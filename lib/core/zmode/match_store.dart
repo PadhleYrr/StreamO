@@ -1,0 +1,214 @@
+import 'package:hive/hive.dart';
+
+import '../hive/safe_box.dart';
+import 'zmode_ids.dart';
+
+/// Which source show a metadata title plays through.
+class SourceMatch {
+  const SourceMatch({
+    required this.sourceId,
+    required this.showUrl,
+    required this.showId,
+    required this.showTitle,
+    required this.pinned,
+  });
+
+  final String sourceId;
+  final String showUrl;
+  final String showId;
+  final String showTitle;
+
+  /// Set by the user through "Wrong title?". A pinned match is never replaced
+  /// by a guess.
+  final bool pinned;
+
+  Map<String, dynamic> toMap() => {
+    'sourceId': sourceId,
+    'showUrl': showUrl,
+    'showId': showId,
+    'showTitle': showTitle,
+    'pinned': pinned,
+  };
+
+  static SourceMatch? fromMap(dynamic m) {
+    if (m is! Map) return null;
+    final sourceId = m['sourceId'], showUrl = m['showUrl'];
+    if (sourceId is! String || showUrl is! String) return null;
+    return SourceMatch(
+      sourceId: sourceId,
+      showUrl: showUrl,
+      showId: m['showId'] is String ? m['showId'] as String : '',
+      showTitle: m['showTitle'] is String ? m['showTitle'] as String : '',
+      pinned: m['pinned'] == true,
+    );
+  }
+}
+
+/// Per-title, per-source matches, plus which source is currently selected for
+/// each title. One Hive box, two key shapes:
+///  - a match:           `'${c.key}@$sourceId'`      → [SourceMatch.toMap]
+///  - a remembered miss: `'miss:${c.key}@$sourceId'` → `{'at': millis}`
+///
+/// Which source PLAYS a title is answered from these entries: a pinned match
+/// is the user's choice for that title (see [pinnedFor]), and only when there
+/// is none does the kind-wide default in [ZSourcePrefs] decide. Old `sel:`
+/// entries are simply never read again, the same way the pre-per-source
+/// scheme's were.
+///
+/// The `@`/`sel:` prefixes can never collide with each other or with a plain
+/// `c.key` — so an entry written by the old (pre-per-source) scheme, keyed by
+/// bare `c.key`, is simply never looked up again under this one. It re-matches
+/// on next open instead of migrating; no code reads that orphaned key.
+class MatchStore {
+  MatchStore._(this._box);
+  final Box<Map> _box;
+
+  static const String boxName = 'zmode_matches';
+  static const String _missPrefix = 'miss:';
+
+  /// How long "this source doesn't have this title" is trusted. A miss is
+  /// recorded so the next open doesn't re-search a source that already said
+  /// no — that re-search is per source, per visit, and it is what made
+  /// opening an unmatched title slow. It expires because sources DO add
+  /// titles, so a miss must never be permanent.
+  static const Duration missTtl = Duration(hours: 12);
+
+  static Future<MatchStore> open() async =>
+      MatchStore._(await openBoxSafely<Map>(boxName));
+
+  String _key(ZCanonical c, String sourceId) => '${c.key}@$sourceId';
+
+  SourceMatch? get(ZCanonical c, String sourceId) =>
+      SourceMatch.fromMap(_box.get(_key(c, sourceId)));
+
+  /// A guess for [m.sourceId]. Does nothing if that source is already pinned
+  /// for this title.
+  Future<void> save(ZCanonical c, SourceMatch m) async {
+    if (get(c, m.sourceId)?.pinned == true) return;
+    await _box.put(_key(c, m.sourceId), m.toMap());
+  }
+
+  /// The user's choice for [m.sourceId]. Always wins for that source, and is
+  /// the title's source from now on.
+  ///
+  /// Any pin on a different source is demoted to a plain guess first: a title
+  /// has one chosen source, and leaving two pinned would make [pinnedFor]
+  /// answer whichever the box listed first.
+  Future<void> pin(ZCanonical c, SourceMatch m) async {
+    await unpinAll(c, except: m.sourceId);
+    await _box.put(
+      _key(c, m.sourceId),
+      SourceMatch(
+        sourceId: m.sourceId,
+        showUrl: m.showUrl,
+        showId: m.showId,
+        showTitle: m.showTitle,
+        pinned: true,
+      ).toMap(),
+    );
+  }
+
+  /// Demote every pin on this title to a plain guess, so the kind's default
+  /// decides again. [except] keeps one source's pin, which is how [pin] makes
+  /// a new choice exclusive.
+  ///
+  /// Demoted rather than deleted: the match itself is still a perfectly good
+  /// remembered result for that source, it just is not the user's choice any
+  /// more.
+  Future<void> unpinAll(ZCanonical c, {String? except}) async {
+    final prefix = '${c.key}@';
+    for (final k in _box.keys.toList()) {
+      if (k is! String || !k.startsWith(prefix)) continue;
+      if (except != null && k == _key(c, except)) continue;
+      final m = SourceMatch.fromMap(_box.get(k));
+      if (m == null || !m.pinned) continue;
+      await _box.put(k, {...m.toMap(), 'pinned': false});
+    }
+  }
+
+  /// The source the user chose for THIS title, whichever source that is, or
+  /// null when they never chose one.
+  ///
+  /// A pin is stored per source ([_key]), so reading it back means scanning the
+  /// title's own keys rather than guessing which source it might be on. Cheap:
+  /// the prefix ends in `@`, and no other title's key can start with
+  /// `'${c.key}@'` because the character after a key is either `@` or nothing.
+  SourceMatch? pinnedFor(ZCanonical c) {
+    final prefix = '${c.key}@';
+    for (final k in _box.keys) {
+      if (k is! String || !k.startsWith(prefix)) continue;
+      final m = SourceMatch.fromMap(_box.get(k));
+      if (m != null && m.pinned) return m;
+    }
+    return null;
+  }
+
+  /// The best remembered match for this title, for UI that asks "where does
+  /// this live" rather than "what will play it": a pin first, then whatever
+  /// last played it, then any source that has matched it at all.
+  ///
+  /// [SourceMatcher.saved] answers the narrower question — a pin, else the
+  /// kind default — and returns null for an AUTO-resolved title, which is the
+  /// common case: Auto Resolve found a source, the user never pinned it and
+  /// may not have played it yet, and the match IS in this box the whole time.
+  ///
+  /// One pass over the title's own keys, same cheap prefix scan as
+  /// [pinnedFor].
+  SourceMatch? bestFor(ZCanonical c) {
+    final prefix = '${c.key}@';
+    final last = lastPlayed(c);
+    SourceMatch? played;
+    SourceMatch? any;
+    for (final k in _box.keys) {
+      if (k is! String || !k.startsWith(prefix)) continue;
+      final m = SourceMatch.fromMap(_box.get(k));
+      if (m == null) continue;
+      if (m.pinned) return m;
+      if (last != null && m.sourceId == last) played ??= m;
+      any ??= m;
+    }
+    return played ?? any;
+  }
+
+  Future<void> forget(ZCanonical c, String sourceId) =>
+      _box.delete(_key(c, sourceId));
+
+  String _missKey(ZCanonical c, String sourceId) =>
+      '$_missPrefix${c.key}@$sourceId';
+
+  /// True when [sourceId] searched for this title recently and genuinely
+  /// didn't have it — the caller should skip re-searching it. False once
+  /// [missTtl] has passed, so the source gets another chance.
+  bool missedRecently(ZCanonical c, String sourceId) {
+    final at = _box.get(_missKey(c, sourceId))?['at'];
+    if (at is! int) return false;
+    final age = DateTime.now().millisecondsSinceEpoch - at;
+    // A negative age means the clock moved backwards; treat that as expired
+    // rather than trusting a miss from the "future" indefinitely.
+    return age >= 0 && age < missTtl.inMilliseconds;
+  }
+
+  Future<void> rememberMiss(ZCanonical c, String sourceId) => _box.put(
+    _missKey(c, sourceId),
+    {'at': DateTime.now().millisecondsSinceEpoch},
+  );
+
+  Future<void> forgetMiss(ZCanonical c, String sourceId) =>
+      _box.delete(_missKey(c, sourceId));
+
+  static const String _lastPrefix = 'last:';
+
+  String _lastKey(ZCanonical c) => '$_lastPrefix${c.key}';
+
+  /// The source that last successfully played this title, if any.
+  String? lastPlayed(ZCanonical c) {
+    final v = _box.get(_lastKey(c))?['sourceId'];
+    return v is String && v.isNotEmpty ? v : null;
+  }
+
+  /// Remember which source served this title on the last successful play.
+  Future<void> rememberLastPlayed(ZCanonical c, String sourceId) => _box.put(
+    _lastKey(c),
+    {'sourceId': sourceId, 'at': DateTime.now().millisecondsSinceEpoch},
+  );
+}

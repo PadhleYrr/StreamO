@@ -1,0 +1,242 @@
+import 'package:flutter/material.dart';
+import '../../features/sources/source_prefs_screen.dart';
+import '../models/source_pref.dart';
+
+import '../aniyomi/aniyomi_extension_service.dart';
+import '../di/injector.dart';
+import '../mihon/mihon_extension_service.dart';
+import '../provider/cloudstream_provider.dart';
+import '../zmode/zmode_ids.dart';
+import 'source_repository.dart';
+import '../../features/sources/source_settings_screen.dart';
+
+/// Whether [id] has its own settings screen to open. Aniyomi (`ani:`) and
+/// Mihon (`mihon:`) report this at runtime through their extension
+/// services; CloudStream (`cs:`) via [csPluginHasSettings]. Anything else
+/// (plain JS providers) has none.
+///
+/// Shared so a "source settings" control — the wrong-title sheet's per-row
+/// action, BrowseSourceScreen's overflow menu — gates on the same check
+/// rather than each re-deriving the id-prefix routing.
+Future<bool> hasSourceSettings(String id) {
+  if (id.startsWith('ani:')) {
+    final raw = int.tryParse(id.substring(4));
+    return raw == null
+        ? Future.value(false)
+        : AniyomiExtensionService().hasSourceSettings(raw);
+  }
+  if (id.startsWith('mihon:')) {
+    final raw = int.tryParse(id.substring(6));
+    return raw == null
+        ? Future.value(false)
+        : MihonExtensionService().hasSourceSettings(raw);
+  }
+  if (id.startsWith('cs:')) return csPluginHasSettings(id.substring(3));
+  return Future.value(false);
+}
+
+/// Opens [id]'s own settings screen. [name] pre-fills the CloudStream path's
+/// AppBar title (matching [SourceSettingsScreen.displayName]).
+Future<void> openSourceSettings(
+  BuildContext context,
+  String id,
+  String name,
+) async {
+  if (id.startsWith('ani:')) {
+    final raw = int.tryParse(id.substring(4));
+    if (raw == null) return;
+    final svc = AniyomiExtensionService();
+    await _openExtensionSettings(
+      context,
+      name,
+      read: () => svc.readSourceSettings(raw),
+      write: (k, v) => svc.writeSourceSetting(raw, k, v),
+      native: () => svc.openSourceSettings(raw),
+    );
+    return;
+  }
+  if (id.startsWith('mihon:')) {
+    final raw = int.tryParse(id.substring(6));
+    if (raw == null) return;
+    final svc = MihonExtensionService();
+    await _openExtensionSettings(
+      context,
+      name,
+      read: () => svc.readSourceSettings(raw),
+      write: (k, v) => svc.writeSourceSetting(raw, k, v),
+      native: () => svc.openSourceSettings(raw),
+    );
+    return;
+  }
+  if (id.startsWith('cs:') && context.mounted) {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) =>
+            SourceSettingsScreen(sourceId: id, repoUrl: '', displayName: name),
+      ),
+    );
+  }
+}
+
+/// Draw the source's settings ourselves when we can, else hand it to the
+/// extension's own native screen.
+///
+/// A page we can partly draw is still drawn: the rows we understand render
+/// here, and a last row opens the extension's own screen for whatever is left,
+/// so an odd setting is never invisible AND unreachable. Only a page with
+/// nothing drawable on it (or a failed read) goes straight there.
+///
+/// The read is bounded: it builds the source's preference objects, and a source
+/// that does something slow in there must not leave a tap hanging.
+Future<void> _openExtensionSettings(
+  BuildContext context,
+  String name, {
+  required Future<List<SourcePref>?> Function() read,
+  required Future<bool> Function(String key, Object? value) write,
+  required Future<void> Function() native,
+}) async {
+  List<SourcePref>? prefs;
+  try {
+    prefs = await read().timeout(const Duration(seconds: 2));
+  } catch (_) {
+    prefs = null;
+  }
+  if (!SourcePref.canDrawAny(prefs) || !context.mounted) {
+    await native();
+    return;
+  }
+  await Navigator.of(context).push(
+    MaterialPageRoute<void>(
+      builder: (_) => SourcePrefsScreen(
+        title: name,
+        prefs: prefs!,
+        write: write,
+        onOpenNative: SourcePref.hasUndrawable(prefs) ? native : null,
+      ),
+    ),
+  );
+}
+
+/// Whether [id]'s source can have its OWN saved state (settings + cookies)
+/// reset. Only CloudStream (`cs:`) plugins keep state reachable this way —
+/// they persist through a shared DataStore SharedPreferences file, folder-
+/// keyed by the plugin's own name, plus site cookies via WebView's
+/// CookieManager (see PluginHost.resetPluginData, native side). Mihon and
+/// Aniyomi extensions have no equivalent per-source store we can reach
+/// without a much broader native change, so they don't offer this action.
+bool canResetSourceData(String id) => id.startsWith('cs:');
+
+/// Clears [id]'s own stored state — its DataStore settings and its site's
+/// cookies — without touching anything else. Returns true only if the native
+/// side reports something was actually cleared. A no-op (false) for any
+/// source [canResetSourceData] says no to.
+Future<bool> resetSourceData(String id) {
+  if (id.startsWith('cs:')) return csPluginResetData(id.substring(3));
+  return Future.value(false);
+}
+
+/// The site to open for [sourceId], or null when there is none.
+///
+/// [SourceRepository.baseUrlFor] answers for every ecosystem and returns an
+/// empty string when it cannot; this is the null-typed twin the callers gate
+/// on. The metadata catalogue is excluded outright — it is a catalogue, not a
+/// provider with an account behind it.
+String? webViewUrlFor(String sourceId) {
+  if (sourceId == ZmodeIds.sourceId) return null;
+  // Unregistered only in a unit test that never bootstrapped the injector —
+  // in the running app SourceRepository is always up by the time a screen
+  // can call this. Same guard main.dart/injector.dart use elsewhere for a
+  // dependency that may not exist yet.
+  if (!sl.isRegistered<SourceRepository>()) return null;
+  final url = sl<SourceRepository>().baseUrlFor(sourceId).trim();
+  return url.isEmpty ? null : url;
+}
+
+/// Opens the source's site in the in-app browser so the user can sign in.
+///
+/// Silent no-op when the source has no site — the callers hide the action in
+/// that case, and a second guard here means a new caller cannot open a blank
+/// screen by forgetting to check.
+Future<void> openSourceWebView(String sourceId) async {
+  final url = webViewUrlFor(sourceId);
+  if (url == null) return;
+  await MihonExtensionService.openSourceWebView(
+    url,
+    title: sl<SourceRepository>().displayName(sourceId),
+  );
+}
+
+/// Opens ONE page — a chapter, an episode — on the source's own site, in the
+/// same in-app browser.
+///
+/// [openSourceWebView] always lands on the site's front page, which is right
+/// for signing in and useless for "show me this chapter". The session and
+/// cookies are shared either way, so a Cloudflare-gated or logged-in source
+/// still works.
+///
+/// Silently does nothing when [url] isn't an http(s) link — some sources key
+/// their chapters by an internal id rather than a URL, and a button that opens
+/// a blank page is worse than one that doesn't fire.
+Future<void> openUrlInSourceWebView(String url, {String? title}) async {
+  final u = url.trim();
+  if (!u.startsWith('http://') && !u.startsWith('https://')) return;
+  await MihonExtensionService.openSourceWebView(u, title: title);
+}
+
+/// The web page for one chapter/episode, or null when there isn't one.
+///
+/// Mihon and Aniyomi hand back an OPAQUE chapter key, not a URL — usually a
+/// path like `/series/x/chapter-110`, sometimes just an id. Treating that as a
+/// link meant the "Open in browser" row was hidden on every Mihon source,
+/// which is the whole set of sources it was built for. A relative key is
+/// resolved against the source's own base URL, the same join the extension
+/// itself does.
+String? chapterWebUrl(String sourceId, String chapterUrl) =>
+    joinChapterUrl(webViewUrlFor(sourceId), chapterUrl);
+
+/// The page to actually OPEN for a chapter — the source's answer where it has
+/// one, else [chapterWebUrl]'s join.
+///
+/// A source's stored url is a key, not necessarily a page. Asura keeps
+/// `/series/<slug>` because its real slugs carry a rotating hash, and overrides
+/// the extension-side URL methods to build the real `/comics/<slug>-<hash>`
+/// page; joining by hand lands on a 404. Mihon itself never joins — it asks the
+/// source — and this is that call.
+///
+/// Falls back on any failure, and the fallback is exactly the old behaviour, so
+/// a source that can't answer (or isn't Mihon) opens what it always did.
+Future<String?> resolveChapterWebUrl(String sourceId, String chapterUrl) async {
+  final fallback = chapterWebUrl(sourceId, chapterUrl);
+  if (!sourceId.startsWith('mihon:')) return fallback;
+  final raw = int.tryParse(sourceId.substring(6));
+  if (raw == null) return fallback;
+  final asked = await MihonExtensionService().webUrl(
+    raw,
+    chapterUrl: chapterUrl,
+  );
+  return asked ?? fallback;
+}
+
+/// The join itself, with [base] passed in — pure, so the rules that matter
+/// (which schemes are refused, how a relative key is joined) can be tested
+/// without standing up a SourceRepository.
+String? joinChapterUrl(String? base, String chapterUrl) {
+  final u = chapterUrl.trim();
+  if (u.isEmpty) return null;
+  if (u.startsWith('http://') || u.startsWith('https://')) return u;
+  // Anything else carrying a scheme is not a web page. A chapter key comes
+  // from a third-party extension, so javascript:/file:/intent: must never
+  // reach a WebView.
+  if (RegExp(r'^[a-zA-Z][a-zA-Z0-9+.-]*:').hasMatch(u)) return null;
+  if (base == null || base.trim().isEmpty) return null;
+  var b = base.trim();
+  while (b.endsWith('/')) {
+    b = b.substring(0, b.length - 1);
+  }
+  return u.startsWith('/') ? '$b$u' : '$b/$u';
+}
+
+/// Whether a chapter has a page worth offering — so a caller can hide the row
+/// rather than show one that opens nothing.
+bool canOpenInBrowser(String sourceId, String chapterUrl) =>
+    chapterWebUrl(sourceId, chapterUrl) != null;

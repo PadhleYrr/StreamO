@@ -1,0 +1,502 @@
+import 'package:dio/dio.dart';
+
+import '../models/episode.dart';
+import '../models/home_section.dart';
+import '../models/media_detail.dart';
+import '../anilist/anilist_network_policy.dart';
+import '../anilist/anilist_title.dart';
+import '../models/media_item.dart';
+import '../models/provider_info.dart';
+import 'anime_catalogue.dart';
+import 'metadata_filters.dart';
+import 'zmode_ids.dart';
+
+typedef Gql =
+    Future<Map<String, dynamic>?> Function(
+      String query,
+      Map<String, dynamic> variables,
+    );
+
+/// AniList as a browsing catalogue: home rows, search, and a detail with a
+/// synthetic episode list. Anonymous — no token, so nothing here can touch the
+/// user's list.
+class AniListCatalogue implements AnimeCatalogue {
+  AniListCatalogue(this._gql);
+  final Gql _gql;
+
+  static const _endpoint = 'https://graphql.anilist.co';
+
+  /// Production transport. Same shape as `AiringService`.
+  static Gql dioGql(Dio dio) => (query, variables) async {
+    try {
+      final res = await dio.post<dynamic>(
+        _endpoint,
+        data: {'query': query, 'variables': variables},
+        options: Options(
+          headers: const {'Accept': 'application/json'},
+          validateStatus: (s) => s != null && s < 500,
+        ),
+      );
+      final data = res.data;
+      if (data is Map && data['data'] is Map) {
+        return Map<String, dynamic>.from(data['data'] as Map);
+      }
+    } on DioException catch (e) {
+      // A transport failure is not "no data". Swallowing it left the caller
+      // holding an empty list it could not tell apart from a quiet catalogue,
+      // so Home could never distinguish an offline phone from a provider
+      // outage — and told people with no network to switch metadata provider.
+      //
+      // A response that DID arrive still returns null: a 4xx/5xx with a body,
+      // or a GraphQL error envelope, is the server answering, and every caller
+      // already handles that as "nothing came back".
+      if (e.response == null || aniListRateLimitOf(e) != null) rethrow;
+    } catch (_) {}
+    return null;
+  };
+
+  static const _fields =
+      'id idMal title{romaji english native} coverImage{large extraLarge} '
+      'bannerImage episodes chapters status genres description(asHtml:false) '
+      'seasonYear studios(isMain:true){nodes{name}} '
+      // airingAt as well as the number: an episode count with no date is a
+      // fact nobody needs, a countdown is the reason to open the page.
+      'nextAiringEpisode{episode airingAt} '
+      'averageScore popularity format duration source countryOfOrigin '
+      'isAdult synonyms startDate{year month day} endDate{year month day} '
+      // Ranked, so the page can show the ones voters actually agreed on and
+      // drop the long tail of 3% tags.
+      'tags{name rank isMediaSpoiler}';
+
+  /// Exactly what [_item] reads, and nothing else. Home asks for 7 rows of 30
+  /// in one request, so every field here is paid for 210 times: carrying the
+  /// detail-only half of [_fields] (description, studios, airing schedule)
+  /// through it more than doubled the response for data no list cell shows.
+  static const _listFields =
+      'id idMal title{romaji english native} coverImage{large} bannerImage '
+      // One int, for the poster's score badge. The rest of the detail fields
+      // stay out for the reason above; this one is a number, not a payload.
+      'averageScore genres';
+
+  static String _type(ZKind k) => k == ZKind.anime ? 'ANIME' : 'MANGA';
+  static String _format(ZKind k) => switch (k) {
+    ZKind.novel => ',format_in:[NOVEL]',
+    ZKind.manga => ',format_not_in:[NOVEL]',
+    _ => '',
+  };
+
+  static ProviderType _providerType(ZKind k) => switch (k) {
+    ZKind.manga => ProviderType.manga,
+    ZKind.novel => ProviderType.novel,
+    _ => ProviderType.anime,
+  };
+
+  /// (row title, extra media() arguments) — the home rows. Anime gets a
+  /// season-aware "this season"/"next season" pair plus a couple of genre
+  /// rows so the page feels populated instead of a wall of sort variants;
+  /// manga/novel keep it shorter since AniList has thinner season data for
+  /// them.
+  /// The row titles this catalogue produces for [k], without fetching them.
+  /// The editor lists rows for layouts the app isn't currently in, and the
+  /// titles ARE the row ids — a live fetch would answer the same thing plus a
+  /// round trip, and would drop a row whose request happened to fail.
+  static List<String> rowTitles(ZKind k) => [for (final r in _rows(k)) r.$1];
+
+  static List<(String, String)> _rows(ZKind k) {
+    final now = DateTime.now();
+    final season = switch (now.month) {
+      1 || 2 || 3 => 'WINTER',
+      4 || 5 || 6 => 'SPRING',
+      7 || 8 || 9 => 'SUMMER',
+      _ => 'FALL',
+    };
+    // AniList's FuzzyDateInt form. Needed because START_DATE_DESC alone puts
+    // NOT_YET_RELEASED titles first — announced entries with a null start date
+    // sort above everything, so the row filled up with "(Provisional Title)"
+    // instead of anything that has actually come out. The date bound plus the
+    // status filter is what makes it a RECENT row rather than an upcoming one.
+    final today = now.year * 10000 + now.month * 100 + now.day;
+    // Popularity floor: AniList carries a long tail of doujin/obscure entries
+    // that are genuinely the most recent thing published and genuinely not
+    // worth a home row.
+    String recent(int minPopularity) =>
+        'sort:START_DATE_DESC,status_in:[RELEASING,FINISHED],'
+        'popularity_greater:$minPopularity,startDate_lesser:$today';
+    if (k != ZKind.anime) {
+      return [
+        // Recently released leads; the opening row also feeds the hero
+        // banner, which Home repeats as a row (firstRepeatsAsRow), so it
+        // shows BOTH places — spotlight on top, row right under it.
+        // Light novels carry far smaller popularity numbers than manga, so
+        // the manga floor pushed this row back to titles years old. Verified
+        // against the live API: >1000 returned 2023 entries, >50 returns the
+        // current month.
+        ('Recently released', recent(k == ZKind.novel ? 50 : 1000)),
+        ('Trending', 'sort:TRENDING_DESC'),
+        ('Popular', 'sort:POPULARITY_DESC'),
+        ('Top rated', 'sort:SCORE_DESC'),
+        ('Action', 'genre_in:["Action"],sort:POPULARITY_DESC'),
+        ('Romance', 'genre_in:["Romance"],sort:POPULARITY_DESC'),
+      ];
+    }
+    final (nextSeason, nextYear) = switch (season) {
+      'WINTER' => ('SPRING', now.year),
+      'SPRING' => ('SUMMER', now.year),
+      'SUMMER' => ('FALL', now.year),
+      _ => ('WINTER', now.year + 1),
+    };
+    return [
+      ('Recently released', recent(2000)),
+      ('Trending', 'sort:TRENDING_DESC'),
+      (
+        'Popular this season',
+        'sort:POPULARITY_DESC,season:$season,seasonYear:${now.year}',
+      ),
+      (
+        'Upcoming next season',
+        'sort:POPULARITY_DESC,season:$nextSeason,seasonYear:$nextYear,'
+            'status:NOT_YET_RELEASED',
+      ),
+      ('All-time popular', 'sort:POPULARITY_DESC'),
+      ('Top rated', 'sort:SCORE_DESC'),
+      ('Action', 'genre_in:["Action"],sort:POPULARITY_DESC'),
+      ('Romance', 'genre_in:["Romance"],sort:POPULARITY_DESC'),
+    ];
+  }
+
+  /// One request for every row, via aliased `Page` fields — `r0`, `r1`, …,
+  /// one per entry in [_rows] — instead of a round-trip per row. A malformed
+  /// or partial response (missing alias, non-list `media`, or no response at
+  /// all) just drops that row rather than throwing.
+  Future<List<HomeSection>> home(ZKind kind) async {
+    final rows = _rows(kind);
+    final query = rows.indexed
+        .map((e) {
+          final (i, (_, args)) = e;
+          return 'r$i: Page(perPage:30){ media(type:${_type(kind)}${_format(kind)},$args){ $_listFields } }';
+        })
+        .join(' ');
+    final data = await _gql('query{ $query }', const {});
+    final out = <HomeSection>[];
+    for (final (i, (title, args)) in rows.indexed) {
+      final items = _itemsFromPage(data?['r$i'], kind);
+      if (items.isEmpty) continue;
+      // The row's own query fragment IS its identity — hand it back through
+      // `more` and [browseRow] can ask for page 2 of exactly this row.
+      out.add(
+        HomeSection(
+          title: title,
+          items: items,
+          more: BrowseMore(
+            sourceId: ZmodeIds.sourceId,
+            kind: 'zm_${kind.name}',
+            categoryId: args,
+          ),
+        ),
+      );
+    }
+    return out;
+  }
+
+  @override
+  Future<List<MediaItem>> browseRow(ZKind kind, String rowId, int page) async {
+    final data = await _gql(
+      'query{ Page(page:$page,perPage:30){ '
+      'media(type:${_type(kind)}${_format(kind)},$rowId){ $_listFields } } }',
+      const {},
+    );
+    return _itemsFromPage(data?['Page'], kind);
+  }
+
+  Future<List<MediaItem>> search(String q, ZKind kind) =>
+      searchFiltered(q, kind);
+
+  /// AniList's own genre vocabulary.
+  ///
+  /// Free and token-less, and the only honest source for this list — the
+  /// built-in one is hand-typed and was already missing an entry. Returns
+  /// empty on any failure so the caller keeps whatever it had.
+  Future<List<String>> genreCollection() async {
+    try {
+      final data = await _gql('{GenreCollection}', const {});
+      final raw = data?['GenreCollection'];
+      if (raw is! List) return const [];
+      return [
+        for (final g in raw)
+          if (g is String && g.isNotEmpty) g,
+      ];
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  @override
+  bool get supportsFilters => true;
+
+  /// Search, browse, or both.
+  ///
+  /// An empty [q] with filters set is a browse — AniList is happy to return
+  /// `media()` with no `search:` at all, which is what makes "filters with no
+  /// query" work without a second endpoint. [page] is 1-based.
+  @override
+  Future<List<MediaItem>> searchFiltered(
+    String q,
+    ZKind kind, {
+    MetaFilters? filters,
+    int page = 1,
+  }) async {
+    final f = filters;
+    final args = <String>[
+      if (q.trim().isNotEmpty) 'search:\$q',
+      'type:${_type(kind)}',
+      if (_format(kind).isNotEmpty) _format(kind).replaceFirst(',', ''),
+      if (f == null) 'isAdult:false',
+      if (f != null) ...[
+        if (f.genres.isNotEmpty)
+          'genre_in:[${f.genres.map((g) => '"$g"').join(',')}]',
+        // AniList's own, finer than a genre. Nothing else has them, which is
+        // why a tag chip is only offered while AniList is answering.
+        if (f.tags.isNotEmpty)
+          'tag_in:[${f.tags.map((t) => '"$t"').join(',')}]',
+        if (f.year != null) 'seasonYear:${f.year}',
+        if (f.season != null) 'season:${f.season!.name.toUpperCase()}',
+        // Manga and novel already pin the format by kind (`format_in:[NOVEL]`
+        // / `format_not_in:[NOVEL]`), so only anime may set it here — two
+        // format clauses would contradict each other and return nothing.
+        if (kind == ZKind.anime && _alFormat(f.format) != null)
+          'format:${_alFormat(f.format)}',
+        if (_alStatus(f.status) != null) 'status:${_alStatus(f.status)}',
+        if (f.minScore != null) 'averageScore_greater:${f.minScore! - 1}',
+        // Omitted entirely when adult is on, so the results include both —
+        // `isAdult:true` would return ONLY adult titles, which is not what a
+        // "show adult content" switch means.
+        if (!f.adult) 'isAdult:false',
+        'sort:${_alSort(f.sort)}',
+      ],
+    ].where((a) => a.isNotEmpty).join(',');
+
+    final vars = <String, dynamic>{'n': 30};
+    final decl = q.trim().isEmpty ? r'($n:Int)' : r'($q:String,$n:Int)';
+    if (q.trim().isNotEmpty) vars['q'] = q;
+
+    final full =
+        'query$decl{ Page(page:$page,perPage:\$n){ '
+        'media($args){ $_listFields } } }';
+    return _items(await _gql(full, vars), kind);
+  }
+
+  static String? _alFormat(MetaFormat? f) => switch (f) {
+    null => null,
+    MetaFormat.tv => 'TV',
+    MetaFormat.movie => 'MOVIE',
+    MetaFormat.ova => 'OVA',
+    MetaFormat.special => 'SPECIAL',
+    MetaFormat.manga => 'MANGA',
+    MetaFormat.novel => 'NOVEL',
+    MetaFormat.oneShot => 'ONE_SHOT',
+  };
+
+  static String? _alStatus(MetaStatus? s) => switch (s) {
+    null => null,
+    MetaStatus.releasing => 'RELEASING',
+    MetaStatus.finished => 'FINISHED',
+    MetaStatus.notYetReleased => 'NOT_YET_RELEASED',
+    MetaStatus.cancelled => 'CANCELLED',
+  };
+
+  static String _alSort(MetaSort s) => switch (s) {
+    MetaSort.popularity => 'POPULARITY_DESC',
+    MetaSort.score => 'SCORE_DESC',
+    MetaSort.trending => 'TRENDING_DESC',
+    MetaSort.newest => 'START_DATE_DESC',
+    MetaSort.title => 'TITLE_ROMAJI',
+  };
+
+  Future<MediaDetail> detail(ZCanonical c) async {
+    final (arg, vars) = _idArg(c);
+    final q =
+        'query(${arg.$1}){ Media(${arg.$2},type:${_type(c.kind)}){ $_fields } }';
+    final m = (await _gql(q, vars))?['Media'];
+    if (m is! Map) throw StateError('AniList returned no media for $c');
+    final map = Map<String, dynamic>.from(m);
+    final eps = _episodesFor(map, c);
+    final t = map['title'] as Map? ?? const {};
+    final cover = map['coverImage'] as Map? ?? const {};
+    return MediaDetail(
+      id: c.id,
+      title: aniListTitle(t, titleLanguagePref) ?? '',
+      // Whichever variant the display isn't — sources index by both, and
+      // dropping one loses matches.
+      englishTitle: aniListAltTitle(t, aniListTitle(t, titleLanguagePref)),
+      cover: (cover['extraLarge'] ?? cover['large']) as String?,
+      banner: map['bannerImage'] as String?,
+      url: ZmodeIds.showUrl(c),
+      description: map['description'] as String?,
+      status: _status(map['status'] as String?),
+      genres: [for (final g in (map['genres'] as List? ?? const [])) '$g'],
+      studios: [
+        for (final n
+            in ((map['studios'] as Map?)?['nodes'] as List? ?? const []))
+          if (n is Map && n['name'] is String) n['name'] as String,
+      ],
+      episodes: eps,
+      year: map['seasonYear']?.toString(),
+      type: _providerType(c.kind),
+      sourceId: ZmodeIds.sourceId,
+      malId: map['idMal'] as int?,
+      score: map['averageScore'] as int?,
+      format: _prettyEnum(map['format'] as String?),
+      durationMins: map['duration'] as int?,
+      airingAt: _airingAt(map['nextAiringEpisode']),
+      nextEpisode: (map['nextAiringEpisode'] as Map?)?['episode'] as int?,
+      tags: _tags(map['tags']),
+      startDate: _date(map['startDate']),
+      endDate: _date(map['endDate']),
+      sourceMaterial: _prettyEnum(map['source'] as String?),
+      country: map['countryOfOrigin'] as String?,
+      popularity: map['popularity'] as int?,
+      nativeTitle: t['native'] as String?,
+      synonyms: [for (final x in (map['synonyms'] as List? ?? const [])) '$x'],
+      isAdult: map['isAdult'] == true,
+    );
+  }
+
+  Future<List<Episode>> episodes(ZCanonical c) async =>
+      (await detail(c)).episodes;
+
+  /// `TV_SHORT` → `TV short`, `LIGHT_NOVEL` → `Light novel`. AniList SHOUTS
+  /// its enums; nothing on the page should.
+  static String? _prettyEnum(String? v) {
+    if (v == null || v.isEmpty) return null;
+    final words = v.replaceAll('_', ' ').toLowerCase();
+    return words[0].toUpperCase() + words.substring(1);
+  }
+
+  static DateTime? _airingAt(Object? node) {
+    final secs = (node is Map) ? node['airingAt'] as int? : null;
+    return secs == null
+        ? null
+        : DateTime.fromMillisecondsSinceEpoch(secs * 1000);
+  }
+
+  /// AniList reports a partial date as nulls in the parts it does not know, so
+  /// a year alone still yields a usable date rather than nothing.
+  static DateTime? _date(Object? node) {
+    if (node is! Map) return null;
+    final y = node['year'] as int?;
+    if (y == null) return null;
+    return DateTime(
+      y,
+      (node['month'] as int?) ?? 1,
+      (node['day'] as int?) ?? 1,
+    );
+  }
+
+  /// The tags voters agreed on. Below 50% is noise — a handful of people
+  /// tagging a show "Time Travel" does not make it a time travel show.
+  static List<MediaTag> _tags(Object? raw) {
+    if (raw is! List) return const [];
+    final out = <MediaTag>[];
+    for (final t in raw) {
+      if (t is! Map) continue;
+      final name = t['name'] as String?;
+      final rank = t['rank'] as int?;
+      if (name == null || name.isEmpty || (rank ?? 0) < 50) continue;
+      out.add(
+        MediaTag(
+          name: name,
+          rank: rank,
+          isSpoiler: t['isMediaSpoiler'] == true,
+        ),
+      );
+    }
+    out.sort((a, b) => (b.rank ?? 0).compareTo(a.rank ?? 0));
+    return out.take(20).toList();
+  }
+
+  // ── helpers ──────────────────────────────────────────────────────────────
+
+  /// (`($idMal:Int)`, `idMal:$idMal`) or the `id` twin, plus the variables.
+  static ((String, String), Map<String, dynamic>) _idArg(ZCanonical c) {
+    final n = int.parse(c.id.split(':').last);
+    return c.id.startsWith('mal:')
+        ? ((r'$idMal:Int', r'idMal:$idMal'), {'idMal': n})
+        : ((r'$id:Int', r'id:$id'), {'id': n});
+  }
+
+  static ZCanonical _canonical(Map<String, dynamic> m, ZKind kind) {
+    final mal = m['idMal'] as int?;
+    return ZCanonical(kind, mal != null ? 'mal:$mal' : 'al:${m['id']}');
+  }
+
+  static List<MediaItem> _items(Map<String, dynamic>? data, ZKind kind) =>
+      _itemsFromPage(data?['Page'], kind);
+
+  /// [page] is a `Page(){ media }` result — top-level for search/detail,
+  /// or one aliased row (`data['r0']`, `data['r1']`, …) for [home]. Anything
+  /// short of a well-shaped `{media: [...]}` map degrades to no items rather
+  /// than throwing, so a partial multi-row response still yields the rows it
+  /// legitimately has.
+  static List<MediaItem> _itemsFromPage(dynamic page, ZKind kind) {
+    if (page is! Map) return const [];
+    final media = page['media'];
+    if (media is! List) return const [];
+    return [
+      for (final m in media)
+        if (m is Map) _item(Map<String, dynamic>.from(m), kind),
+    ];
+  }
+
+  static MediaItem _item(Map<String, dynamic> m, ZKind kind) {
+    final c = _canonical(m, kind);
+    final t = m['title'] as Map? ?? const {};
+    return MediaItem(
+      id: c.id,
+      title: aniListTitle(t, titleLanguagePref) ?? '',
+      // Whichever variant the display isn't — sources index by both, and
+      // dropping one loses matches.
+      englishTitle: aniListAltTitle(t, aniListTitle(t, titleLanguagePref)),
+      cover: (m['coverImage'] as Map?)?['large'] as String?,
+      banner: m['bannerImage'] as String?,
+      url: ZmodeIds.showUrl(c),
+      type: _providerType(kind),
+      sourceId: ZmodeIds.sourceId,
+      malId: m['idMal'] as int?,
+      genres: [for (final g in (m['genres'] as List? ?? const [])) '$g'],
+      // Already 0-100 here; the other three scale theirs to match.
+      score: m['averageScore'] as int?,
+    );
+  }
+
+  /// Anime: 1..episodes, or 1..(next-1) while airing. Manga/novel: 1..chapters.
+  /// No count → no list; the matched source supplies chapters in that case.
+  static List<Episode> _episodesFor(Map<String, dynamic> m, ZCanonical c) {
+    int? n;
+    if (c.kind == ZKind.anime) {
+      n = m['episodes'] as int?;
+      final next = (m['nextAiringEpisode'] as Map?)?['episode'] as int?;
+      if (next != null) n = next - 1;
+    } else {
+      n = m['chapters'] as int?;
+    }
+    if (n == null || n <= 0) return const [];
+    final word = c.kind == ZKind.anime ? 'Episode' : 'Chapter';
+    return [
+      for (var i = 1; i <= n; i++)
+        Episode(
+          id: '$i',
+          title: '$word $i',
+          number: i.toDouble(),
+          url: ZmodeIds.episodeUrl(c, i),
+        ),
+    ];
+  }
+
+  static MediaStatus _status(String? s) => switch (s) {
+    'RELEASING' => MediaStatus.ongoing,
+    'FINISHED' => MediaStatus.completed,
+    'HIATUS' => MediaStatus.hiatus,
+    'CANCELLED' => MediaStatus.cancelled,
+    _ => MediaStatus.unknown,
+  };
+}

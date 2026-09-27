@@ -1,0 +1,504 @@
+
+import 'dart:math' as math;
+
+import 'package:cached_network_image/cached_network_image.dart';
+import 'package:flutter/material.dart';
+
+import 'image_fade.dart';
+import 'package:palette_generator/palette_generator.dart';
+
+import '../di/injector.dart';
+import 'native_cover_provider.dart';
+import '../metadata/title_logo_service.dart';
+import '../models/media_item.dart';
+import '../theme/app_colors.dart';
+import '../theme/app_text.dart';
+
+/// Height of the floating home header the hero reserves room for, measured
+/// from the bottom of the status bar: 8px of top padding, a 48px icon row and
+/// 2px of air so the card never quite touches the icons. Added to the
+/// status-bar inset — see the card's Padding below.
+///
+/// 58 is not a taste call: the dev phone's inset is 32, and 32 + 58 is exactly
+/// the 90 that has always been hardcoded there. So every phone whose status
+/// bar is 32 or less keeps the layout it has today, to the pixel, and only the
+/// taller ones — where the header was landing on the artwork — move.
+const double kHeroHeaderRoom = 58;
+
+/// Space to leave above the artwork card for the floating header, given the
+/// status-bar [topInset]. 90 is the floor — the value that was hardcoded here
+/// — so a normal phone keeps its layout to the pixel and only tall-cutout
+/// devices push the card down.
+double heroTopReserve(double topInset) =>
+    math.max(90, topInset + kHeroHeaderRoom);
+
+/// Lightweight metadata shown under the hero title: a few genres + episode
+/// count (or year for movies). Lazily fetched, so it never blocks the banner.
+class HeroMeta {
+  const HeroMeta({this.genres = const [], this.episodeCount = 0, this.year});
+  final List<String> genres;
+  final int episodeCount;
+  final String? year;
+}
+
+/// Apple-TV+-style cinematic hero: a rounded inset artwork card floating on the
+/// page, with a colour-matched top gradient pulled from the cover's dominant
+/// colour, a centred title, an uppercase genres·episodes line, and a clean
+/// white Play + glass My-List / Info.
+class FeaturedHero extends StatefulWidget {
+  const FeaturedHero({
+    super.key,
+    required this.item,
+    required this.inList,
+    required this.onPlay,
+    required this.onInfo,
+    required this.onToggleList,
+    this.metaFuture,
+    this.parallax = 0,
+    this.kenBurns = false,
+    this.wrapButton,
+    this.reading = false,
+  });
+
+  final MediaItem item;
+  final bool inList;
+
+  /// Manga/novel mode: the primary action reads "Read" with a book glyph
+  /// instead of "Play" with a triangle. Defaults to false, so every existing
+  /// caller — including both TV heroes, which have no content mode — renders
+  /// exactly as before.
+  final bool reading;
+
+  final VoidCallback onPlay;
+  final VoidCallback onInfo;
+  final VoidCallback onToggleList;
+
+  /// Lazily-fetched genres + episode count for this title.
+  final Future<HeroMeta?>? metaFuture;
+
+  /// Page-relative offset (-1..1) used to parallax the blurred bleed in the
+  /// parallax-slide carousel mode. 0 = no parallax.
+  final double parallax;
+
+  /// Slowly zoom the card artwork (Ken-Burns) — used in the cinematic mode.
+  final bool kenBurns;
+
+  /// Optional button decorator for TV D-pad focus.  When supplied, each hero
+  /// action button (Play, My List, Info) is passed through this builder so TV
+  /// callers can inject [TvFocusable] focus around the buttons without altering
+  /// phone behaviour in any way.
+  ///
+  /// [autofocus] is true only for the primary Play button.
+  ///
+  /// Defaults to null — the phone render is byte-identical when null.
+  final Widget Function(Widget child, VoidCallback onTap, {bool autofocus})?
+      wrapButton;
+
+  @override
+  State<FeaturedHero> createState() => _FeaturedHeroState();
+}
+
+class _FeaturedHeroState extends State<FeaturedHero> {
+  // Cache extracted colours so swiping back doesn't recompute the palette.
+  static final Map<String, Color> _paletteCache = {};
+  Color? _artColor;
+  String? _logoUrl; // TMDB title logo (null → show the text title)
+
+  @override
+  void initState() {
+    super.initState();
+    _loadPalette();
+    _loadLogo();
+  }
+
+  /// The hero's own art: the wide banner when the item has one (Z Mode),
+  /// else the regular poster cover — same as every hero before [MediaItem.banner]
+  /// existed.
+  static String? _art(MediaItem item) => item.banner ?? item.cover;
+
+  @override
+  void didUpdateWidget(FeaturedHero old) {
+    super.didUpdateWidget(old);
+    if (_art(old.item) != _art(widget.item)) {
+      _artColor = null;
+      _logoUrl = null;
+      _loadPalette();
+      _loadLogo();
+    }
+  }
+
+  /// Best-effort TMDB title-logo lookup; on a hit, swap the text title for the
+  /// logo image. Stays as text until (and unless) a logo resolves.
+  Future<void> _loadLogo() async {
+    if (!sl.isRegistered<TitleLogoService>()) return;
+    try {
+      final url = await sl<TitleLogoService>().logoFor(widget.item);
+      if (mounted && url != null && url.isNotEmpty) {
+        setState(() => _logoUrl = url);
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _loadPalette() async {
+    final cover = _art(widget.item);
+    if (cover == null || cover.isEmpty) return;
+    final cached = _paletteCache[cover];
+    if (cached != null) {
+      setState(() => _artColor = cached);
+      return;
+    }
+    try {
+      final pal = await PaletteGenerator.fromImageProvider(
+        // Decode a SMALL copy for the palette: the dominant colour is identical,
+        // but this avoids a full-resolution decode on the UI isolate every time
+        // the cinematic carousel rotates to a new cover (the 30s-of-lag cause).
+        ResizeImage(
+          nativeCoverProvider(cover, widget.item.coverHeaders),
+          width: 180,
+        ),
+        size: const Size(180, 270),
+        maximumColorCount: 8,
+      );
+      final c =
+          pal.vibrantColor?.color ??
+          pal.dominantColor?.color ??
+          pal.darkVibrantColor?.color ??
+          pal.mutedColor?.color;
+      if (c != null) {
+        _paletteCache[cover] = c;
+        if (mounted) setState(() => _artColor = c);
+      }
+    } catch (_) {
+      /* keep fallback */
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final item = widget.item;
+    final cover = _art(item);
+    final hasCover = cover != null && cover.isNotEmpty;
+    final mq = MediaQuery.of(context);
+    final memW = (mq.size.width * mq.devicePixelRatio).round();
+    final tint = _artColor ?? AppColors.surface2;
+
+    final provider = hasCover
+        ? nativeCoverProvider(cover, item.coverHeaders)
+        : null;
+
+    return RepaintBoundary(
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          // Plain page background.
+          ColoredBox(color: AppColors.bg),
+
+          // Soft ambient glow of the art's own colour bleeding OUTSIDE the card.
+          // RADIAL so it fades to the page colour on every side — it dies out
+          // before reaching the banner's bottom, so there's no straight cut-off
+          // line like the old full-width "box" bleed had.
+          Positioned.fill(
+            child: IgnorePointer(
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  gradient: RadialGradient(
+                    center: const Alignment(0, -0.15),
+                    radius: 1.05,
+                    colors: [
+                      tint.withValues(alpha: 0.66),
+                      tint.withValues(alpha: 0.28),
+                      const Color(0x000B0B0F),
+                    ],
+                    stops: const [0.0, 0.5, 0.84],
+                  ),
+                ),
+              ),
+            ),
+          ),
+
+          // ── The artwork card, floating on the glow ────────────────────────
+          // Rounded, no border/shadow; its bottom melts into the page colour so
+          // there's no hard edge below it.
+          //
+          // The top inset is the room the floating home header sits in. It was
+          // a flat 90, which is the status bar (24) plus the header itself
+          // (8 + a 48 icon row) plus a little air. The header is inside a
+          // SafeArea, so on a phone with a tall cutout it slides DOWN as the
+          // status bar grows while this number stayed put — and the wordmark
+          // and icons ended up on the artwork. Grow with the inset instead.
+          //
+          // max() rather than a plain sum on purpose: 90 stays the floor, so
+          // no phone that looks right today has its card move at all.
+          Padding(
+            padding: EdgeInsets.fromLTRB(
+              16,
+              heroTopReserve(MediaQuery.paddingOf(context).top),
+              16,
+              40,
+            ),
+            child: _card(provider, tint, memW),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _card(ImageProvider? provider, Color tint, int memW) {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(28),
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          if (provider != null)
+            Image(
+              // Decode at the screen's actual size (not full source res) — same
+              // visible sharpness, a fraction of the memory + decode cost.
+              image: ResizeImage(provider, width: memW),
+              fit: BoxFit.cover,
+              frameBuilder: imageFadeIn,
+              // Crop from the top so the poster's own printed title block (and
+              // the thin rule above it) is pushed off the bottom and hidden by
+              // the gradient — also removes the duplicate "ghosted" title.
+              alignment: Alignment.topCenter,
+              gaplessPlayback: true,
+            )
+          else
+            ColoredBox(color: AppColors.surface2),
+
+          // Colour-matched top gradient — pulled from the artwork.
+          Positioned.fill(
+            child: IgnorePointer(
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [
+                      tint.withValues(alpha: 0.72),
+                      tint.withValues(alpha: 0.34),
+                      tint.withValues(alpha: 0.08),
+                      Colors.transparent,
+                    ],
+                    stops: const [0.0, 0.16, 0.34, 0.52],
+                  ),
+                ),
+              ),
+            ),
+          ),
+
+          // Bottom fade to the EXACT page colour, so the card bottom melts into
+          // the page with no hard bottom edge/line.
+          Positioned.fill(
+            child: IgnorePointer(
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [
+                      Color(0x000B0B0F),
+                      Color(0xB30B0B0F),
+                      AppColors.bg,
+                    ],
+                    stops: [0.42, 0.72, 1.0],
+                  ),
+                ),
+              ),
+            ),
+          ),
+
+          // ── Content ───────────────────────────────────────────────────────
+          // Anchored low in the card (Netflix/Apple-TV+-style) so there's no
+          // dead space below the buttons.
+          Positioned(
+            left: 20,
+            right: 20,
+            bottom: 40,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                GestureDetector(
+                  behavior: HitTestBehavior.translucent,
+                  onTap: widget.onInfo,
+                  child: _logoUrl != null
+                      ? ConstrainedBox(
+                          constraints: const BoxConstraints(maxHeight: 96),
+                          child: CachedNetworkImage(
+                            imageUrl: _logoUrl!,
+                            fit: BoxFit.contain,
+                            memCacheWidth: memW,
+                            fadeInDuration: const Duration(milliseconds: 250),
+                            // If the logo image itself fails, fall back to text.
+                            errorWidget: (_, _, _) => _titleText(),
+                          ),
+                        )
+                      : _titleText(),
+                ),
+                const SizedBox(height: 12),
+                // Metadata line (reserve height so the card never jumps).
+                SizedBox(height: 18, child: Center(child: _metaLine())),
+                const SizedBox(height: 18),
+                // Single action row — Play + inline My List (info is on the
+                // title tap / long-press), so the overlay stays compact.
+                // Each button is passed through [_wrap] so TV callers can
+                // inject TvFocusable focus without changing phone behaviour.
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    _wrap(_playButton(), widget.onPlay, autofocus: true),
+                    const SizedBox(width: 10),
+                    _wrap(
+                      _circleBtn(
+                        widget.inList
+                            ? Icons.check_rounded
+                            : Icons.add_rounded,
+                        widget.onToggleList,
+                        active: widget.inList,
+                        semanticLabel: widget.inList
+                            ? 'Remove from My List'
+                            : 'Add to My List',
+                      ),
+                      widget.onToggleList,
+                    ),
+                    const SizedBox(width: 10),
+                    _wrap(
+                      _circleBtn(
+                        Icons.info_outline_rounded,
+                        widget.onInfo,
+                        semanticLabel: 'Details',
+                      ),
+                      widget.onInfo,
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _titleText() => Text(
+    widget.item.title,
+    textAlign: TextAlign.center,
+    style: AppText.largeTitle.copyWith(
+      fontSize: 30,
+      height: 1.02,
+      letterSpacing: -0.6,
+    ),
+    maxLines: 2,
+    overflow: TextOverflow.ellipsis,
+  );
+
+  /// If a [widget.wrapButton] decorator was provided (TV), wraps [w] with it;
+  /// otherwise returns [w] unchanged — phone behaviour is exact.
+  Widget _wrap(Widget w, VoidCallback cb, {bool autofocus = false}) {
+    final decorator = widget.wrapButton;
+    return decorator != null ? decorator(w, cb, autofocus: autofocus) : w;
+  }
+
+  Widget _metaLine() {
+    return FutureBuilder<HeroMeta?>(
+      future: widget.metaFuture,
+      builder: (context, snap) {
+        final m = snap.data;
+        if (m == null) return const SizedBox.shrink();
+        final parts = <String>[...m.genres.take(3)];
+        if (m.episodeCount > 1) {
+          // Reading modes count chapters, not episodes (same shared
+          // Episode model underneath — display wording only).
+          parts.add(
+            '${m.episodeCount} ${widget.reading ? 'Chapters' : 'Episodes'}',
+          );
+        } else if (m.year != null && m.year!.isNotEmpty) {
+          parts.add(m.year!);
+        }
+        if (parts.isEmpty) return const SizedBox.shrink();
+        return Text(
+          parts.join('   ·   ').toUpperCase(),
+          textAlign: TextAlign.center,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: AppText.caption.copyWith(
+            color: Colors.white.withValues(alpha: 0.92),
+            fontWeight: FontWeight.w600,
+            letterSpacing: 1.8,
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _playButton() {
+    return Material(
+      color: Colors.white,
+      borderRadius: BorderRadius.circular(12),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: widget.onPlay,
+        child: SizedBox(
+          width: 138,
+          height: 44,
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                widget.reading
+                    ? Icons.menu_book_rounded
+                    : Icons.play_arrow_rounded,
+                color: AppColors.bg,
+                size: 20,
+              ),
+              SizedBox(width: 7),
+              Text(
+                widget.reading ? 'Read' : 'Play',
+                style: TextStyle(
+                  fontFamily: AppText.fontFamily,
+          fontFamilyFallback: AppText.fontFamilyFallback,
+                  color: AppColors.bg,
+                  fontWeight: FontWeight.w700,
+                  fontSize: 15,
+                  letterSpacing: -0.2,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Inline glass circular action (My List / Info) sitting next to Play.
+  Widget _circleBtn(
+    IconData icon,
+    VoidCallback onTap, {
+    bool active = false,
+    String? semanticLabel,
+  }) {
+    return Semantics(
+      button: true,
+      label: semanticLabel,
+      child: GestureDetector(
+        onTap: onTap,
+        behavior: HitTestBehavior.opaque,
+        child: Container(
+          width: 44,
+          height: 44,
+          decoration: BoxDecoration(
+            color: Colors.white.withValues(alpha: 0.14),
+            shape: BoxShape.circle,
+            border: Border.all(color: Colors.white.withValues(alpha: 0.2)),
+          ),
+          child: Icon(
+            icon,
+            color: active ? AppColors.accent : Colors.white,
+            size: 21,
+          ),
+        ),
+      ),
+    );
+  }
+}

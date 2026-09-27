@@ -1,0 +1,892 @@
+import 'dart:io';
+
+import 'package:flutter/foundation.dart';
+import 'package:hive/hive.dart';
+import 'package:watch_app/core/hive/safe_box.dart';
+
+/// Subtitle font families bundled in the app (registered in pubspec's
+/// `flutter: fonts:`). Used by the player's Subtitle-style font picker; the
+/// stored value is the mpv `sub-font` family name. The leading empty entry is
+/// "Default" (let mpv pick / use the embedded ASS font).
+const List<String> kBundledSubtitleFonts = [
+  '',
+  'Inter',
+  'Poppins',
+  'Roboto',
+  'Open Sans',
+  'Lato',
+  'Montserrat',
+  'Nunito',
+  'Rubik',
+  'Noto Sans',
+  'Source Sans 3',
+];
+
+/// (key, label) for the in-player info overlay, in display order. The overlay
+/// shows the fields the user ticks (Settings → Playback → Player info overlay)
+/// and auto-appears with the player controls. "Stats for nerds"-style.
+const List<(String, String)> kPlayerInfoFields = [
+  ('resolution', 'Resolution'),
+  ('source', 'Source'),
+  ('quality', 'Quality'),
+  ('vcodec', 'Video codec'),
+  ('acodec', 'Audio codec'),
+  ('fps', 'Frame rate'),
+  ('vbitrate', 'Video bitrate'),
+  ('buffer', 'Buffer'),
+  ('dropped', 'Dropped frames'),
+  ('decoder', 'Decoder'),
+  ('speed', 'Speed'),
+  ('atrack', 'Audio track'),
+  ('strack', 'Subtitle track'),
+  ('af', 'Audio boost'),
+];
+
+/// The mpv video output (renderer) for a given user [choice].
+///
+/// 'auto' reproduces the behaviour from before the Video renderer setting
+/// existed — gpu-next only while Anime4K is on, otherwise null so media_kit
+/// picks its own default (gpu). TV never uses mpv, so it always gets null.
+///
+/// Pure so the "auto changes nothing" guarantee is testable.
+String? resolveVideoOutput({
+  required bool isTv,
+  required String choice,
+  required String shaderStyle,
+}) {
+  if (isTv) return null;
+  if (choice != 'auto') return choice;
+  return shaderStyle != 'off' ? 'gpu-next' : null;
+}
+
+/// The family of hardware video decoder a platform exposes to mpv.
+///
+/// Every platform names its own video chip: Android `mediacodec`, Apple
+/// `videotoolbox`, Windows `d3d11va`, Linux `vaapi`. mpv only accepts the name
+/// its own build was compiled with.
+enum DecoderPlatform { android, apple, windows, linux, other }
+
+DecoderPlatform get currentDecoderPlatform {
+  if (Platform.isAndroid) return DecoderPlatform.android;
+  if (Platform.isIOS || Platform.isMacOS) return DecoderPlatform.apple;
+  if (Platform.isWindows) return DecoderPlatform.windows;
+  if (Platform.isLinux) return DecoderPlatform.linux;
+  return DecoderPlatform.other;
+}
+
+/// The mpv `hwdec` value for decoder [choice] on [platform].
+///
+/// This MUST branch per platform, and the failure it prevents is silent. mpv
+/// ACCEPTS any string here — the name is only looked up later, when the decoder
+/// is initialised. Handing an iPhone Android's name produced exactly this, read
+/// off a real iOS build:
+///
+///     Unsupported hwdec: mediacodec-copy
+///     Using software decoding.
+///
+/// No error, no exception, nothing the app could notice — just a phone quietly
+/// decoding 4K on its CPU and stuttering on hardware that handles 4K easily.
+/// With the right name the same build reports `hwdec-current =
+/// videotoolbox-copy` instead of `no`.
+///
+/// Pure so every platform's mapping is testable from one machine.
+String resolveHwdec({
+  required String choice,
+  required String videoOutput,
+  required DecoderPlatform platform,
+}) {
+  // mediacodec_embed keeps the frame on the Android surface, which only works
+  // with the non-copy mediacodec decoder — every other choice renders nothing
+  // at all, so the renderer pick wins over the decoder pick. It is an
+  // Android-only renderer, so the override is too.
+  if (platform == DecoderPlatform.android &&
+      videoOutput == 'mediacodec_embed') {
+    return 'mediacodec';
+  }
+  switch (choice) {
+    case 'sw':
+      return 'no';
+    case 'auto':
+      return 'auto-safe';
+    case 'direct':
+      return switch (platform) {
+        DecoderPlatform.android => 'mediacodec',
+        DecoderPlatform.apple => 'videotoolbox',
+        DecoderPlatform.windows => 'd3d11va',
+        DecoderPlatform.linux => 'vaapi',
+        DecoderPlatform.other => 'auto',
+      };
+    case 'copy':
+    default:
+      return switch (platform) {
+        DecoderPlatform.android => 'mediacodec-copy',
+        // `-copy` and not plain `videotoolbox`, measured rather than assumed:
+        // plain videotoolbox needs mpv's GL interop, and where that interop is
+        // unavailable mpv logs "Using software decoding" and silently drops to
+        // the CPU — the very failure this mapping exists to prevent. The copy
+        // variant needs no interop and logs "Trying hardware decoding". This
+        // is the default mode, so it takes the path that always decodes in
+        // hardware; 'direct' below is the no-readback option.
+        DecoderPlatform.apple => 'videotoolbox-copy',
+        DecoderPlatform.windows => 'd3d11va-copy',
+        DecoderPlatform.linux => 'vaapi-copy',
+        DecoderPlatform.other => 'auto-copy',
+      };
+  }
+}
+
+/// Persistent, app-wide playback preferences (default quality, sub/dub
+/// category, autoplay, speed, seek step, keep-screen-on, auto-resume). Backed
+/// by a tiny untyped Hive box read anywhere via `sl<PlaybackPrefs>()`. Values
+/// are read with defaults so a fresh install behaves sensibly; numbers are
+/// coerced defensively since Hive may round-trip them as `int`/`double`/`num`.
+class PlaybackPrefs {
+  static const String boxName = 'playback_prefs';
+  static const String androidPlayerId = 'zangetsu.android.player';
+
+  /// Opens the prefs box. Call once during app bootstrap before constructing.
+  static Future<void> init() async {
+    if (!Hive.isBoxOpen(boxName)) {
+      await openBoxSafely(boxName);
+    }
+    final box = Hive.box<dynamic>(boxName);
+    if (!box.containsKey('externalPlayerPackage') &&
+        box.get('experimentalExoPlayer') == true) {
+      await box.put('externalPlayerPackage', androidPlayerId);
+      await box.put('externalPlayerLabel', 'Android Player');
+    }
+    await box.delete('experimentalExoPlayer');
+  }
+
+  Box get _box => Hive.box(boxName);
+
+  /// Preferred stream quality: 'auto'|'highest'|'1080p'|'720p'|'480p'.
+  String get defaultQuality =>
+      _box.get('defaultQuality', defaultValue: 'auto') as String;
+  Future<void> setDefaultQuality(String value) =>
+      _box.put('defaultQuality', value);
+
+  /// Preferred audio category: 'sub'|'dub'.
+  String get defaultCategory =>
+      _box.get('defaultCategory', defaultValue: 'sub') as String;
+  Future<void> setDefaultCategory(String value) =>
+      _box.put('defaultCategory', value);
+
+  /// Whether to automatically start the next episode when one finishes.
+  bool get autoplayNext => _box.get('autoplayNext', defaultValue: true) as bool;
+  Future<void> setAutoplayNext(bool value) => _box.put('autoplayNext', value);
+
+  /// Whether the detail-screen hero trailer autoplays once it resolves
+  /// (Netflix-style). On by default; off opens it paused with a play button.
+  bool get autoplayTrailer =>
+      _box.get('autoplayTrailer', defaultValue: true) as bool;
+  Future<void> setAutoplayTrailer(bool value) =>
+      _box.put('autoplayTrailer', value);
+
+  /// Play the fullscreen trailer in HD (up to 1080p) instead of the light 360p
+  /// stream. Off by default: 1080p is only offered as separate video+audio
+  /// streams (joined at playback) and uses noticeably more data. The
+  /// autoplaying detail-page hero stays light regardless of this.
+  bool get trailerHd => _box.get('trailerHd', defaultValue: false) as bool;
+  Future<void> setTrailerHd(bool value) => _box.put('trailerHd', value);
+
+  /// Default playback speed multiplier.
+  double get defaultSpeed =>
+      (_box.get('defaultSpeed', defaultValue: 1.0) as num).toDouble();
+  Future<void> setDefaultSpeed(double value) => _box.put('defaultSpeed', value);
+
+  /// How many seconds a single seek (forward/back) jumps.
+  int get seekSeconds =>
+      (_box.get('seekSeconds', defaultValue: 10) as num).toInt();
+  Future<void> setSeekSeconds(int value) => _box.put('seekSeconds', value);
+
+  /// How many seconds a double-tap-to-seek jumps (±5/10/15/30s). Aliases the
+  /// same stored key as [seekSeconds] so the player and the "Double-tap skip"
+  /// setting share one source of truth; exposed under this name for clarity at
+  /// the double-tap call sites.
+  int get doubleTapSeconds => seekSeconds;
+  Future<void> setDoubleTapSeconds(int value) => setSeekSeconds(value);
+
+  /// How many seconds a single seek (forward/back) jumps on TV.
+  int get tvSeekSeconds =>
+      (_box.get('tvSeekSeconds', defaultValue: 10) as num).toInt();
+  Future<void> setTvSeekSeconds(int value) => _box.put('tvSeekSeconds', value);
+
+  /// Whether the player shows the seek buttons at all (only on TV). Not available for on phones,
+  /// where the double-tap gesture is the main way to seek. On by default on TV,
+  /// where double-tap isn't a thing and the only way to seek is through remote buttons.
+  /// [seekButtons] enables the buttons; [tvSeekSeconds] is the jump size (default 10).
+  bool get seekButtons => _box.get('seekButtons', defaultValue: true) as bool;
+  Future<void> setSeekButtons(bool value) => _box.put('seekButtons', value);
+
+
+  /// Whether to keep the screen awake while playing.
+  bool get keepScreenOn => _box.get('keepScreenOn', defaultValue: true) as bool;
+  Future<void> setKeepScreenOn(bool value) => _box.put('keepScreenOn', value);
+
+  /// Auto-enter Picture-in-Picture when leaving the app mid-playback (Android).
+  /// The manual PiP button works regardless of this setting.
+  bool get autoPip => _box.get('autoPip', defaultValue: true) as bool;
+  Future<void> setAutoPip(bool value) => _box.put('autoPip', value);
+
+  /// Route TV playback to the fully-native player (TvPlayerActivity, real-window
+  /// SurfaceView) instead of the Flutter platform-view player. Default ON on TV:
+  /// the platform-view surface black-screens on some TVs, and the native window
+  /// renders directly. Turning it OFF falls back to the old Flutter player.
+  /// Phone is unaffected (it never reads this).
+  bool get nativeTvPlayer =>
+      _box.get('nativeTvPlayer', defaultValue: true) as bool;
+  Future<void> setNativeTvPlayer(bool value) =>
+      _box.put('nativeTvPlayer', value);
+
+  /// Enable FFmpeg software audio decoding in the native TV player, so TVs that
+  /// lack hardware Dolby (AC3/E-AC3) or DTS play those tracks instead of going
+  /// silent. Off by default — CloudStream disables it on TV by default too
+  /// ("because of crashes"), so it's strictly opt-in. Hardware decoders stay
+  /// preferred (EXTENSION_RENDERER_MODE_ON); FFmpeg only fills the gap.
+  bool get tvSoftwareDecoding =>
+      _box.get('tvSoftwareDecoding', defaultValue: false) as bool;
+  Future<void> setTvSoftwareDecoding(bool value) =>
+      _box.put('tvSoftwareDecoding', value);
+
+  /// Whether to resume a title from its saved position automatically.
+  bool get autoResume => _box.get('autoResume', defaultValue: true) as bool;
+  Future<void> setAutoResume(bool value) => _box.put('autoResume', value);
+
+  /// Ask before opening something that isn't where you left off, so a look at
+  /// a later chapter/episode doesn't quietly move your place — or, jumping
+  /// backwards, drag the tracker count DOWN to whatever you re-opened.
+  ///
+  /// OFF by default: it puts a dialog in front of a very common tap, and an
+  /// existing install should keep behaving exactly as it did until someone
+  /// asks for this.
+  bool get askOnJump => _box.get('askOnJump', defaultValue: false) as bool;
+  Future<void> setAskOnJump(bool value) => _box.put('askOnJump', value);
+
+  /// Auto-add a title to My List (as "Watching"/"Reading") the first time you
+  /// open it — mirrors the tracker auto-scrobble. On by default; anyone who's
+  /// explicitly flipped this keeps their own choice, this only changes what a
+  /// never-touched install starts with.
+  bool get autoAddToMyList =>
+      _box.get('autoAddToMyList', defaultValue: true) as bool;
+  Future<void> setAutoAddToMyList(bool value) =>
+      _box.put('autoAddToMyList', value);
+
+  /// Push progress to the connected trackers (AniList / MAL / Simkl) as you
+  /// watch — the title goes "watching" when playback starts and the episode
+  /// count follows once you've finished one. Off means the accounts stay
+  /// connected and readable, but nothing is written unless you ask for it from
+  /// the Tracking sheet or a long-press "Mark as watched". On by default, so
+  /// this changes nothing until someone turns it off.
+  bool get autoTrack => _box.get('autoTrack', defaultValue: true) as bool;
+  Future<void> setAutoTrack(bool value) => _box.put('autoTrack', value);
+
+  /// How closing the player is guarded against accidental exits:
+  ///  • 'double_back' = first back shows a "press back again" hint, second back
+  ///    within 2s exits. DEFAULT.
+  ///  • 'confirm'     = an "Are you sure?" dialog before leaving.
+  ///  • 'direct'      = leave immediately (legacy behaviour, no guard).
+  String get closeConfirmation =>
+      _box.get('closeConfirmation', defaultValue: 'double_back') as String;
+  Future<void> setCloseConfirmation(String value) =>
+      _box.put('closeConfirmation', value);
+
+  /// Whether installed extensions (Zangetsu / CloudStream / Aniyomi) auto-update
+  /// in the background on launch, throttled to ~once a day. Off by default —
+  /// updates otherwise happen only when the user taps Update in Sources. A
+  /// failed update always leaves the working version in place.
+  bool get autoUpdateExtensions =>
+      _box.get('autoUpdateExtensions', defaultValue: false) as bool;
+  Future<void> setAutoUpdateExtensions(bool value) =>
+      _box.put('autoUpdateExtensions', value);
+
+  /// Style of the batch-download sheet (detail → Download on a multi-episode
+  /// title):
+  ///  • 'classic' = the full sheet with a per-episode thumbnail grid. DEFAULT.
+  ///  • 'minimal' = a number-wheel "how many episodes" picker with the
+  ///    sub/dub · season · quality controls tucked into one line.
+  /// Both return the exact same selection, so the download itself is identical.
+  String get batchDownloadStyle =>
+      _box.get('batchDownloadStyle', defaultValue: 'classic') as String;
+  Future<void> setBatchDownloadStyle(String value) =>
+      _box.put('batchDownloadStyle', value);
+
+  /// Epoch millis of the last background extension-update pass (throttle gate).
+  int get lastExtensionUpdateMs =>
+      (_box.get('lastExtensionUpdateMs', defaultValue: 0) as num).toInt();
+  Future<void> setLastExtensionUpdateMs(int value) =>
+      _box.put('lastExtensionUpdateMs', value);
+
+  /// Whether vertical swipe gestures in the player adjust brightness (left half)
+  /// and volume (right half), MX/Netflix-style.
+  bool get gestureControls =>
+      _box.get('gestureControls', defaultValue: true) as bool;
+  Future<void> setGestureControls(bool value) =>
+      _box.put('gestureControls', value);
+
+  /// Whether dragging left/right across the video scrubs through the episode.
+  /// Separate from [gestureControls], which only ever covered the vertical
+  /// swipes — the horizontal one was ungated until now, so turning that off
+  /// left scrubbing live. It maps the full screen width to the whole runtime,
+  /// so a stray sideways drag can throw your position minutes away; this is
+  /// the switch for people who'd rather it didn't.
+  bool get swipeSeek => _box.get('swipeSeek', defaultValue: true) as bool;
+  Future<void> setSwipeSeek(bool value) => _box.put('swipeSeek', value);
+
+  /// The player bottom bar's arrangement — which controls sit on the left,
+  /// which on the right. Unset means "never customised", so the defaults apply
+  /// and the bar looks exactly as it did before the screen existed.
+  ///
+  /// Hidden isn't stored: it's whatever isn't in either list. That's what lets
+  /// a control added in a later version land in Hidden on its own, instead of
+  /// needing every saved layout migrated.
+  List<String>? get playerBarTop =>
+      (_box.get('playerBarTop') as List?)?.cast<String>();
+  List<String>? get playerBarLeft =>
+      (_box.get('playerBarLeft') as List?)?.cast<String>();
+  List<String>? get playerBarRight =>
+      (_box.get('playerBarRight') as List?)?.cast<String>();
+
+  Future<void> setPlayerBar(
+    List<String> top,
+    List<String> left,
+    List<String> right,
+  ) async {
+    await _box.put('playerBarTop', top);
+    await _box.put('playerBarLeft', left);
+    await _box.put('playerBarRight', right);
+  }
+
+  /// Back to the shipped layout — clears the keys rather than writing the
+  /// defaults in, so a future change to those defaults reaches anyone who
+  /// hasn't customised.
+  Future<void> resetPlayerBar() async {
+    await _box.delete('playerBarTop');
+    await _box.delete('playerBarLeft');
+    await _box.delete('playerBarRight');
+  }
+
+  /// Whether long-pressing the video plays at 2× while held.
+  bool get holdSpeed => _box.get('holdSpeed', defaultValue: true) as bool;
+  Future<void> setHoldSpeed(bool value) => _box.put('holdSpeed', value);
+
+  /// In-app volume level (0–200%), applied via mpv's own volume — independent of
+  /// the Android system volume. 100 = original loudness; >100 boosts (with
+  /// volume-max raised to 200, CloudStream-style).
+  int get volumeBoost =>
+      (_box.get('volumeBoost', defaultValue: 100) as num).toInt().clamp(0, 200);
+  Future<void> setVolumeBoost(int value) =>
+      _box.put('volumeBoost', value.clamp(0, 200));
+
+  /// Whether to apply dynamic audio normalization (mpv 'dynaudnorm' filter) so
+  /// quiet/loud passages are levelled out.
+  bool get audioNormalize =>
+      _box.get('audioNormalize', defaultValue: false) as bool;
+  Future<void> setAudioNormalize(bool value) =>
+      _box.put('audioNormalize', value);
+
+  /// Video decoder mode (labels match the wider ecosystem now):
+  ///  • 'copy'   = Hardware+ — MediaCodec decoded into mpv's pipeline
+  ///    (`mediacodec-copy`): robust A/V sync, shaders/filters work. DEFAULT.
+  ///  • 'direct' = Hardware — MediaCodec straight to the surface (`mediacodec`):
+  ///    faster/lighter, but can drift after a stall + some filter limits.
+  ///  • 'sw'     = Software (`no`) — slower/more battery, plays anything.
+  ///  • 'auto'   = mpv picks a safe decoder (`auto-safe`).
+  /// Old stored values migrate on read: both the old 'hw' (default) and 'hw+'
+  /// (the old "Hardware+" pick) resolve to 'copy' — i.e. the new **Hardware+**
+  /// (`mediacodec-copy`), the recommended robust mode. So anyone previously on
+  /// either hardware option lands on Hardware+; 'direct' is only reached by
+  /// newly picking "Hardware (faster)".
+  String get videoDecoder {
+    final v = _box.get('videoDecoder', defaultValue: 'copy') as String;
+    return switch (v) {
+      'hw' || 'hw+' => 'copy',
+      _ => v,
+    };
+  }
+
+  Future<void> setVideoDecoder(String value) => _box.put('videoDecoder', value);
+
+  /// mpv video output (renderer) for the phone player: 'auto' (default), 'gpu',
+  /// 'gpu-next' or 'mediacodec_embed'. 'auto' reproduces the behaviour from
+  /// before this setting existed, so an untouched install is unchanged.
+  ///
+  /// The reason this is exposed at all is `mediacodec_embed`: MediaCodec draws
+  /// straight onto the Android surface, so mpv's GL renderer is never used. On
+  /// devices whose GPU driver can't run that renderer the video is black while
+  /// audio and controls work fine, and no source or decoder change helps —
+  /// this is the only knob that does. TV is unaffected (it doesn't use mpv).
+  String get videoOutput =>
+      _box.get('videoOutput', defaultValue: 'auto') as String;
+  Future<void> setVideoOutput(String value) => _box.put('videoOutput', value);
+
+  /// The mpv `hwdec` property value for the current [videoDecoder] choice, for
+  /// the platform actually running. See [resolveHwdec].
+  String get hwdecValue => resolveHwdec(
+    choice: videoDecoder,
+    videoOutput: videoOutput,
+    platform: currentDecoderPlatform,
+  );
+
+  // ── Anime4K enhancement (GLSL upscaling) ───────────────────────────────────
+  // Real-time neural upscaling for low-res anime. STYLE = the filter: 'off'
+  // (default), 'a' Sharpen, 'b' De-blur, 'c' Denoise. TIER = GPU cost: 'mid'
+  // (light) / 'high' (heavy). Applied via `glsl-shaders`; routed through the
+  // gpu-next renderer + deband/HQ-scaling render tuning when style != 'off'.
+  String get videoShaderStyle =>
+      _box.get('videoShaderStyle', defaultValue: 'off') as String;
+  Future<void> setVideoShaderStyle(String value) =>
+      _box.put('videoShaderStyle', value);
+
+  String get videoShaderTier =>
+      _box.get('videoShaderTier', defaultValue: 'mid') as String;
+  Future<void> setVideoShaderTier(String value) =>
+      _box.put('videoShaderTier', value);
+
+  // ── Colour adjustment (mpv video-equalizer, each -100..100, 0 = neutral) ────
+  // Individual sliders; all 0 (default) = no change = stock playback. A preset
+  // (see [ColorProfiles]) just sets these five at once.
+  int get colorBrightness =>
+      (_box.get('colorBrightness', defaultValue: 0) as num).toInt();
+  Future<void> setColorBrightness(int v) => _box.put('colorBrightness', v);
+  int get colorContrast =>
+      (_box.get('colorContrast', defaultValue: 0) as num).toInt();
+  Future<void> setColorContrast(int v) => _box.put('colorContrast', v);
+  int get colorSaturation =>
+      (_box.get('colorSaturation', defaultValue: 0) as num).toInt();
+  Future<void> setColorSaturation(int v) => _box.put('colorSaturation', v);
+  int get colorGamma =>
+      (_box.get('colorGamma', defaultValue: 0) as num).toInt();
+  Future<void> setColorGamma(int v) => _box.put('colorGamma', v);
+  int get colorHue => (_box.get('colorHue', defaultValue: 0) as num).toInt();
+  Future<void> setColorHue(int v) => _box.put('colorHue', v);
+
+  /// Skip filler episodes when advancing to the next one (anime only; needs
+  /// MAL/filler data). Applies to autoplay and the Next button.
+  /// Off by default.
+  bool get autoSkipFiller =>
+      _box.get('autoSkipFiller', defaultValue: false) as bool;
+  Future<void> setAutoSkipFiller(bool v) => _box.put('autoSkipFiller', v);
+
+  // ── Video buffering (mpv cache) ────────────────────────────────────────────
+  // Presets, NOT raw values, so a user can't set a footgun. 'default' returns
+  // exactly today's hardcoded numbers, so a fresh install / untouched setting is
+  // byte-identical. 'low' shrinks the buffers for low-RAM / Android-TV to avoid
+  // OOM; 'high' enlarges them for smoother playback on strong devices; 'max'
+  // is LENGTH-only, for connections that drop out for minutes at a time.
+  static const List<String> bufferPresets = ['low', 'default', 'high', 'max'];
+
+  /// Forward+back demuxer buffer SIZE preset: 'low' | 'default' | 'high'.
+  String get videoBufferSize =>
+      _box.get('videoBufferSize', defaultValue: 'default') as String;
+  Future<void> setVideoBufferSize(String value) =>
+      _box.put('videoBufferSize', value);
+
+  /// Buffer LENGTH (seconds of readahead) preset: 'low' | 'default' | 'high'.
+  String get videoBufferLength =>
+      _box.get('videoBufferLength', defaultValue: 'default') as String;
+  Future<void> setVideoBufferLength(String value) =>
+      _box.put('videoBufferLength', value);
+
+  /// mpv `demuxer-max-bytes` for the current size preset (default = 128MiB).
+  String get bufferMaxBytes => bufferMaxBytesFor(videoBufferSize);
+
+  /// mpv `demuxer-max-back-bytes`, scaled with the size preset (default = 48MiB).
+  String get bufferMaxBackBytes => bufferMaxBackBytesFor(videoBufferSize);
+
+  /// Seconds for mpv `cache-secs` + `demuxer-readahead-secs` (default = 60).
+  int get bufferSecs => bufferSecsFor(videoBufferLength);
+
+  // Pure preset→mpv-value maps (static so they're unit-testable without Hive).
+  // The 'default' branch MUST return the app's legacy hardcoded values so an
+  // untouched setting keeps playback byte-identical.
+  static String bufferMaxBytesFor(String preset) {
+    switch (preset) {
+      case 'low':
+        return '32MiB';
+      case 'high':
+      case 'max': // length-only preset; if it ever lands here, don't shrink
+        return '512MiB';
+      default:
+        return '128MiB';
+    }
+  }
+
+  static String bufferMaxBackBytesFor(String preset) {
+    switch (preset) {
+      case 'low':
+        return '16MiB';
+      case 'high':
+      case 'max':
+        return '128MiB';
+      default:
+        return '48MiB';
+    }
+  }
+
+  static int bufferSecsFor(String preset) {
+    switch (preset) {
+      case 'low':
+        return 15;
+      case 'high':
+        return 120;
+      case 'max':
+        // Costs no extra worst-case memory: both engines stop at whichever of
+        // seconds and bytes comes first, so the size preset still caps this.
+        // At ~5 Mbps (1080p anime) 300s is ~187MB, comfortably inside the
+        // 512MiB 'high' cap; at 4K the byte cap binds first, around 165s.
+        return 300;
+      default:
+        return 60;
+    }
+  }
+
+  // ── The same presets, translated for ExoPlayer (TV players + the phone's
+  // ClearKey DRM screen) ─────────────────────────────────────────────────────
+  // mpv and ExoPlayer buffer through completely different knobs, so the presets
+  // have to be mapped twice. Until this existed the TV players built ExoPlayer
+  // with no LoadControl at all and silently sat on the library default (~50s),
+  // which meant moving this setting to High did nothing whatsoever on a TV —
+  // the device most likely to be on far-away Wi-Fi in the first place.
+
+  /// ExoPlayer `maxBufferMs` for the length preset — the mpv seconds in ms, so
+  /// both engines buffer the same amount of media for a given preset.
+  static int exoMaxBufferMsFor(String preset) => bufferSecsFor(preset) * 1000;
+
+  /// ExoPlayer `minBufferMs`: the library default (50s), except that
+  /// DefaultLoadControl requires min <= max, which 'low' (15s) would violate.
+  static int exoMinBufferMsFor(String preset) {
+    const exoDefaultMin = 50000;
+    final max = exoMaxBufferMsFor(preset);
+    return max < exoDefaultMin ? max : exoDefaultMin;
+  }
+
+  /// ExoPlayer `targetBufferBytes` — the memory ceiling, mirroring the mpv
+  /// size preset so "High" means the same thing on both engines. ExoPlayer
+  /// stops buffering at whichever of this and [exoMaxBufferMsFor] comes first.
+  static int exoTargetBufferBytesFor(String preset) {
+    switch (preset) {
+      case 'low':
+        return 32 * 1024 * 1024;
+      case 'high':
+      case 'max':
+        return 512 * 1024 * 1024;
+      default:
+        return 128 * 1024 * 1024;
+    }
+  }
+
+  /// ExoPlayer back-buffer: keeps recently played media so a small seek back
+  /// doesn't re-download. Off on 'low', where the point is to save memory.
+  static int exoBackBufferMsFor(String preset) => preset == 'low' ? 0 : 30000;
+
+  /// The four values above for the current settings, shaped for the
+  /// `zangetsu/exoplayer_view` PlatformView's `creationParams` and for the
+  /// native TV player's launch arguments. One accessor so every ExoPlayer entry
+  /// point sends the same thing and none of them can drift.
+  Map<String, dynamic> get exoBufferParams => <String, dynamic>{
+    'minBufferMs': exoMinBufferMsFor(videoBufferLength),
+    'maxBufferMs': exoMaxBufferMsFor(videoBufferLength),
+    'targetBufferBytes': exoTargetBufferBytesFor(videoBufferSize),
+    'backBufferMs': exoBackBufferMsFor(videoBufferSize),
+  };
+
+  /// Home hero banner animation: 'cinematic' (cross-fade + Ken-Burns) or
+  /// 'parallax' (parallax slide). A/B while we settle on the final one.
+  String get heroStyle =>
+      _box.get('heroStyle', defaultValue: 'cinematic') as String;
+  Future<void> setHeroStyle(String value) => _box.put('heroStyle', value);
+
+  /// Whether to show live scrub-preview thumbnails for ONLINE streams. Offline
+  /// downloads always preview (it's instant and free); online generates frames
+  /// live, which costs a little extra data, so it's user-toggleable.
+  bool get seekPreviewOnline =>
+      _box.get('seekPreviewOnline', defaultValue: false) as bool;
+  Future<void> setSeekPreviewOnline(bool value) =>
+      _box.put('seekPreviewOnline', value);
+
+  /// Which fields the in-player info overlay shows (keys from
+  /// [kPlayerInfoFields]). Empty = overlay off. Auto-shown with the controls.
+  List<String> get playerInfoFields =>
+      (_box.get('playerInfoFields', defaultValue: const <String>[]) as List)
+          .cast<String>();
+  Future<void> setPlayerInfoFields(List<String> value) =>
+      _box.put('playerInfoFields', value);
+
+  /// Show the current quality as plain text on the top-bar right, fading
+  /// with the controls — separate from the ⓘ info panel. The
+  /// legacy Hive key name is kept. Default off.
+  bool get alwaysShowQuality =>
+      _box.get('alwaysShowQuality', defaultValue: false) as bool;
+  Future<void> setAlwaysShowQuality(bool value) =>
+      _box.put('alwaysShowQuality', value);
+
+  /// Show the source's claimed release quality as a poster badge — 4K / HD /
+  /// CAM and so on. Only CloudStream reports one, so the badge appears on some
+  /// results and not others; on by default, matching what CloudStream itself
+  /// does. Note it's the provider's claim, not something we verify.
+  bool get qualityBadges =>
+      _box.get('qualityBadges', defaultValue: true) as bool;
+
+  /// Bumped ONLY by [setQualityBadges], so the badge on a poster can rebuild
+  /// itself the moment the switch flips. Same shape as
+  /// `ThemeController.revision`. Nothing else touches it, so no other setting
+  /// — and no navigation — can make a poster rebuild through this.
+  static final ValueNotifier<int> badgeRevision = ValueNotifier<int>(0);
+
+  Future<void> setQualityBadges(bool value) async {
+    await _box.put('qualityBadges', value);
+    badgeRevision.value++;
+  }
+
+  /// Whether to show the accurate AniSkip "Skip opening/ending" button (anime,
+  /// when real OP/ED timings are detected).
+  bool get skipIntro => _box.get('skipIntro', defaultValue: true) as bool;
+  Future<void> setSkipIntro(bool value) => _box.put('skipIntro', value);
+
+  /// Jump past the opening / ending on their own, no tap, when AniSkip has real
+  /// timings for the episode. Independent of [skipIntro] (that one only governs
+  /// the manual button). Off by default — auto-seeking is the kind of thing you
+  /// opt into, and AniSkip timings are occasionally wrong.
+  bool get autoSkipOp => _box.get('autoSkipOp', defaultValue: false) as bool;
+  Future<void> setAutoSkipOp(bool value) => _box.put('autoSkipOp', value);
+
+  bool get autoSkipEd => _box.get('autoSkipEd', defaultValue: false) as bool;
+  Future<void> setAutoSkipEd(bool value) => _box.put('autoSkipEd', value);
+
+  /// Same for the "previously on..." recap some episodes open with. Its own
+  /// toggle rather than riding on [autoSkipOp]: a recap is content you might
+  /// actually want, and unlike an opening it can start at 0:00.
+  bool get autoSkipRecap =>
+      _box.get('autoSkipRecap', defaultValue: false) as bool;
+  Future<void> setAutoSkipRecap(bool value) => _box.put('autoSkipRecap', value);
+
+  /// MegaSkip — a manual "jump forward N seconds" button shown in the player
+  /// (Aniyomi-style), independent of the accurate AniSkip OP/ED skip above.
+  /// [megaSkip] toggles the button; [megaSkipSeconds] is the jump size, clamped
+  /// 5–180s (default 85 ≈ a typical anime opening).
+  bool get megaSkip => _box.get('megaSkip', defaultValue: true) as bool;
+  Future<void> setMegaSkip(bool value) => _box.put('megaSkip', value);
+
+  static const int megaSkipMin = 5;
+  static const int megaSkipMax = 180;
+  int get megaSkipSeconds {
+    final v = (_box.get('megaSkipSeconds', defaultValue: 85) as num).toInt();
+    return v.clamp(megaSkipMin, megaSkipMax);
+  }
+
+  Future<void> setMegaSkipSeconds(int value) =>
+      _box.put('megaSkipSeconds', value.clamp(megaSkipMin, megaSkipMax));
+
+  /// Default player. Empty string = the built-in player; otherwise the package
+  /// id of an external player (e.g. 'org.videolan.vlc') to hand streams to.
+  /// [externalPlayerLabel] is the human name shown in settings.
+  String get externalPlayerPackage =>
+      _box.get('externalPlayerPackage', defaultValue: '') as String;
+  String get externalPlayerLabel =>
+      _box.get('externalPlayerLabel', defaultValue: '') as String;
+  Future<void> setExternalPlayer(String package, String label) async {
+    await _box.put('externalPlayerPackage', package);
+    await _box.put('externalPlayerLabel', label);
+  }
+
+  /// Whether sources flagged NSFW in their repo manifest are shown and usable.
+  /// Off by default; turning it on is gated behind a confirmation in Privacy
+  /// settings. When off, NSFW sources are hidden from the source list + switcher.
+  bool get nsfwSources => _box.get('nsfwSources', defaultValue: false) as bool;
+  Future<void> setNsfwSources(bool value) => _box.put('nsfwSources', value);
+
+  /// Whether the metadata catalogues may return adult (18+) titles.
+  ///
+  /// Separate from [nsfwSources], which is about which SOURCES are listed —
+  /// this is about the AniList/MAL/TMDB catalogue itself. Off by default, and
+  /// enforced in [MetadataRepository] rather than only in the filter sheet, so
+  /// a stale saved filter cannot bring adult results back after it is turned
+  /// off. Simkl has no such flag, so it is unaffected either way.
+  bool get adultMetadata =>
+      _box.get('adultMetadata', defaultValue: false) as bool;
+  Future<void> setAdultMetadata(bool value) =>
+      _box.put('adultMetadata', value);
+
+  /// Whether Aniyomi sources flagged as NSFW (18+) are shown in the source
+  /// list and switcher. Off by default; turning it on requires confirmation.
+  /// When off, NSFW-flagged Aniyomi providers are hidden at display time;
+  /// they remain registered in AniyomiManager and are never unloaded.
+  bool get showNsfwAniyomi =>
+      _box.get('showNsfwAniyomi', defaultValue: false) as bool;
+  Future<void> setShowNsfwAniyomi(bool value) =>
+      _box.put('showNsfwAniyomi', value);
+
+  // ── Subtitle styling (applied via mpv) ─────────────────────────────────────
+  /// Render subtitles with mpv/libass — real .ass styling (fonts, positions,
+  /// karaoke, signs) — instead of media_kit's flat Flutter text overlay.
+  /// Read at player creation. Default off: libass on Android uses the app's
+  /// bundled (Latin) fonts, so non-Latin subs (CJK/Devanagari/Arabic) can show
+  /// missing-glyph boxes — the Flutter overlay falls back to the system font.
+  bool get styledSubtitles =>
+      _box.get('styledSubtitles', defaultValue: false) as bool;
+  Future<void> setStyledSubtitles(bool value) =>
+      _box.put('styledSubtitles', value);
+
+  /// Subtitle size multiplier: 0.8 (small) / 1.0 / 1.3 (large).
+  double get subtitleScale =>
+      (_box.get('subtitleScale', defaultValue: 1.0) as num).toDouble();
+  Future<void> setSubtitleScale(double value) =>
+      _box.put('subtitleScale', value);
+
+  /// Sideloaded subtitle delay in seconds (Apple TV AVKit overlay). Positive =
+  /// show captions later. Used when provider VTTs are ahead of the stream.
+  double get subtitleDelaySeconds =>
+      (_box.get('subtitleDelaySeconds', defaultValue: 0.0) as num).toDouble();
+  Future<void> setSubtitleDelaySeconds(double value) =>
+      _box.put('subtitleDelaySeconds', value.clamp(-60.0, 60.0));
+
+  /// Subtitle text colour: 'white' | 'yellow'.
+  String get subtitleColor =>
+      _box.get('subtitleColor', defaultValue: 'white') as String;
+  Future<void> setSubtitleColor(String value) =>
+      _box.put('subtitleColor', value);
+
+  /// Whether to draw a translucent box behind subtitles.
+  bool get subtitleBackground =>
+      _box.get('subtitleBackground', defaultValue: false) as bool;
+  Future<void> setSubtitleBackground(bool value) =>
+      _box.put('subtitleBackground', value);
+
+  /// Subtitle font family — one of [kBundledSubtitleFonts], or a family the
+  /// user added themselves (see [customSubtitleFonts]). Empty = mpv default
+  /// (don't override the font). Maps to mpv's `sub-font`.
+  String get subtitleFont =>
+      _box.get('subtitleFont', defaultValue: '') as String;
+  Future<void> setSubtitleFont(String value) => _box.put('subtitleFont', value);
+
+  /// Fonts the user supplied themselves: family name → filename in
+  /// `<appSupport>/sub_fonts/`.
+  ///
+  /// Separate from [kBundledSubtitleFonts] because that list is a compile-time
+  /// const the pickers iterate, and because these have no download URL — the
+  /// file is already on disk. The family is read out of the font itself
+  /// (`fontFamilyFromBytes`) so libass can match it.
+  ///
+  /// Phone-only: the file cannot travel to a TV (backup carries Hive boxes, not
+  /// files), so a TV that syncs this pref simply finds no file and falls back
+  /// to the default — the same path an unknown family already takes.
+  Map<String, String> get customSubtitleFonts {
+    final raw = _box.get('customSubtitleFonts');
+    if (raw is! Map) return const {};
+    return {
+      for (final e in raw.entries)
+        if (e.key is String && e.value is String)
+          e.key as String: e.value as String,
+    };
+  }
+
+  Future<void> setCustomSubtitleFonts(Map<String, String> value) =>
+      _box.put('customSubtitleFonts', value);
+
+  /// Subtitle text colour as an 8-digit hex (`#RRGGBBAA`), default opaque white.
+  /// When non-empty this takes precedence over the legacy [subtitleColor] token.
+  String get subtitleColorHex =>
+      _box.get('subtitleColorHex', defaultValue: '#FFFFFFFF') as String;
+  Future<void> setSubtitleColorHex(String value) =>
+      _box.put('subtitleColorHex', value);
+
+  /// Opacity (0–1) of the black box drawn behind subtitles. 0 = no box. When
+  /// >0 this takes precedence over the legacy [subtitleBackground] toggle.
+  double get subtitleBgOpacity =>
+      (_box.get('subtitleBgOpacity', defaultValue: 0.0) as num)
+          .toDouble()
+          .clamp(0.0, 1.0);
+  Future<void> setSubtitleBgOpacity(double value) =>
+      _box.put('subtitleBgOpacity', value.clamp(0.0, 1.0));
+
+  /// Subtitle outline/border colour as `#RRGGBBAA` (default opaque black).
+  String get subtitleOutlineColorHex =>
+      _box.get('subtitleOutlineColorHex', defaultValue: '#000000FF') as String;
+  Future<void> setSubtitleOutlineColorHex(String value) =>
+      _box.put('subtitleOutlineColorHex', value);
+
+  /// Subtitle outline thickness (0–8). 0 = no outline.
+  double get subtitleOutlineWidth =>
+      (_box.get('subtitleOutlineWidth', defaultValue: 2.0) as num)
+          .toDouble()
+          .clamp(0.0, 8.0);
+  Future<void> setSubtitleOutlineWidth(double value) =>
+      _box.put('subtitleOutlineWidth', value.clamp(0.0, 8.0));
+
+  /// Subtitle outline-style preset id. Default 'soft' reproduces the legacy
+  /// soft-shadow look, so existing users see no change until they pick another.
+  String get subtitleOutlineType =>
+      _box.get('subtitleOutlineType', defaultValue: 'soft') as String;
+  Future<void> setSubtitleOutlineType(String value) =>
+      _box.put('subtitleOutlineType', value);
+
+  /// Subtitle text opacity (0.1–1.0), multiplied into the text colour's alpha.
+  double get subtitleTextOpacity =>
+      (_box.get('subtitleTextOpacity', defaultValue: 1.0) as num)
+          .toDouble()
+          .clamp(0.1, 1.0);
+  Future<void> setSubtitleTextOpacity(double value) =>
+      _box.put('subtitleTextOpacity', value.clamp(0.1, 1.0));
+
+  /// OpenSubtitles REST API key (https://www.opensubtitles.com/consumers).
+  /// Empty by default — the user pastes a free key in Settings to enable online
+  /// subtitle search/download. Stored verbatim (trimmed at use sites).
+  String get subtitleApiKey =>
+      _box.get('subtitleApiKey', defaultValue: '') as String;
+  Future<void> setSubtitleApiKey(String value) =>
+      _box.put('subtitleApiKey', value);
+
+  /// Vertical subtitle position (0 = top, 100 = bottom), maps to mpv `sub-pos`.
+  /// Default 95 keeps subtitles near the bottom edge.
+  int get subtitlePosition =>
+      (_box.get('subtitlePosition', defaultValue: 95) as num).toInt().clamp(
+        0,
+        100,
+      );
+  Future<void> setSubtitlePosition(int value) =>
+      _box.put('subtitlePosition', value.clamp(0, 100));
+
+  /// The single global subtitle preference: '' (Auto — no forcing), 'off'
+  /// (subtitles off on every video), or an ISO-639-1 language code (auto-select
+  /// the source's subtitle in that language). Stored under the legacy
+  /// `preferredSubtitleLang` key so an existing language choice migrates as-is.
+  String get subtitlePreference =>
+      _box.get('preferredSubtitleLang', defaultValue: '') as String;
+  Future<void> setSubtitlePreference(String value) =>
+      _box.put('preferredSubtitleLang', value);
+
+  /// Target language (ISO-639-1) for subtitle translation — the in-player
+  /// picker's default and the auto-translate target. '' = none set yet.
+  String get translateSubtitleTo =>
+      _box.get('translateSubtitleTo', defaultValue: '') as String;
+  Future<void> setTranslateSubtitleTo(String value) =>
+      _box.put('translateSubtitleTo', value);
+
+  /// Auto-translate the subtitle into [translateSubtitleTo] on play, when the
+  /// source has no subtitle already in that language. Off by default.
+  bool get autoTranslateSubtitles =>
+      _box.get('autoTranslateSubtitles', defaultValue: false) as bool;
+  Future<void> setAutoTranslateSubtitles(bool value) =>
+      _box.put('autoTranslateSubtitles', value);
+
+  /// The preference as a *language* code only: '' for Auto or Off, else the
+  /// iso1. Callers that want a language (online-search default, Settings label)
+  /// use this so the 'off' sentinel never leaks in as a language.
+  String get preferredSubtitleLanguage {
+    final p = subtitlePreference;
+    return p == 'off' ? '' : p;
+  }
+
+  Future<void> setPreferredSubtitleLanguage(String value) =>
+      setSubtitlePreference(value);
+
+  /// Whether to automatically download subtitles from OpenSubtitles when the
+  /// loaded source carries no subtitle in the preferred language. Defaults to
+  /// true — the player will attempt a silent download before falling back to
+  /// no subtitles. Requires [subtitleApiKey] to be set.
+  bool get autoDownloadSubtitles =>
+      _box.get('autoDownloadSubtitles', defaultValue: true) as bool;
+  Future<void> setAutoDownloadSubtitles(bool value) =>
+      _box.put('autoDownloadSubtitles', value);
+}

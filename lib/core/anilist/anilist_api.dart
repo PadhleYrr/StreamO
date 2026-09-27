@@ -1,0 +1,775 @@
+import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
+
+import 'anilist_graphql.dart';
+import '../models/media_extras.dart';
+import '../zmode/metadata_provider_prefs.dart';
+import 'anilist_title.dart';
+import '../models/person.dart';
+import '../tracker/tracker.dart' show MediaKind;
+
+/// AniList's `type:` enum value for [kind].
+String _anilistType(MediaKind kind) =>
+    kind == MediaKind.manga ? 'MANGA' : 'ANIME';
+
+/// AniList's total-count field(s) for [kind] — episodes for anime, chapters
+/// + volumes for manga/novel (novels are filed under MANGA on AniList).
+String _totalCountFields(MediaKind kind) =>
+    kind == MediaKind.manga ? 'chapters volumes' : 'episodes';
+
+/// Query text for [AniListApi.mediaByMalId]. Pure + exposed so a test can pin
+/// the anime text byte-for-byte and assert the manga branch on its own.
+String mediaByMalIdQuery(MediaKind kind) {
+  return 'query(\$idMal:Int){ Media(idMal:\$idMal, type:${_anilistType(kind)}){ '
+      'id ${_totalCountFields(kind)} } }';
+}
+
+/// Query text for [AniListApi.mediaBySearch].
+String mediaBySearchQuery(MediaKind kind) {
+  return 'query(\$search:String){ Media(search:\$search, type:${_anilistType(kind)}){ '
+      'id ${_totalCountFields(kind)} } }';
+}
+
+/// Query text for [AniListApi.mediaEntry]. No `type:` filter — a lookup by
+/// AniList's own [mediaId] is unambiguous across anime/manga, unlike idMal.
+String mediaEntryQuery(MediaKind kind) {
+  return 'query(\$id:Int){ Media(id:\$id){ ${_totalCountFields(kind)} '
+      'title{ romaji english native } '
+      'nextAiringEpisode{ episode airingAt } '
+      'mediaListEntry{ status score(format:POINT_10) progress } } }';
+}
+
+/// Query text for [AniListApi.searchMedia]. [novelFormat] narrows a manga
+/// search to light novels (`format_in: [NOVEL]`); ignored for anime.
+String searchMediaQuery(MediaKind kind, {bool novelFormat = false}) {
+  final formatArg = (kind == MediaKind.manga && novelFormat)
+      ? ',format_in:[NOVEL]'
+      : '';
+  return 'query(\$q:String,\$n:Int){ Page(perPage:\$n){ media(search:\$q,type:${_anilistType(kind)}$formatArg){ '
+      'id idMal ${_totalCountFields(kind)} format seasonYear '
+      'title{ romaji english native } coverImage{ medium } } } }';
+}
+
+/// Query text for the library read-back ([AniListService.fetchList]).
+///
+/// The manga variant also selects `format` — that's the ONLY way to tell a
+/// light novel from a manga, since AniList files both under `type: MANGA`
+/// (see [_anilistType]). Anime doesn't select it, so the anime request stays
+/// byte-identical to the pre-manga text apart from the totals/airing fields.
+String mediaListCollectionQuery(MediaKind kind) {
+  final formatField = kind == MediaKind.manga ? ' format' : '';
+  final airingField = kind == MediaKind.manga ? '' : ' nextAiringEpisode{episode}';
+  return 'query(\$u:String){ MediaListCollection(userName:\$u, type:${_anilistType(kind)}){ '
+      'lists { status entries { status progress score(format:POINT_10) '
+      'updatedAt customLists(asArray:true) '
+      'media { id idMal title { romaji english native }$formatField '
+      '${_totalCountFields(kind)}$airingField coverImage { large } } } } } }';
+}
+
+/// The signed-in AniList user.
+/// AniList's own `UserTitleLanguage`, mapped onto ours. Its ROMAJI_STYLISED /
+/// ENGLISH_STYLISED / NATIVE_STYLISED variants only change how AniList's site
+/// renders them, so they fold into the same three. Null (or anything new)
+/// leaves the choice to us.
+TitleLanguage? _titleLanguage(String? raw) => switch (raw) {
+  'ROMAJI' || 'ROMAJI_STYLISED' => TitleLanguage.romaji,
+  'ENGLISH' || 'ENGLISH_STYLISED' => TitleLanguage.english,
+  'NATIVE' || 'NATIVE_STYLISED' => TitleLanguage.native,
+  _ => null,
+};
+
+class AniListViewer {
+  const AniListViewer({
+    required this.id,
+    required this.name,
+    this.avatar,
+    this.titleLanguage,
+  });
+
+  /// The account's own title-language setting, when AniList reported one.
+  final TitleLanguage? titleLanguage;
+  final int id;
+  final String name;
+  final String? avatar;
+}
+
+/// Thin AniList GraphQL client (https://graphql.anilist.co). Read-only queries
+/// (Media lookup) work unauthenticated; list reads + the SaveMediaListEntry
+/// mutation require the bearer token, supplied lazily via [_token].
+class AniListApi {
+  AniListApi(this._dio, this._token);
+  final Dio _dio;
+  final String? Function() _token;
+
+  static const String _endpoint = AniListGraphql.endpoint;
+
+  Future<Map<String, dynamic>?> _gql(
+    String query,
+    Map<String, dynamic> variables, {
+    bool auth = false,
+  }) async {
+    final headers = Map<String, String>.from(AniListGraphql.headers);
+    if (auth) {
+      final t = _token();
+      if (t == null || t.isEmpty) return null;
+      headers['Authorization'] = 'Bearer $t';
+    } else {
+      // AniList now 403s ANONYMOUS API access, so authenticate reads too when
+      // the user is signed in (these queries request no viewer-specific fields,
+      // so the result is identical). Still attempt anonymously when there's no
+      // token — no worse than before.
+      final t = _token();
+      if (t != null && t.isNotEmpty) headers['Authorization'] = 'Bearer $t';
+    }
+    try {
+      final res = await _dio.post<dynamic>(
+        _endpoint,
+        data: {'query': query, 'variables': variables},
+        options: Options(
+          headers: headers,
+          validateStatus: (s) => s != null && s < 500,
+        ),
+      );
+      final data = res.data;
+      if (data is Map && data['data'] is Map) {
+        return Map<String, dynamic>.from(data['data'] as Map);
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  /// The signed-in user, or null when the token is missing/invalid.
+  /// The custom lists the user has defined for [kind], in their own order.
+  ///
+  /// These are defined in AniList's list settings, not here: the per-entry
+  /// field only says which of them a title is in, so a name that isn't in this
+  /// set can't be written to. Empty when the user has none (the common case).
+  Future<List<String>> customListNames(MediaKind kind) async {
+    final field = kind == MediaKind.manga ? 'mangaList' : 'animeList';
+    final d = await _gql(
+      'query{ Viewer{ mediaListOptions{ $field{ customLists } } } }',
+      const {},
+      auth: true,
+    );
+    final opts = (d?['Viewer'] as Map?)?['mediaListOptions'];
+    final list = (opts is Map) ? opts[field] : null;
+    final names = (list is Map) ? list['customLists'] : null;
+    if (names is! List) return const [];
+    return names.whereType<String>().toList();
+  }
+
+  /// Add [name] to the user's custom lists for [kind] and return the new full
+  /// set, or null if it couldn't be done.
+  ///
+  /// DANGEROUS FIELD: AniList's `customLists` on the user options is the WHOLE
+  /// array, so writing just the new name would DELETE every existing list on
+  /// the account. This reads the current set first, appends, and writes both —
+  /// and bails out entirely if the read fails, because writing a partial set
+  /// would destroy the user's lists.
+  Future<List<String>?> addCustomList(MediaKind kind, String name) async {
+    final trimmed = name.trim();
+    if (trimmed.isEmpty) return null;
+
+    final existing = await customListNames(kind);
+    // A failed read is indistinguishable from "no lists" here, and guessing
+    // wrong wipes the account. Only the caller knows it asked for a create, so
+    // an empty result is treated as legitimate ONLY when the query succeeded —
+    // customListNames returns [] on error too, so re-run it strictly.
+    final probe = await _gql('query{ Viewer{ id } }', const {}, auth: true);
+    if (probe?['Viewer'] is! Map) return null; // not signed in / API down
+
+    if (existing.any((e) => e.toLowerCase() == trimmed.toLowerCase())) {
+      return existing; // already there — nothing to write
+    }
+    final next = [...existing, trimmed];
+    final field = kind == MediaKind.manga
+        ? 'mangaListOptions'
+        : 'animeListOptions';
+    final d = await _gql(
+      'mutation(\$lists:[String]){'
+      ' UpdateUser($field:{ customLists:\$lists }){ id } }',
+      {'lists': next},
+      auth: true,
+    );
+    return d?['UpdateUser'] is Map ? next : null;
+  }
+
+  /// Replace which custom lists [mediaId] belongs to. [names] is the FULL set
+  /// it should be in — AniList treats this as the whole membership, so
+  /// omitting a name removes it. Names must already exist in the user's
+  /// settings; unknown ones are ignored by AniList rather than created.
+  Future<bool> saveCustomLists(int mediaId, List<String> names) async {
+    final d = await _gql(
+      'mutation(\$mediaId:Int,\$lists:[String]){'
+      ' SaveMediaListEntry(mediaId:\$mediaId, customLists:\$lists){ id } }',
+      {'mediaId': mediaId, 'lists': names},
+      auth: true,
+    );
+    return d?['SaveMediaListEntry'] is Map;
+  }
+
+  Future<AniListViewer?> viewer() async {
+    final d = await _gql(
+      'query{ Viewer{ id name avatar{ medium large } '
+          'options{ titleLanguage } } }',
+      const {},
+      auth: true,
+    );
+    final v = d?['Viewer'];
+    if (v is! Map) return null;
+    final av = v['avatar'];
+    return AniListViewer(
+      id: (v['id'] as num).toInt(),
+      name: '${v['name']}',
+      avatar: av is Map ? (av['large'] ?? av['medium']) as String? : null,
+      titleLanguage: _titleLanguage(
+        (v['options'] as Map?)?['titleLanguage'] as String?,
+      ),
+    );
+  }
+
+  /// Resolve an AniList media id (+ total episodes, or chapters for
+  /// [MediaKind.manga]) from a MAL id. Returns `(id, episodes)` or null when
+  /// unmatched.
+  Future<({int id, int? episodes})?> mediaByMalId(
+    int malId, {
+    MediaKind kind = MediaKind.anime,
+  }) async {
+    final d = await _gql(mediaByMalIdQuery(kind), {'idMal': malId});
+    final m = d?['Media'];
+    if (m is! Map || m['id'] == null) return null;
+    final total = kind == MediaKind.manga ? m['chapters'] : m['episodes'];
+    return (id: (m['id'] as num).toInt(), episodes: (total as num?)?.toInt());
+  }
+
+  /// Resolve an AniList media id (+ total episodes/chapters) by title search.
+  /// Fallback for when no MAL id is available. Null when unmatched.
+  Future<({int id, int? episodes})?> mediaBySearch(
+    String search, {
+    MediaKind kind = MediaKind.anime,
+  }) async {
+    final d = await _gql(mediaBySearchQuery(kind), {'search': search});
+    final m = d?['Media'];
+    if (m is! Map || m['id'] == null) return null;
+    final total = kind == MediaKind.manga ? m['chapters'] : m['episodes'];
+    return (id: (m['id'] as num).toInt(), episodes: (total as num?)?.toInt());
+  }
+
+  /// The characters + relations selection, shared by the MAL-id and
+  /// title-search enrichment queries.
+  static const String _extrasSelection =
+      'characters(sort:[ROLE,RELEVANCE],perPage:24){ edges{ role '
+      'node{ id name{full} image{medium} } '
+      'voiceActors(language:JAPANESE,sort:[RELEVANCE]){ name{full} } } } '
+      'relations{ edges{ relationType '
+      'node{ id idMal type format title{romaji english native} coverImage{medium} } } } '
+      'recommendations(sort:RATING_DESC,perPage:16){ edges{ node{ mediaRecommendation{ id idMal type format title{romaji english native} coverImage{medium} } } } }';
+
+  /// Manga/novel twin of [_extrasSelection].
+  ///
+  /// No `voiceActors` — a comic has none — and `staff` instead, because the
+  /// people worth naming on a manga are its author and artist. Relations come
+  /// back the same shape.
+  static const String _readingExtrasSelection =
+      'characters(sort:[ROLE,RELEVANCE],perPage:24){ edges{ role '
+      'node{ id name{full} image{medium} } } } '
+      'staff(sort:[RELEVANCE],perPage:6){ edges{ role '
+      'node{ id name{full} image{medium} } } } '
+      'relations{ edges{ relationType '
+      'node{ id idMal type format title{romaji english native} coverImage{medium} } } } '
+      'recommendations(sort:RATING_DESC,perPage:16){ edges{ node{ mediaRecommendation{ id idMal type format title{romaji english native} coverImage{medium} } } } }';
+
+  /// Cast + relations for a MANGA or NOVEL, resolved by title.
+  ///
+  /// `type:MANGA` is the whole safety story. Manga usually shares its anime
+  /// adaptation's title, and an earlier attempt at this looked reading titles
+  /// up in the video databases — which happily returned the ADAPTATION and put
+  /// the anime's cast on the manga's page. Asking AniList for MANGA makes that
+  /// structurally impossible: an anime can't come back from this query.
+  ///
+  /// AniList files light novels under MANGA (format NOVEL), so novels use the
+  /// same path. Best-effort; empty on a miss.
+  Future<({List<CastMember> cast, List<MediaRelation> relations})>
+  readingExtrasBySearch(String search) async {
+    Future<({List<CastMember> cast, List<MediaRelation> relations})> tryOne(
+      String q,
+    ) async {
+      final d = await _gql(
+        'query(\$search:String){ Media(search:\$search,type:MANGA){ '
+        '$_readingExtrasSelection } }',
+        {'search': q},
+      );
+      final media = d?['Media'];
+      if (media is! Map) {
+        return (cast: <CastMember>[], relations: <MediaRelation>[]);
+      }
+      final base = _parseExtras(media, keepTypes: const {'MANGA', 'ANIME'});
+      // Characters first, creators after. The detail header's "Starring:" line
+      // takes the head of this list, so putting staff in front made a manga
+      // read "Starring: <the author>" — and the source's own metadata already
+      // shows a Creators: line above it.
+      return (
+        cast: [...base.cast, ..._parseStaff(media)],
+        relations: base.relations,
+      );
+    }
+
+    var r = await tryOne(search);
+    if (r.cast.isEmpty && r.relations.isEmpty) {
+      final cleaned = _cleanSearchTitle(search);
+      if (cleaned.isNotEmpty && cleaned != search) r = await tryOne(cleaned);
+    }
+    return r;
+  }
+
+  /// Author/artist rows, appended after the characters — see the ordering note
+  /// in [readingExtrasBySearch].
+  List<CastMember> _parseStaff(Map media) {
+    final out = <CastMember>[];
+    final edges = media['staff'] is Map ? media['staff']['edges'] : null;
+    if (edges is! List) return out;
+    for (final e in edges) {
+      if (e is! Map) continue;
+      final node = e['node'];
+      final name = (node is Map && node['name'] is Map)
+          ? node['name']['full'] as String?
+          : null;
+      if (name == null || name.isEmpty) continue;
+      final img = (node is Map && node['image'] is Map)
+          ? node['image']['medium'] as String?
+          : null;
+      final id = (node is Map) ? (node['id'] as num?)?.toInt() : null;
+      out.add(
+        CastMember(
+          name: name,
+          role: e['role'] as String?,
+          photo: img,
+          // Tappable, so an author's card opens their page and lists everything
+          // else they've written. Without the ref the card is inert.
+          person: id == null
+              ? null
+              : PersonRef(
+                  id: id,
+                  source: PersonSource.anilistStaff,
+                  name: name,
+                  photo: img,
+                ),
+        ),
+      );
+    }
+    return out;
+  }
+
+  /// One hop of the season chain: the prequel/sequel neighbours of an AniList
+  /// id, with just enough to draw a poster.
+  ///
+  /// Separate from [mediaExtras] because walking a franchise asks a much
+  /// narrower question — no cast, no recommendations, no MAL-id round trip.
+  /// `relations` is only ever ONE level deep in AniList's schema, so reaching
+  /// season 1 from season 3 means asking again per hop; keeping the selection
+  /// this small is what makes that affordable.
+  Future<List<({String relation, int id, int? idMal, String? format,
+      String title, String? cover, int? episodes})>> seasonNeighbours(
+    int anilistId,
+  ) async {
+    final d = await _gql(
+      'query(\$id:Int){ Media(id:\$id,type:ANIME){ relations{ edges{ '
+      'relationType node{ id idMal format episodes '
+      'title{romaji english native} coverImage{medium} } } } } }',
+      {'id': anilistId},
+    );
+    final edges = (d?['Media'] is Map) ? d!['Media']['relations'] : null;
+    final list = (edges is Map) ? edges['edges'] : null;
+    if (list is! List) return const [];
+    final out = <({String relation, int id, int? idMal, String? format,
+        String title, String? cover, int? episodes})>[];
+    for (final e in list) {
+      if (e is! Map) continue;
+      final node = e['node'];
+      if (node is! Map) continue;
+      final title = aniListTitle(node['title'], titleLanguagePref);
+      final id = (node['id'] as num?)?.toInt();
+      if (title == null || title.isEmpty || id == null) continue;
+      out.add((
+        relation: (e['relationType'] as String?) ?? '',
+        id: id,
+        idMal: (node['idMal'] as num?)?.toInt(),
+        format: node['format'] as String?,
+        title: title,
+        cover: (node['coverImage'] is Map)
+            ? node['coverImage']['medium'] as String?
+            : null,
+        episodes: (node['episodes'] as num?)?.toInt(),
+      ));
+    }
+    return out;
+  }
+
+  /// Cast (characters + their Japanese voice actors) and related anime titles
+  /// for an anime, by MAL id. Unauthenticated; returns empty lists on miss.
+  Future<({List<CastMember> cast, List<MediaRelation> relations})> mediaExtras(
+    int idMal,
+  ) async {
+    final d = await _gql(
+      'query(\$idMal:Int){ Media(idMal:\$idMal,type:ANIME){ $_extrasSelection } }',
+      {'idMal': idMal},
+    );
+    final media = d?['Media'];
+    if (media is! Map) {
+      return (cast: <CastMember>[], relations: <MediaRelation>[]);
+    }
+    return _parseExtras(media);
+  }
+
+  /// Cast + relations for a MANGA or NOVEL, by its MAL **manga** id.
+  ///
+  /// The anime twin ([mediaExtras]) pins `type:ANIME`, and MAL numbers its
+  /// manga and its anime separately — so a manga id sent there resolves to
+  /// whatever anime happens to hold the same number. MAL manga 25 is Fullmetal
+  /// Alchemist; MAL anime 25 is Sunabouzu. Reading titles went down that path
+  /// for every id-carrying source, so the tabs filled with a stranger's cast,
+  /// or stayed empty when no anime held the number at all.
+  Future<({List<CastMember> cast, List<MediaRelation> relations})>
+  readingExtras(int idMal) async {
+    final d = await _gql(
+      'query(\$idMal:Int){ Media(idMal:\$idMal,type:MANGA){ '
+      '$_readingExtrasSelection } }',
+      {'idMal': idMal},
+    );
+    final media = d?['Media'];
+    if (media is! Map) {
+      return (cast: <CastMember>[], relations: <MediaRelation>[]);
+    }
+    // AniList files light novels under MANGA, and a manga's relations reach
+    // into ANIME for its adaptation — both belong on a reading page.
+    final base = _parseExtras(media, keepTypes: const {'MANGA', 'ANIME'});
+    // Characters first, creators after — same order the title-search twin
+    // uses, and for the same reason: the header's "Starring:" line takes the
+    // head of this list, so staff in front made a manga read
+    // "Starring: <the author>".
+    return (
+      cast: [...base.cast, ..._parseStaff(media)],
+      relations: base.relations,
+    );
+  }
+
+  /// Cast + relations for an anime resolved by TITLE search — the fallback for
+  /// id-less sources (Aniyomi, most CloudStream) that expose no MAL id. Tries
+  /// the raw title, then a cleaned variant (bracketed "(Dub)"/"(TV)"/
+  /// "[Uncensored]" suffixes break AniList's search). Best-effort, empty on miss.
+  Future<({List<CastMember> cast, List<MediaRelation> relations})>
+  mediaExtrasBySearch(String search) async {
+    var r = await _searchExtras(search);
+    if (r.cast.isEmpty && r.relations.isEmpty) {
+      final cleaned = _cleanSearchTitle(search);
+      if (cleaned.isNotEmpty && cleaned != search) {
+        r = await _searchExtras(cleaned);
+      }
+    }
+    return r;
+  }
+
+  /// Resolve a MAL id from a TITLE (for id-less sources) — tries the raw then
+  /// the cleaned title, like [mediaExtrasBySearch]. Best-effort, null on miss.
+  Future<int?> idMalByTitle(String title) async {
+    Future<int?> tryOne(String s) async {
+      final d = await _gql(
+        'query(\$search:String){ Media(search:\$search,type:ANIME){ idMal } }',
+        {'search': s},
+      );
+      final media = d?['Media'];
+      return media is Map ? (media['idMal'] as num?)?.toInt() : null;
+    }
+
+    var id = await tryOne(title);
+    if (id == null) {
+      final cleaned = _cleanSearchTitle(title);
+      if (cleaned.isNotEmpty && cleaned != title) id = await tryOne(cleaned);
+    }
+    return id;
+  }
+
+  Future<({List<CastMember> cast, List<MediaRelation> relations})>
+  _searchExtras(String search) async {
+    final d = await _gql(
+      'query(\$search:String){ Media(search:\$search,type:ANIME){ $_extrasSelection } }',
+      {'search': search},
+    );
+    final media = d?['Media'];
+    if (media is! Map) {
+      return (cast: <CastMember>[], relations: <MediaRelation>[]);
+    }
+    return _parseExtras(media);
+  }
+
+  /// Strip bracketed/parenthetical qualifiers a source appends — "(Dub)",
+  /// "(TV)", "[Uncensored]" — which break AniList's title search.
+  static String _cleanSearchTitle(String t) => t
+      .replaceAll(RegExp(r'[\(\[][^\)\]]*[\)\]]'), ' ')
+      .replaceAll(RegExp(r'\s+'), ' ')
+      .trim();
+
+  /// [keepTypes] are the AniList media types a relation may be.
+  ///
+  /// Anime pages keep ANIME only — this is a video app and a manga relation
+  /// there leads nowhere. Reading pages keep BOTH: their own sequels and
+  /// spin-offs are MANGA, but "is there an anime of this?" is one of the main
+  /// things a reader wants from the tab, and those edges come back as ANIME.
+  /// The card names the relation type, so an adaptation reads as an
+  /// adaptation — which is information, not the misattribution that made
+  /// Cast/Relations get switched off for reading titles in the first place.
+  ///
+  /// Defaulting to ANIME-only is what silently emptied the tab: a manga's
+  /// relations are MANGA, so every one was dropped.
+  /// Exposed so the shape AniList actually returns can be pinned in a test
+  /// without a token — the API refuses anonymous reads.
+  @visibleForTesting
+  ({List<CastMember> cast, List<MediaRelation> relations}) parseExtrasForTest(
+    Map media, {
+    Set<String> keepTypes = const {'ANIME'},
+  }) => _parseExtras(media, keepTypes: keepTypes);
+
+  ({List<CastMember> cast, List<MediaRelation> relations}) _parseExtras(
+    Map media, {
+    Set<String> keepTypes = const {'ANIME'},
+  }) {
+    final cast = <CastMember>[];
+    final cEdges = media['characters'] is Map
+        ? media['characters']['edges']
+        : null;
+    if (cEdges is List) {
+      for (final e in cEdges) {
+        if (e is! Map) continue;
+        final node = e['node'];
+        final name = (node is Map && node['name'] is Map)
+            ? node['name']['full'] as String?
+            : null;
+        if (name == null || name.isEmpty) continue;
+        final img = (node is Map && node['image'] is Map)
+            ? node['image']['medium'] as String?
+            : null;
+        final vas = e['voiceActors'];
+        final va =
+            (vas is List &&
+                vas.isNotEmpty &&
+                vas.first is Map &&
+                (vas.first as Map)['name'] is Map)
+            ? (vas.first as Map)['name']['full'] as String?
+            : null;
+        final charId = (node is Map) ? (node['id'] as num?)?.toInt() : null;
+        cast.add(
+          CastMember(
+            name: name,
+            role: va,
+            photo: img,
+            person: charId == null
+                ? null
+                : PersonRef(
+                    id: charId,
+                    source: PersonSource.anilistCharacter,
+                    name: name,
+                    photo: img,
+                  ),
+          ),
+        );
+      }
+    }
+
+    final relations = <MediaRelation>[];
+    final rEdges = media['relations'] is Map
+        ? media['relations']['edges']
+        : null;
+    if (rEdges is List) {
+      for (final e in rEdges) {
+        if (e is! Map) continue;
+        final node = e['node'];
+        if (node is! Map || !keepTypes.contains(node['type'])) continue;
+        final t = node['title'];
+        final romaji = (t is Map) ? t['romaji'] as String? : null;
+        final title = aniListTitle(t, titleLanguagePref);
+        if (title == null || title.isEmpty) continue;
+        final cover = (node['coverImage'] is Map)
+            ? node['coverImage']['medium'] as String?
+            : null;
+        relations.add(
+          MediaRelation(
+            title: title,
+            romaji: romaji,
+            cover: cover,
+            relation: _relationLabel(
+              e['relationType'] as String?,
+              node['format'] as String?,
+            ),
+            malId: (node['idMal'] as num?)?.toInt(),
+            anilistId: (node['id'] as num?)?.toInt(),
+            isReading: node['type'] == 'MANGA',
+          ),
+        );
+      }
+    }
+
+    // Recommendations come after the relations, never mixed in: a sequel is a
+    // fact about the title, a recommendation is someone else's opinion, and the
+    // row reads wrong when the two are interleaved. Sorted by AniList's own
+    // rating, so the top of the list is what its users actually voted up.
+    final recEdges = media['recommendations'] is Map
+        ? media['recommendations']['edges']
+        : null;
+    if (recEdges is List) {
+      final seen = {for (final r in relations) r.title};
+      for (final e in recEdges) {
+        if (e is! Map) continue;
+        final node = e['node'];
+        final rec = (node is Map) ? node['mediaRecommendation'] : null;
+        // Null when the recommended entry has been deleted from AniList.
+        if (rec is! Map || !keepTypes.contains(rec['type'])) continue;
+        final t = rec['title'];
+        final title = aniListTitle(t, titleLanguagePref);
+        if (title == null || title.isEmpty || !seen.add(title)) continue;
+        relations.add(
+          MediaRelation(
+            title: title,
+            romaji: (t is Map) ? t['romaji'] as String? : null,
+            cover: (rec['coverImage'] is Map)
+                ? rec['coverImage']['medium'] as String?
+                : null,
+            relation: 'Recommended',
+            malId: (rec['idMal'] as num?)?.toInt(),
+            anilistId: (rec['id'] as num?)?.toInt(),
+            isReading: rec['type'] == 'MANGA',
+          ),
+        );
+      }
+    }
+    return (cast: cast, relations: relations);
+  }
+
+  static String _relationLabel(String? type, String? format) {
+    if (type == null || type.isEmpty) return format ?? 'Related';
+    final t = type.replaceAll('_', ' ').toLowerCase();
+    return t.isEmpty ? 'Related' : t[0].toUpperCase() + t.substring(1);
+  }
+
+  /// Push progress/status for [mediaId]. Returns true on success.
+  Future<bool> saveProgress({
+    required int mediaId,
+    required int progress,
+    required String status, // CURRENT / COMPLETED / ...
+  }) async {
+    final d = await _gql(
+      'mutation(\$mediaId:Int,\$progress:Int,\$status:MediaListStatus){'
+      ' SaveMediaListEntry(mediaId:\$mediaId, progress:\$progress, status:\$status){ id progress status } }',
+      {'mediaId': mediaId, 'progress': progress, 'status': status},
+      auth: true,
+    );
+    return d?['SaveMediaListEntry'] is Map;
+  }
+
+  /// Set only the list status for [mediaId] (no progress change). Returns true
+  /// on success.
+  Future<bool> saveStatus({
+    required int mediaId,
+    required String status,
+  }) async {
+    final d = await _gql(
+      'mutation(\$mediaId:Int,\$status:MediaListStatus){'
+      ' SaveMediaListEntry(mediaId:\$mediaId, status:\$status){ id status } }',
+      {'mediaId': mediaId, 'status': status},
+      auth: true,
+    );
+    return d?['SaveMediaListEntry'] is Map;
+  }
+
+  /// Remove [mediaId] from the user's list entirely. Best-effort.
+  Future<bool> deleteEntry(int mediaId) async {
+    // DeleteMediaListEntry needs the LIST entry id, not the media id — look it
+    // up, then delete.
+    final d = await _gql(
+      'query(\$mediaId:Int){ Media(id:\$mediaId){ mediaListEntry{ id } } }',
+      {'mediaId': mediaId},
+      auth: true,
+    );
+    final entry = (d?['Media'] as Map?)?['mediaListEntry'];
+    final id = (entry is Map) ? (entry['id'] as num?)?.toInt() : null;
+    if (id == null) return true; // not on the list → nothing to delete
+    final r = await _gql(
+      'mutation(\$id:Int){ DeleteMediaListEntry(id:\$id){ deleted } }',
+      {'id': id},
+      auth: true,
+    );
+    return (r?['DeleteMediaListEntry'] as Map?)?['deleted'] == true;
+  }
+
+  /// The user's list entry for [mediaId] plus the media's episode/chapter +
+  /// next-airing meta, for the sync sheet. `mediaListEntry` is null when the
+  /// title isn't on the user's list. Returns null on error. Score is read on
+  /// the 0–10 scale.
+  Future<Map<String, dynamic>?> mediaEntry(
+    int mediaId, {
+    MediaKind kind = MediaKind.anime,
+  }) async {
+    final d = await _gql(mediaEntryQuery(kind), {'id': mediaId}, auth: true);
+    final m = d?['Media'];
+    if (m is! Map) return null;
+    return Map<String, dynamic>.from(m);
+  }
+
+  /// Write any subset of status/progress/score for [mediaId] in one mutation.
+  /// [scoreRaw] is 0–100 (AniList's internal scale, independent of the user's
+  /// display format). Returns true on success.
+  Future<bool> saveEntry({
+    required int mediaId,
+    String? status,
+    int? progress,
+    int? scoreRaw,
+  }) async {
+    final varDefs = <String>['\$mediaId:Int'];
+    final args = <String>['mediaId:\$mediaId'];
+    final vars = <String, dynamic>{'mediaId': mediaId};
+    if (status != null) {
+      varDefs.add('\$status:MediaListStatus');
+      args.add('status:\$status');
+      vars['status'] = status;
+    }
+    if (progress != null) {
+      varDefs.add('\$progress:Int');
+      args.add('progress:\$progress');
+      vars['progress'] = progress;
+    }
+    if (scoreRaw != null) {
+      varDefs.add('\$scoreRaw:Int');
+      args.add('scoreRaw:\$scoreRaw');
+      vars['scoreRaw'] = scoreRaw;
+    }
+    final d = await _gql(
+      'mutation(${varDefs.join(',')}){'
+      ' SaveMediaListEntry(${args.join(', ')}){ id } }',
+      vars,
+      auth: true,
+    );
+    return d?['SaveMediaListEntry'] is Map;
+  }
+
+  /// Search anime (or manga/novel) for candidate matches (the match-fixer).
+  /// Returns up to [perPage] raw media maps ({id, idMal, title, coverImage,
+  /// episodes|chapters+volumes, format, seasonYear}). [novelFormat] narrows a
+  /// manga search to light novels only. Unauthenticated; empty on error.
+  Future<List<Map<String, dynamic>>> searchMedia(
+    String query, {
+    int perPage = 12,
+    MediaKind kind = MediaKind.anime,
+    bool novelFormat = false,
+  }) async {
+    final d = await _gql(searchMediaQuery(kind, novelFormat: novelFormat), {
+      'q': query,
+      'n': perPage,
+    });
+    final page = d?['Page'];
+    final media = (page is Map) ? page['media'] : null;
+    if (media is! List) return const [];
+    return [
+      for (final m in media)
+        if (m is Map) Map<String, dynamic>.from(m),
+    ];
+  }
+}

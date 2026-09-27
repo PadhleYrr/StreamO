@@ -1,0 +1,317 @@
+name: watch_app
+description: "A new Flutter project."
+# The following line prevents the package from being accidentally published to
+# pub.dev using `flutter pub publish`. This is preferred for private packages.
+publish_to: "none" # Remove this line if you wish to publish to pub.dev
+
+# The following defines the version and build number for your application.
+# A version number is three numbers separated by dots, like 1.2.43
+# followed by an optional build number separated by a +.
+# Both the version and the builder number may be overridden in flutter
+# build by specifying --build-name and --build-number, respectively.
+# In Android, build-name is used as versionName while build-number used as versionCode.
+# Read more about Android versioning at https://developer.android.com/studio/publish/versioning
+# In iOS, build-name is used as CFBundleShortVersionString while build-number is used as CFBundleVersion.
+# Read more about iOS versioning at
+# https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
+# In Windows, build-name is used as the major, minor, and patch parts
+# of the product and file versions while build-number is used as the build suffix.
+version: 2.2.0+11500
+
+environment:
+  sdk: ^3.11.5
+
+# Dependencies specify other packages that your package needs in order to work.
+# To automatically upgrade your package dependencies to the latest versions
+# consider running `flutter pub upgrade --major-versions`. Alternatively,
+# dependencies can be manually updated by changing the version numbers below to
+# the latest version available on pub.dev. To see which dependencies have newer
+# versions available, run `flutter pub outdated`.
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+  intl: any
+  cupertino_icons: ^1.0.8
+
+  # State management
+  flutter_bloc: ^9.1.0
+  bloc: ^9.0.0
+
+  # State / value equality
+  equatable: ^2.0.7
+
+  # DI
+  get_it: ^8.0.3
+
+  # Network
+  dio: ^5.8.0+1
+
+  # Local storage
+  hive: ^2.2.3
+  hive_flutter: ^1.1.0
+  path_provider: ^2.1.5
+  # Apple TV (tvOS) federated plugin implementations. path_provider does not
+  # degrade gracefully (Hive.initFlutter fails hard without it).
+  path_provider_tvos: ^0.0.3
+  device_info_plus_tvos: ^0.0.1
+  package_info_plus_tvos: ^0.0.1
+  shared_preferences_tvos: ^0.0.2
+  flutter_secure_storage_tvos: ^0.0.2
+  # Path override: pub.dev 0.0.2 ships PrivacyInfo.xcprivacy but never embeds
+  # it (podspec missing resource_bundles) → ITMS-91061 on TestFlight.
+  sqflite_tvos:
+    path: third_party/sqflite_tvos
+  # Transitive via flutter_widget_from_html (etc.); needs a tvOS implementation.
+  video_player_tvos: ^0.0.1
+  wakelock_plus_tvos: ^0.0.1
+  firebase_core_tvos: ^0.0.2
+  firebase_analytics_tvos: ^0.0.1
+  firebase_messaging_tvos: ^0.0.1
+  # Extract the .srt/.ssa from SubDL's zipped subtitle downloads.
+  archive: ^4.0.9
+
+  # JS engine (QuickJS bridge)
+  flutter_js: ^0.8.0
+
+  # Hashing (SHA-256)
+  crypto: ^3.0.6
+
+  # AES-256-CTR for decrypting source lists from providers (e.g. AllAnime).
+  pointycastle: ^3.9.1
+
+  # Video playback (libmpv-based). _libs_video bundles the native libs (iOS pod).
+  media_kit: ^1.1.11
+  media_kit_video: ^1.2.5
+  media_kit_libs_video: ^1.0.5
+
+  file_picker: ^12.1.2
+
+  # Image caching
+  cached_network_image: ^3.4.1
+  flutter_cache_manager: ^3.4.1
+  # Lazy HTML rendering for the novel reader (RenderMode.sliverList) — only the
+  # on-screen paragraphs are built, so long chapters scroll without jank.
+  flutter_widget_from_html: ^0.15.3
+  # DOM parsing for EPUB export — walks scraped chapter HTML to serialise it
+  # as well-formed XHTML rather than regexing it. Already in the tree
+  # transitively (flutter_widget_from_html), now a direct dependency since we
+  # use it ourselves.
+  html: ^0.15.6
+  # Dominant-colour extraction for the colour-matched hero banner
+  palette_generator: ^0.3.3+3
+
+  # JSON
+  json_annotation: ^4.11.0
+
+  # Open a source's web page in the system browser (Globe action on Detail).
+  url_launcher: ^6.3.1
+
+  # Fire the list-reveal animation when an item actually scrolls into view
+  # (pure Dart, no native — negligible size). See core/ui/reveal_item.dart.
+  visibility_detector: ^0.4.0+2
+
+  share_plus: ^13.1.0
+
+  # Save player screenshots to the gallery (Android MediaStore / iOS Photos).
+  gal: ^2.3.0
+
+  # Direct YouTube stream extraction (pure-Dart, no API key / native deps).
+  # TrailerService resolves a YouTube id from metadata APIs (AniList / TMDB),
+  # then youtube_explode_dart resolves it to a direct muxed (video+audio) URL
+  # that media_kit plays natively — no iframe, no YouTube chrome (Netflix-style).
+  youtube_explode_dart: ^3.1.0
+  wakelock_plus: ^1.5.2
+  appwrite: ^26.1.0
+  image_picker: ^1.2.2
+  # Swipe-for-brightness gesture in the player (left half of the surface).
+  screen_brightness: ^2.1.4
+  # CloudStream-style volume swipe: the right-half drag drives the REAL Android
+  # system media volume for 0–100% (then mpv `af=volume` boosts beyond 100%),
+  # exactly like CloudStream's slider. System UI is suppressed (we draw our HUD).
+  flutter_volume_controller: ^2.0.2
+  # Offline downloads — true background downloads with a progress notification,
+  # pause/resume, and move-to-shared-storage (public Downloads folder).
+  # Pinned to 9.5.5 — 9.5.7's Android/Kotlin code fails to compile here
+  # ("Unresolved reference" across BDPlugin/DownloadTaskRunner). 9.5.5 is the
+  # last version that builds. Revisit when a newer one fixes it.
+  background_downloader: 9.5.5
+  permission_handler: ^11.3.1
+  flutter_background_service: ^5.1.0
+  # Local notifications for "new episode" alerts on subscribed shows.
+  flutter_local_notifications: ^17.2.4
+  # Discord Rich Presence: Gateway WebSocket + secure token storage + a WebView
+  # for the Discord login (user-token capture).
+  web_socket_channel: ^3.0.1
+  flutter_secure_storage: ^10.3.1
+  webview_flutter: ^4.10.0
+  # Capture the OAuth redirect (zangetsu://anilist-auth) back into the app for
+  # AniList account linking.
+  app_links: ^6.3.2
+  # Render the QR on the TV device-pairing screen (pure Dart).
+  qr_flutter: ^4.1.0
+  floating: ^6.0.0
+  # In-app updates: read the running version + check GitHub Releases, then hand
+  # the downloaded APK to the system installer.
+  package_info_plus: ^10.2.1
+  open_filex: ^4.5.0
+  device_info_plus: ^13.2.0
+  flutter_colorpicker: ^1.1.0
+  firebase_core: ^4.12.1
+  # Crash reporting. Same Firebase project as Analytics/FCM, no new account.
+  firebase_crashlytics: ^5.0.5
+  firebase_analytics: ^12.4.5
+  supabase_flutter: ^2.16.0
+  firebase_messaging: ^16.4.3
+  fluttertoast: ^10.0.0
+  dynamic_color: ^2.1.0
+dev_dependencies:
+  # Test-only: gives the EPUB tests a REAL XML parse, which catches what a
+  # hand-rolled tag-balance check cannot (an unescaped '&', a bad attribute)
+  # — exactly what a strict e-reader rejects the whole file over.
+  xml: ^6.5.0
+  flutter_test:
+    sdk: flutter
+  integration_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  build_runner: ^2.4.13
+  json_serializable: ^6.9.0
+  flutter_launcher_icons: ^0.14.1
+
+# ── media_kit → Predidit performance fork (feat/mediakit-fork) ───────────────
+# Same media_kit Dart API (no code changes), but a newer native mpv 0.41 +
+# out-of-tree ffmpeg patches that play the malformed HLS/DASH streams scraped
+# sources serve — the reason AnymeX/Kazumi/Dartotsu run this fork. It's a
+# monorepo, so every package points at its subdir path. Pinned to AnymeX's
+# proven commit. To revert: delete this whole block and `flutter pub get`.
+dependency_overrides:
+  # screen_brightness 2.1.4+ jumped to Kotlin 2.3.21 / AGP 8.13.2, which the
+  # project's Kotlin 2.2.20 toolchain can't compile (the plugin's class fails to
+  # link → GeneratedPluginRegistrant "cannot find symbol"). 2.1.3 is the last
+  # release on Kotlin 1.9.22. Override only the Android impl (a leaf) so the rest
+  # of the dependency graph isn't re-resolved. Revisit if the project bumps
+  # Kotlin/AGP.
+  screen_brightness_android: 2.1.3
+  media_kit:
+    git:
+      url: https://github.com/Predidit/media-kit.git
+      ref: 11d02cb804b8faf944137834a1b0ac80880a4079
+      path: ./media_kit
+  media_kit_video:
+    git:
+      url: https://github.com/Predidit/media-kit.git
+      ref: 11d02cb804b8faf944137834a1b0ac80880a4079
+      path: ./media_kit_video
+  media_kit_libs_video:
+    git:
+      url: https://github.com/Predidit/media-kit.git
+      ref: 11d02cb804b8faf944137834a1b0ac80880a4079
+      path: ./libs/universal/media_kit_libs_video
+  media_kit_libs_android_video:
+    git:
+      url: https://github.com/Predidit/media-kit.git
+      ref: 11d02cb804b8faf944137834a1b0ac80880a4079
+      path: ./libs/android/media_kit_libs_android_video
+  media_kit_libs_ios_video:
+    git:
+      url: https://github.com/Predidit/media-kit.git
+      ref: 11d02cb804b8faf944137834a1b0ac80880a4079
+      path: ./libs/ios/media_kit_libs_ios_video
+  media_kit_libs_macos_video:
+    git:
+      url: https://github.com/Predidit/media-kit.git
+      ref: 11d02cb804b8faf944137834a1b0ac80880a4079
+      path: ./libs/macos/media_kit_libs_macos_video
+  media_kit_libs_windows_video:
+    git:
+      url: https://github.com/Predidit/media-kit.git
+      ref: 11d02cb804b8faf944137834a1b0ac80880a4079
+      path: ./libs/windows/media_kit_libs_windows_video
+  media_kit_libs_linux:
+    git:
+      url: https://github.com/Predidit/media-kit.git
+      ref: 11d02cb804b8faf944137834a1b0ac80880a4079
+      path: ./libs/linux/media_kit_libs_linux
+  media_kit_libs_ohos:
+    git:
+      url: https://github.com/Predidit/media-kit.git
+      ref: 11d02cb804b8faf944137834a1b0ac80880a4079
+      path: ./libs/ohos/media_kit_libs_ohos
+  # The fork's media_kit_video pins wakelock_plus 1.3.3; the rest of the app uses
+  # ^1.5.2. The WakelockPlus static API is unchanged across that bump, so force
+  # our newer one for everyone to let resolution succeed.
+  wakelock_plus: ^1.5.2
+  # The fork's media_kit needs js ^0.7.1; flutter_secure_storage's web shim pins
+  # js ^0.6.3. js is web-only interop (never compiled into the Android APK), so
+  # forcing 0.7.1 unblocks resolution without affecting the Android build.
+  js: ^0.7.1
+
+# App launcher icon (Zangetsu logo). Regenerate with:
+#   dart run flutter_launcher_icons
+flutter_launcher_icons:
+  image_path: "assets/icon/app_icon.png"
+  android: true
+  ios: true
+  remove_alpha_ios: true
+  background_color_ios: "#000000"
+  min_sdk_android: 21
+
+# For information on the generic Dart part of this file, see the
+# following page: https://dart.dev/tools/pub/pubspec
+
+# The following section is specific to Flutter packages.
+flutter:
+  generate: true
+  uses-material-design: true
+  assets:
+    # No built-in providers — sources are installed from the Zangetsu repo.
+    # Extractors stay bundled (shared video-host helpers, not providers).
+    - extractors/example_embed.js
+    - extractors/okru.js
+    - extractors/mp4upload.js
+    - extractors/streamlare.js
+    - extractors/doodstream.js
+    # Cheerio + htmlparser2 bundle for LNReader-style novel source scripts.
+    - assets/js/lnreader_cheerio.js
+    # require()/fetch shims + plugin loader that runs LNReader plugins on top.
+    - assets/js/lnreader_harness.js
+    # Brand wordmark extracted from the logo (exact lettering) for header/splash.
+    - assets/icon/wordmark.png
+    # Square app icon — shown on the About screen.
+    - assets/icon/app_icon.png
+    # Launcher-icon previews for the Appearance picker (mipmaps are not
+    # reachable from Dart, so the choices are bundled as normal assets).
+    - assets/icon/preview_crescent.png
+    - assets/icon/preview_default.png
+    - assets/icon/preview_classic.png
+    # New Zangetsu mark (black bg keyed out) — for the mode-switch transition.
+    - assets/icon/logo_mark.png
+    # Metadata provider marks, from each service's own site, for the switcher
+    # sheet. The sheet falls back to initials if one ever fails to decode.
+    - assets/icon/providers/anilist.png
+    - assets/icon/providers/mal.png
+    - assets/icon/providers/tmdb.png
+    - assets/icon/providers/simkl.png
+
+  fonts:
+    - family: Inter
+      fonts:
+        - asset: assets/fonts/Inter.ttf
+    # The default UI font, and the ONLY one added to the APK for it: a default
+    # has to paint on the first frame, with no network. Every other choice in
+    # Settings → Interface → Appearance → Font is fetched on demand by
+    # SubtitleFontService and registered with FontLoader, which is app-wide —
+    # so they cost download, not install size. Variable, so one file covers
+    # w400 through w800 and headings are really bold rather than smeared.
+    - family: Nunito
+      fonts:
+        - asset: assets/fonts/Nunito-Regular.ttf
+
+    # Noto Sans stays bundled — the libass Android fallback + an offline-safe
+    # default subtitle font. The other subtitle fonts are download-on-demand
+    # (SubtitleFontService), so they don't add ~6MB to the APK.
+    - family: Noto Sans
+      fonts:
+        - asset: assets/fonts/NotoSans-Regular.ttf

@@ -1,0 +1,1479 @@
+import 'package:flutter/foundation.dart' show debugPrint;
+import 'package:flutter/material.dart';
+
+import '../aniyomi/aniyomi_provider.dart';
+import '../app_mode.dart';
+import '../di/injector.dart';
+import '../hive/source_icon_store.dart';
+import '../i18n/source_languages.dart';
+import 'source_icon_tile.dart';
+import '../lnreader/lnreader_manager.dart';
+import '../mihon/mihon_manager.dart';
+import '../prefs/source_lang_prefs.dart';
+import '../mode/content_mode.dart';
+import '../mode/content_mode_cubit.dart';
+import '../playback/pinned_sources.dart';
+import '../models/provider_info.dart';
+import '../playback/playback_prefs.dart';
+import '../provider/cloudstream_provider.dart';
+import '../provider/provider_manager.dart';
+import '../provider/provider_registry.dart';
+import '../theme/app_colors.dart';
+import '../theme/app_text.dart';
+import '../tv/tv_focusable.dart';
+import '../tv/tv_list_focusable.dart';
+import '../zmode/zmode_ids.dart';
+import '../zmode/zmode_module.dart';
+import '../zmode/zmode_prefs.dart';
+import 'states.dart';
+
+/// Installed-and-enabled sources bucketed by category, each as an `(id, label)`
+/// row. Reused by the source switcher and the search source picker.
+///
+/// [manga]/[novel] are additive: a reading-typed JS source ALSO still lands in
+/// [movies] exactly as it always has (that classification is untouched), so
+/// [TvSourcePicker] — which reads only anime/movies/nsfw and has no mode
+/// filter — renders exactly as it did before these two fields existed.
+typedef SourceBuckets = ({
+  List<({String id, String label, String? repo, String? icon})> anime,
+  List<({String id, String label, String? repo, String? icon})> movies,
+  List<({String id, String label, String? repo, String? icon})> nsfw,
+  List<({String id, String label, String? repo, String? icon})> manga,
+  List<({String id, String label, String? repo, String? icon})> novel,
+});
+
+/// Short repo identifier from a manifest URL (the GitHub repo name, else the
+/// owner, else the host) — shown after a source so you can tell which repo it
+/// came from. Null for bundled/blank URLs → nothing is shown.
+String? _repoLabelFromUrl(String? repoUrl) {
+  if (repoUrl == null || repoUrl.isEmpty || repoUrl.startsWith('bundled://')) {
+    return null;
+  }
+  try {
+    final u = Uri.parse(repoUrl);
+    final segs = u.pathSegments.where((s) => s.isNotEmpty).toList();
+    if (u.host.contains('github')) {
+      if (segs.length >= 2) return segs[1]; // owner / REPO
+      if (segs.isNotEmpty) return segs.first;
+    }
+    return u.host.isEmpty ? null : u.host;
+  } catch (_) {
+    return null;
+  }
+}
+
+/// A row's own name with its ecosystem tag ("CS · ", "Ani · ", "Z · ") taken
+/// off — for sorting and for the avatar letter, so a bucket orders by what the
+/// source is called rather than by which ecosystem it came from.
+String sourceRowName(String label) {
+  final i = label.indexOf('· ');
+  return (i == -1 ? label : label.substring(i + 2)).trim();
+}
+
+/// `sourceId -> icon URL` for every loaded CloudStream source.
+///
+/// A loaded plugin carries no icon of its own — only the repo catalog entry it
+/// was installed from does, keyed by the plugin's internal name. Shared by the
+/// picker and the CloudStream sources screen so the two cannot disagree.
+/// Best-effort: an icon must never stop a list from building.
+Map<String, String> cloudStreamIconUrls() {
+  final out = <String, String>{};
+  try {
+    for (final g in sl<CloudStreamManager>().repoGroups) {
+      for (final s in g.sources) {
+        final internalName = s.sourcePlugin?.split('@').first;
+        if (internalName == null) continue;
+        for (final p in g.catalog) {
+          if (p.internalName == internalName && p.iconUrl != null) {
+            out[s.sourceId] = p.iconUrl!;
+            break;
+          }
+        }
+      }
+    }
+  } catch (_) {
+    /* icons are cosmetic */
+  }
+  return out;
+}
+
+/// Buckets installed + enabled providers (JS + CloudStream) by manifest type.
+/// NSFW sources are kept separate and only surfaced when the Privacy toggle is
+/// on. CS rows are prefixed "CS · " and interleaved alphabetically. Each row's
+/// label carries a small trailing " · repo" tag so the origin repo is visible.
+SourceBuckets categorizedSources() {
+  final reg = sl<ProviderRegistry>();
+  final nsfwEnabled = sl<PlaybackPrefs>().nsfwSources;
+  final nsfwIds = reg.nsfwSourceIds();
+  // Resolved once for the whole bucketing pass — see [_typeOfFromMap]. This
+  // used to be reg.typeOf(e.name) AND sourceTypeOf(e.name) called per row
+  // below (two repo-manifest deserializes per row instead of one total).
+  // Both maps from ONE manifest pass — a second getAll() here doubles the
+  // per-call cost the perf test pins.
+  final maps = reg.manifestMapsOf();
+  final typeMap = maps.types;
+  final logoMap = maps.logos;
+  ({String id, String label, String? repo, String? icon}) row(e) {
+    final base = (e.displayName as String).isNotEmpty
+        ? e.displayName as String
+        : e.name as String;
+    final repo = _repoLabelFromUrl(e.originRepoUrl as String?);
+    // No ecosystem tag: these ARE the app's own sources, and the repo line
+    // underneath already says where they came from.
+    //
+    // The logo is snapshotted on the registry entry at install time, the same
+    // way [displayName] is, so this costs no manifest read per row. Empty for
+    // every manifest that declares no `logo` — which is all of them today —
+    // and empty means the letter tile, exactly as before.
+    // Live manifest first, then the snapshot taken at install as the offline
+    // fallback. The snapshot alone would leave every source installed before
+    // the field existed on its letter tile forever.
+    final id = e.name as String;
+    final logo = logoMap[id] ?? (e.logoUrl as String? ?? '');
+    return (
+      id: id,
+      label: base,
+      repo: repo,
+      icon: logo.isEmpty ? null : logo,
+    );
+  }
+
+  int byLabel(a, b) => sourceRowName(
+    row(a).label,
+  ).toLowerCase().compareTo(sourceRowName(row(b).label).toLowerCase());
+
+  final enabled = reg.getAll().where((e) => e.enabled).toList();
+  final anime = <({String id, String label, String? repo, String? icon})>[];
+  final movies = <({String id, String label, String? repo, String? icon})>[];
+  final nsfw = <({String id, String label, String? repo, String? icon})>[];
+  final manga = <({String id, String label, String? repo, String? icon})>[];
+  final novel = <({String id, String label, String? repo, String? icon})>[];
+  for (final e in (enabled..sort(byLabel))) {
+    if (nsfwIds.contains(e.name)) {
+      if (nsfwEnabled) nsfw.add(row(e));
+      continue; // NSFW sources live only in their own group
+    }
+    if (typeMap[e.name] == 'anime') {
+      anime.add(row(e));
+    } else {
+      movies.add(row(e)); // movie / series / unknown
+    }
+    // Additive only — the anime/movies routing above is UNCHANGED, so a
+    // manga/novel source still lands in `movies` too (TvSourcePicker keeps
+    // seeing exactly what it saw before). This is just the one extra place a
+    // reading-mode picker can actually find it. Same resolution sourceTypeOf
+    // does (the app's one ProviderType resolver), just against the map
+    // already built above instead of re-deriving the type per row.
+    switch (_typeOfFromMap(e.name, typeMap)) {
+      case ProviderType.manga:
+        manga.add(row(e));
+      case ProviderType.novel:
+        novel.add(row(e));
+      case ProviderType.anime:
+      case ProviderType.movie:
+        break;
+    }
+  }
+
+  // Loaded CloudStream plugins. No NSFW flag, so they only ever land in the
+  // anime or movies buckets. Sort each combined bucket by label so CS rows
+  // interleave alphabetically with the JS rows rather than trailing them.
+  // By NAME, not by the tagged label — sorting on "CS · …" clustered every
+  // CloudStream row under C, which is the opposite of the interleaving this
+  // comment has always claimed.
+  int byRowLabel(
+    ({String id, String label, String? repo, String? icon}) a,
+    ({String id, String label, String? repo, String? icon}) b,
+  ) => sourceRowName(
+    a.label,
+  ).toLowerCase().compareTo(sourceRowName(b.label).toLowerCase());
+  final mgr = sl<CloudStreamManager>();
+  // Map each CS source to its origin repo's name, for the repo tag, and to
+  // the repo catalog's advertised icon (loaded providers don't carry one
+  // themselves — only the catalog entry they were installed from does).
+  // Best-effort: neither a repo tag nor an icon must ever stop the picker
+  // from opening.
+  final csRepoById = <String, String>{};
+  final iconById = cloudStreamIconUrls();
+  try {
+    for (final g in mgr.repoGroups) {
+      if (g.name.isEmpty) continue;
+      for (final s in g.sources) {
+        csRepoById[s.sourceId] = g.name;
+      }
+    }
+  } catch (_) {
+    /* tags are cosmetic */
+  }
+  for (final p in mgr.enabled) {
+    final repo = csRepoById[p.sourceId];
+    final csRow = (
+      id: p.sourceId,
+      label: 'CS · ${p.displayName}',
+      repo: repo,
+      icon: iconById[p.sourceId],
+    );
+    if (p.providerType == ProviderType.anime) {
+      anime.add(csRow);
+    } else {
+      movies.add(csRow);
+    }
+  }
+  // Aniyomi providers — always anime; keyed by their `ani:` sourceId.
+  // NSFW-flagged sources are hidden when the pref is off.
+  final showNsfwAni = sl<PlaybackPrefs>().showNsfwAniyomi;
+  // Language filter, same as the Mihon block below. Its absence here is why
+  // choosing English still listed every Aniyomi language in the picker and on
+  // the Sources screen — both read this function.
+  final aniLangs = sl.isRegistered<AnimeLangPrefs>()
+      ? (sl<AnimeLangPrefs>().enabled ?? defaultSourceLangs())
+      : null;
+  var aniSources = sl<AniyomiManager>()
+      .all
+      .where((p) => aniyomiNsfwVisible(p, showNsfwAniyomi: showNsfwAni))
+      .toList();
+  if (aniLangs != null) {
+    aniSources = visibleInstalledSources(
+      aniSources,
+      aniLangs,
+      pkgOf: (p) => p is AniyomiProvider ? p.info.pkg : p.sourceId,
+      langOf: (p) => p is AniyomiProvider ? p.info.lang : '',
+    );
+  }
+  for (final p in aniSources) {
+    // The source object carries no icon — the repo index does, and
+    // SourceIconStore keeps what it saw. Null until that repo has been read
+    // once, which just means the letter tile.
+    anime.add((
+      id: p.sourceId,
+      label: 'Ani · ${p.displayName}',
+      repo: 'Aniyomi',
+      icon: p is AniyomiProvider ? SourceIconStore.urlFor(p.pkg) : null,
+    ));
+  }
+  // Mihon providers — always manga; keyed by their `mihon:` sourceId. Only the
+  // manga bucket, never anime/movies/nsfw, so TvSourcePicker (which reads
+  // anime/movies/nsfw and has no mode filter) renders exactly as before.
+  //
+  // isRegistered-guarded because MihonManager is a newer singleton than this
+  // function's other dependencies: plenty of existing tests build a GetIt with
+  // ProviderRegistry + PlaybackPrefs + CloudStreamManager + AniyomiManager and
+  // nothing else, and an unguarded lookup would turn every one of them into a
+  // GetIt "not registered" crash. NSFW reuses the general `nsfwSources` toggle
+  // (there is no Mihon-specific pref), matching SourceRepository.loadedSources.
+  if (sl.isRegistered<MihonManager>()) {
+    // Only surface sources in the user's enabled languages. A multi-language
+    // extension (MangaDex, MANGA Plus) is a SourceFactory that yields one source
+    // PER LANGUAGE, so without this the picker floods with dozens of identical
+    // rows. Mirrors the Mihon sources screen's Languages filter + default
+    // (English + device language).
+    final langs = sl.isRegistered<MangaLangPrefs>()
+        ? (sl<MangaLangPrefs>().enabled ?? defaultSourceLangs())
+        : null;
+    var mihonSources = sl<MihonManager>()
+        .all
+        .where((p) => !(p.info.nsfw && !nsfwEnabled))
+        .toList();
+    if (langs != null) {
+      // Guarded, not a hard filter: narrowing MangaDex's 61 languages to the
+      // ones you read is the point, but an extension whose ONLY language you
+      // filtered out is one you installed deliberately — hiding it leaves you
+      // no way to use it.
+      mihonSources = visibleInstalledSources(
+        mihonSources,
+        langs,
+        pkgOf: (p) => p.pkg,
+        langOf: (p) => p.info.lang,
+      );
+    }
+    for (final p in mihonSources) {
+      final lang = p.info.lang;
+      // Carry the language code in the subtitle so the ones that DO show (e.g.
+      // the enabled languages of a multi-language extension) stay
+      // distinguishable; it feeds the picker's search too.
+      // Same store as the Aniyomi rows above; a multi-language extension is
+      // one package, so every one of its rows shares the icon.
+      manga.add((
+        id: p.sourceId,
+        label: 'Mihon · ${p.displayName}',
+        repo: lang.isNotEmpty ? 'Mihon · $lang' : 'Mihon',
+        icon: SourceIconStore.urlFor(p.pkg),
+      ));
+    }
+  }
+  // LNReader providers — always novel; keyed by their `lnr:` sourceId. Only
+  // the novel bucket, same isRegistered guard and rationale as the Mihon
+  // block above (LnReaderManager is registered even later than MihonManager,
+  // so plenty of existing tests still build a GetIt without it).
+  // `installedSources` is SYNC and reads stored meta only — no runtime build.
+  if (sl.isRegistered<LnReaderManager>()) {
+    final lnr = sl<LnReaderManager>();
+    for (final p in lnr.installedSources) {
+      // p.id is already the `lnr:`-prefixed sourceId; metaFor wants the bare
+      // plugin id back off it.
+      final icon = lnr.metaFor(p.id.substring(4))?.iconUrl;
+      novel.add((
+        id: p.id,
+        label: 'LNReader · ${p.name}',
+        repo: 'LNReader',
+        icon: (icon != null && icon.isNotEmpty) ? icon : null,
+      ));
+    }
+  }
+
+  anime.sort(byRowLabel);
+  movies.sort(byRowLabel);
+  manga.sort(byRowLabel);
+  novel.sort(byRowLabel);
+
+  return (anime: anime, movies: movies, nsfw: nsfw, manga: manga, novel: novel);
+}
+
+/// Best-effort [ProviderType] for a source [id] — used to filter the picker
+/// and search by content mode. Mirrors [categorizedSources]' own anime/movie
+/// bucketing default, so an id with no cached manifest type still counts as
+/// anime (matching today's behavior when a mode filter isn't applied).
+ProviderType sourceTypeOf(String id) {
+  // Zangetsu Mode's pseudo source has no manifest to type — its "type" is
+  // whatever catalogue kind is currently browsed. `movie`/`anime`/`tv` all
+  // fall under `anime` here since ContentMode.anime.matchesProvider accepts
+  // either; the caller only needs to know which ContentMode bucket it's in.
+  if (id == ZmodeIds.sourceId) {
+    return switch (browseKindFor(
+      sl<ContentModeCubit>().state,
+      ZModePrefs.streamKind,
+    )) {
+      ZKind.manga => ProviderType.manga,
+      ZKind.novel => ProviderType.novel,
+      ZKind.anime || ZKind.movie || ZKind.tv => ProviderType.anime,
+    };
+  }
+  if (id.startsWith('cs:')) {
+    final p = sl<CloudStreamManager>().get(id);
+    return p is CloudStreamProvider ? p.providerType : ProviderType.anime;
+  }
+  // LNReader novel extensions. Same reasoning as the Mihon line right below:
+  // a dedicated `lnr:` prefix, checked first, types these as novel without
+  // touching the `mihon:`/`ani:` lines — no GetIt lookup needed since an
+  // LNReader source is novel-only by construction.
+  if (id.startsWith('lnr:')) return ProviderType.novel;
+  // Mihon manga extensions. They carry their own `mihon:` prefix precisely so
+  // this resolver can type them as manga WITHOUT disturbing the `ani:` line
+  // below (spec Decision 1) — reusing `ani:` would have typed every manga
+  // source as anime. No GetIt lookup needed: the prefix alone is authoritative,
+  // since a Mihon source is manga-only by construction.
+  if (id.startsWith('mihon:')) return ProviderType.manga;
+  // ponytail: hardcoded to anime — wrong by construction the day manga
+  // reuses the Aniyomi extension machinery (a real, planned direction; see
+  // watch-app-manga-novel-support). Fix then: read the loaded extension's
+  // own declared type instead of assuming video-only.
+  if (id.startsWith('ani:')) return ProviderType.anime; // Aniyomi is video-only
+  final t = sl<ProviderRegistry>().typeOf(id);
+  if (t == null) return ProviderType.anime;
+  return ProviderType.values.asNameMap()[t] ?? ProviderType.anime;
+}
+
+/// Same resolution as [sourceTypeOf], but reads a precomputed id->type map
+/// (see [ProviderRegistry.typeMapOf]) instead of hitting the registry per
+/// call. Used by callers that resolve many ids in one pass — the repo
+/// manifests get walked once for the whole pass instead of once per id.
+ProviderType _typeOfFromMap(String id, Map<String, String> typeMap) {
+  if (id.startsWith('cs:')) {
+    final p = sl<CloudStreamManager>().get(id);
+    return p is CloudStreamProvider ? p.providerType : ProviderType.anime;
+  }
+  // Must stay in lockstep with [sourceTypeOf]'s branches — this twin is what
+  // filterBucketsForMode uses, so without them a `lnr:`/`mihon:` row would
+  // resolve to anime here and get filtered straight out of the novel/manga
+  // bucket it was just put in.
+  if (id.startsWith('lnr:')) return ProviderType.novel;
+  if (id.startsWith('mihon:')) return ProviderType.manga;
+  if (id.startsWith('ani:')) return ProviderType.anime; // Aniyomi is video-only
+  final t = typeMap[id];
+  if (t == null) return ProviderType.anime;
+  return ProviderType.values.asNameMap()[t] ?? ProviderType.anime;
+}
+
+/// Splits video rows by the ecosystem they came from — Zangetsu's own JS
+/// providers, CloudStream plugins, Aniyomi extensions — in that order, with
+/// empty ones dropped.
+///
+/// The id prefix is the truth here (`cs:`, `ani:`, `mihon:`, `lnr:`), the same
+/// routing every other part of the app uses, rather than the "CS · " label
+/// text which is only for reading.
+List<({String title, List<({String id, String label, String? repo, String? icon})> rows})>
+ecosystemTabs(List<({String id, String label, String? repo, String? icon})> rows) {
+  bool isCs(String id) => id.startsWith('cs:');
+  bool isAni(String id) => id.startsWith('ani:');
+  final zangetsu = [
+    for (final r in rows)
+      if (!isCs(r.id) && !isAni(r.id)) r,
+  ];
+  final cs = [
+    for (final r in rows)
+      if (isCs(r.id)) r,
+  ];
+  final ani = [
+    for (final r in rows)
+      if (isAni(r.id)) r,
+  ];
+  return [
+    if (zangetsu.isNotEmpty) (title: 'Zangetsu', rows: zangetsu),
+    if (cs.isNotEmpty) (title: 'CloudStream', rows: cs),
+    if (ani.isNotEmpty) (title: 'Aniyomi', rows: ani),
+  ];
+}
+
+/// Narrows a [SourceBuckets] to the rows visible in [mode]. A no-op in anime
+/// mode for today's real source sets (anime/movie are the only types in use),
+/// so the picker and search show exactly what they show today.
+SourceBuckets filterBucketsForMode(SourceBuckets buckets, ContentMode mode) {
+  // Resolved once for the whole call, not once per row — this used to be
+  // sourceTypeOf(r.id) inside the row filter below, which meant one
+  // ProviderRegistry.typeOf() (and therefore one full repo-manifest
+  // deserialize) per row across every bucket. That's the picker-open lag:
+  // switching sources is a hot, frequent action, not a cold path.
+  final typeMap = sl<ProviderRegistry>().typeMapOf();
+
+  // A plain list filter, NOT a map-by-id round trip: the same sourceId can
+  // legitimately appear twice in a bucket (installed from two different
+  // repos — see ProviderRegistry's composite repoUrl+sourceId key), and a
+  // map would collapse those into one row, silently dropping one from the
+  // picker/search.
+  List<({String id, String label, String? repo, String? icon})> filter(
+    List<({String id, String label, String? repo, String? icon})> rows,
+  ) => rows
+      .where((r) => mode.matchesProvider(_typeOfFromMap(r.id, typeMap)))
+      .toList();
+
+  return (
+    anime: filter(buckets.anime),
+    movies: filter(buckets.movies),
+    nsfw: filter(buckets.nsfw),
+    manga: filter(buckets.manga),
+    novel: filter(buckets.novel),
+  );
+}
+
+/// True if there's at least one installed+enabled source for [mode]'s own
+/// reading bucket. Always false for [ContentMode.anime] (it has no reading
+/// bucket of its own) — callers should already be gating on
+/// [ContentModeX.isReading] before asking. The "is there anything installed
+/// for this mode" check Home/Search/My List's empty states need, factored
+/// out of [_SourcePickerSheetState._hasAnySources] (which needed the exact
+/// same thing for the picker's pin nudge) so it's one answer, not four.
+bool hasReadingSourcesFor(ContentMode mode) {
+  if (!mode.isReading) return false;
+  final b = categorizedSources();
+  return (mode == ContentMode.manga ? b.manga : b.novel).isNotEmpty;
+}
+
+/// True if there's at least one installed source usable in [mode] — the mode's
+/// own reading bucket for manga/novel, or any anime/movie source for anime.
+/// Generalises [hasReadingSourcesFor] to all three modes (the app ships NO
+/// built-in sources — everything comes from installed repos), so Home can show
+/// a "no sources yet → install" guide for anime too, not just reading.
+///
+/// filterBucketsForMode drops the rows a mode can't use (the raw `movies`
+/// bucket also carries manga/novel rows for the TV picker), so any non-empty
+/// bucket after it is a real source for [mode].
+///
+/// Defensive: source enumeration touches several DI singletons, so if the graph
+/// isn't fully up (early boot, minimal test harnesses) it can throw — treat that
+/// as "sources exist" so a spurious "no sources" guide never flashes over a home
+/// that would otherwise show content (or its own retry).
+bool hasSourcesFor(ContentMode mode) {
+  try {
+    final b = filterBucketsForMode(categorizedSources(), mode);
+    final result =
+        b.anime.isNotEmpty ||
+        b.movies.isNotEmpty ||
+        b.nsfw.isNotEmpty ||
+        b.manga.isNotEmpty ||
+        b.novel.isNotEmpty;
+    debugPrint(
+      '[source-switcher] hasSourcesFor($mode) → $result '
+      '(anime=${b.anime.length} movies=${b.movies.length} '
+      'nsfw=${b.nsfw.length} manga=${b.manga.length} '
+      'novel=${b.novel.length})',
+    );
+    return result;
+  } catch (e) {
+    debugPrint('[source-switcher] hasSourcesFor($mode) → catch → true · $e');
+    return true;
+  }
+}
+
+/// A compact pill button that shows the active source and opens a
+/// bottom-sheet picker when tapped. The selectable list is built
+/// dynamically from the installed-and-enabled providers in
+/// [ProviderRegistry], so repo-installed sources become selectable here
+/// as soon as they're enabled.
+class SourceSwitcher extends StatelessWidget {
+  const SourceSwitcher({
+    super.key,
+    required this.currentId,
+    required this.onChanged,
+    this.onInstallSources,
+  });
+
+  final String currentId;
+  final void Function(String id) onChanged;
+
+  /// Opens the install flow (Zangetsu sources → Repositories) — shown as a
+  /// button on the picker's empty state when a reading mode has no sources
+  /// installed yet. Null → the empty state just has no button (today's
+  /// anime-mode behavior, and a safe no-op for any caller that hasn't wired
+  /// this up).
+  final VoidCallback? onInstallSources;
+
+  /// Installed + enabled providers bucketed by category (shared helper).
+  SourceBuckets _buckets() => categorizedSources();
+
+  // Ecosystem signature colors for the chip tag (CS blue / Aniyomi purple /
+  // Zangetsu coral).
+  static const Color _csColor = Color(0xFF7EA2FF);
+  static const Color _aniColor = Color(0xFFBB8CFF);
+  static const Color _mihonColor = Color(0xFF6FD8A8);
+  static const Color _lnrColor = Color(0xFFF6A96B); // LNReader (novel) — amber
+
+  /// Short colored ecosystem tag + source name for the chip. The tag replaces
+  /// the old "CS · " name prefix: still text (a colored dot alone was too
+  /// cryptic), but tiny and tinted per ecosystem.
+  (String, Color, String) get _tagAndName {
+    if (currentId.startsWith('cs:')) {
+      final name = sl<CloudStreamManager>().get(currentId)?.displayName;
+      return (
+        'CS',
+        _csColor,
+        (name != null && name.isNotEmpty) ? name : currentId,
+      );
+    }
+    if (currentId.startsWith('ani:')) {
+      final name = sl<AniyomiManager>().get(currentId)?.displayName;
+      return (
+        'ANI',
+        _aniColor,
+        (name != null && name.isNotEmpty) ? name : currentId,
+      );
+    }
+    // Without this a `mihon:` active source falls through to the ZAN branch,
+    // finds no ProviderRegistry entry, and the chip renders the raw id.
+    if (currentId.startsWith('mihon:')) {
+      final name = sl.isRegistered<MihonManager>()
+          ? sl<MihonManager>().get(currentId)?.displayName
+          : null;
+      return (
+        'MIHON',
+        _mihonColor,
+        (name != null && name.isNotEmpty) ? name : currentId,
+      );
+    }
+    // Without this an `lnr:` novel source falls through to the ZAN branch,
+    // which has no ProviderRegistry entry for it, so the chip showed the raw
+    // id (e.g. "lnr:anf.net") instead of the plugin's name.
+    if (currentId.startsWith('lnr:')) {
+      final name = sl.isRegistered<LnReaderManager>()
+          ? sl<LnReaderManager>().metaFor(currentId.substring(4))?.name
+          : null;
+      return (
+        'LN',
+        _lnrColor,
+        (name != null && name.isNotEmpty) ? name : currentId,
+      );
+    }
+    final entry = sl<ProviderRegistry>().entryFor(currentId);
+    final name = (entry != null && entry.displayName.isNotEmpty)
+        ? entry.displayName
+        : (entry?.name ?? currentId);
+    return ('ZAN', AppColors.accent, name);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final (tag, tagColor, name) = _tagAndName;
+    // Hairline micro-capsule: outline only (the hero shows through), a tiny
+    // colored ecosystem tag, then the source name. Hugs the text — but capped
+    // at 150px so a long name ellipsizes inside instead of growing the
+    // capsule and squeezing the wordmark on the left.
+    final chip = Container(
+      constraints: const BoxConstraints(maxWidth: 150),
+      padding: const EdgeInsets.fromLTRB(11, 4, 7, 4),
+      decoration: BoxDecoration(
+        border: Border.all(color: Colors.white.withValues(alpha: 0.16)),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            tag,
+            style: TextStyle(
+              fontSize: 9,
+              fontWeight: FontWeight.w800,
+              letterSpacing: 0.4,
+              color: tagColor,
+            ),
+          ),
+          const SizedBox(width: 6),
+          Flexible(
+            child: Text(
+              name,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: AppText.body.copyWith(
+                fontSize: 12.5,
+                color: AppColors.textPrimary,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+          const SizedBox(width: 3),
+          const Icon(
+            Icons.keyboard_arrow_down,
+            size: 15,
+            color: AppColors.textSecondary,
+          ),
+        ],
+      ),
+    );
+    final isTv = sl.isRegistered<AppMode>() && sl<AppMode>().isTv;
+    if (isTv) {
+      return TvFocusable(
+        onTap: () => showPicker(context),
+        // Picker autofocuses a source row; KeyDown open + KeyUp would
+        // activate that row and close the sheet immediately.
+        waitForKeyUp: true,
+        variant: TvFocusVariant.float,
+        scale: 1.02,
+        borderRadius: 14,
+        semanticLabel: name,
+        child: ExcludeSemantics(child: chip),
+      );
+    }
+    return GestureDetector(onTap: () => showPicker(context), child: chip);
+  }
+
+  /// Opens the shared source picker (tabbed anime/movies list with CS·/Ani·
+  /// labels + repo tags). Public so other screens (e.g. Settings → Active
+  /// source) can present the exact same picker as the Home header.
+  void showPicker(
+    BuildContext context, {
+    Widget? Function(String id)? trailingBuilder,
+    void Function(String id)? onPick,
+    VoidCallback? onAutoResolve,
+    bool autoSelected = false,
+  }) {
+    final mode = sl<ContentModeCubit>().state;
+    final b = filterBucketsForMode(_buckets(), mode);
+
+    // The "All" tab is the tallest; size the sheet to it (so it's compact for a
+    // few sources) but cap at 85% screen — TabBarView needs a bounded height.
+    // Anime mode sizes off anime/movies/nsfw exactly as before; a reading
+    // mode sizes off its own single bucket instead (anime/movies/nsfw are
+    // always empty there, so counting them in too would be harmless, but
+    // this keeps the "what's actually shown" intent explicit).
+    final screenH = MediaQuery.sizeOf(context).height;
+    final relevant = mode.isReading
+        ? [mode == ContentMode.manga ? b.manga : b.novel]
+        : [b.anime, b.movies, b.nsfw];
+    final headers = relevant.where((l) => l.isNotEmpty).length;
+    final total = relevant.fold(0, (sum, l) => sum + l.length);
+    // Search only earns its space once there's a list worth filtering.
+    final showSearch = total > 6;
+    // Measured against the compact layout: pill search ~44, auto row ~46 plus
+    // its "OR PICK ONE" label ~19, rows ~46. Guessing high here is not free —
+    // the sheet reserves whatever this says and leaves dead space below the
+    // list if the numbers describe an older, taller layout.
+    // Reserve slightly MORE than each piece measures, never less: the sheet is
+    // a fixed box, so under-reserving clips the bottom of the list rather than
+    // scrolling it — which is exactly what happened when these were first
+    // tuned down to match the compact layout (7 picker tests went red).
+    //   pill search 36 + 8 margins  -> 48
+    //   auto row 46 + hairline 18 -> 64
+    //   source row 30 avatar + 16 padding -> 48
+    final searchH = showSearch ? 48 : 0;
+    final autoRowH = onAutoResolve != null ? 64 : 0;
+    final sheetH = (24 + 48 + searchH + autoRowH + (total + headers) * 48 + 24)
+        .clamp(240.0, screenH * 0.85);
+
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: AppColors.surface,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) => _SourcePickerSheet(
+        buckets: b,
+        currentId: currentId,
+        trailingBuilder: trailingBuilder,
+        height: sheetH.toDouble(),
+        showSearch: showSearch,
+        mode: mode,
+        onInstallSources: onInstallSources,
+        autoSelected: autoSelected,
+        onAutoResolve: onAutoResolve == null
+            ? null
+            : () {
+                Navigator.of(ctx).pop();
+                onAutoResolve();
+              },
+        onChoose: (id) {
+          Navigator.of(ctx).pop();
+          // onPick lets a caller (Z Mode's per-title selector) consume the
+          // choice WITHOUT switching the app's active source.
+          (onPick ?? onChanged)(id);
+        },
+      ),
+    );
+  }
+}
+
+/// True if a source [label] (or its origin [repo]) matches the search [query].
+/// Case-insensitive substring; a blank query matches everything.
+bool _sourcePickerMatches(String query, String label, String? repo) {
+  final q = query.trim().toLowerCase();
+  if (q.isEmpty) return true;
+  if (label.toLowerCase().contains(q)) return true;
+  return repo != null && repo.toLowerCase().contains(q);
+}
+
+/// The source-picker bottom sheet body. Stateful so the search field can filter
+/// the tab lists live. Tab set (All / Anime / Movies / NSFW) is fixed — only the
+/// rows inside each tab filter, so the [DefaultTabController] length is stable.
+class _SourcePickerSheet extends StatefulWidget {
+  const _SourcePickerSheet({
+    required this.buckets,
+    required this.currentId,
+    required this.height,
+    required this.showSearch,
+    required this.mode,
+    required this.onChoose,
+    this.onInstallSources,
+    this.trailingBuilder,
+    this.onAutoResolve,
+    this.autoSelected = false,
+  });
+
+  final SourceBuckets buckets;
+  final String currentId;
+  final double height;
+  final bool showSearch;
+  final ContentMode mode;
+  final void Function(String id) onChoose;
+  final VoidCallback? onInstallSources;
+  final Widget? Function(String id)? trailingBuilder;
+
+  /// When set, an "Auto Resolve" row is shown above the tabs — Z Mode's
+  /// per-title selector only.
+  final VoidCallback? onAutoResolve;
+
+  /// True when Auto Resolve is the active pick for this title.
+  final bool autoSelected;
+
+  @override
+  State<_SourcePickerSheet> createState() => _SourcePickerSheetState();
+}
+
+class _SourcePickerSheetState extends State<_SourcePickerSheet> {
+  final _searchCtrl = TextEditingController();
+  String _query = '';
+
+  bool get _isTv => sl.isRegistered<AppMode>() && sl<AppMode>().isTv;
+
+  @override
+  void dispose() {
+    _searchCtrl.dispose();
+    super.dispose();
+  }
+
+  List<({String id, String label, String? repo, String? icon})> _filter(
+    List<({String id, String label, String? repo, String? icon})> rows,
+  ) => [
+    for (final s in rows)
+      if (_sourcePickerMatches(_query, s.label, s.repo)) s,
+  ];
+
+  Widget _rowFor(
+    ({String id, String label, String? repo, String? icon}) src, {
+    bool autofocus = false,
+  }) {
+    final trailing = widget.trailingBuilder?.call(src.id);
+    final row = _SourceRow(
+      label: src.label,
+      repo: src.repo,
+      icon: src.icon,
+      isActive: !widget.autoSelected && src.id == widget.currentId,
+      isPinned: PinnedSources.isPinned(src.id),
+      // On TV trailing actions are siblings beside the row so D-pad can
+      // reach them without nesting focus inside the source TvListFocusable.
+      trailing: _isTv ? null : trailing,
+      autofocus: autofocus,
+      onTap: () => widget.onChoose(src.id),
+      onLongPress: () async {
+        await PinnedSources.toggle(src.id);
+        if (mounted) setState(() {});
+      },
+    );
+    if (_isTv && trailing != null) {
+      return Row(
+        children: [
+          Expanded(child: row),
+          trailing,
+        ],
+      );
+    }
+    return row;
+  }
+
+  Widget _empty(String message) =>
+      EmptyState(icon: Icons.source_outlined, message: message);
+
+  /// Empty state for a reading mode with literally nothing installed — the
+  /// gap this task fixes. Only rendered from [_readingFlat]/[_grouped],
+  /// never from the anime-mode path, so anime mode can never show a button
+  /// here regardless of whether [onInstallSources] is wired.
+  Widget _installCta() {
+    final install = widget.onInstallSources;
+    void openInstall() {
+      Navigator.of(context).pop();
+      install!();
+    }
+
+    if (_isTv && install != null) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.source_outlined,
+              size: 48,
+              color: AppColors.textTertiary,
+            ),
+            const SizedBox(height: 12),
+            Text(
+              'No ${widget.mode.label} sources yet',
+              textAlign: TextAlign.center,
+              style: AppText.body,
+            ),
+            const SizedBox(height: 16),
+            TvFocusable(
+              autofocus: true,
+              variant: TvFocusVariant.pill,
+              onTap: openInstall,
+              semanticLabel: 'Browse repositories',
+              builder: (focused) => DecoratedBox(
+                decoration: BoxDecoration(
+                  color: focused ? Colors.white : AppColors.accent,
+                  borderRadius: BorderRadius.circular(24),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 28,
+                    vertical: 12,
+                  ),
+                  child: Text(
+                    'Browse repositories',
+                    style: AppText.button.copyWith(
+                      color: focused ? Colors.black : Colors.white,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+    return EmptyState(
+      icon: Icons.source_outlined,
+      message: 'No ${widget.mode.label} sources yet',
+      actionLabel: install == null ? null : 'Browse repositories',
+      onAction: install == null ? null : openInstall,
+    );
+  }
+
+  // A scrollable flat list for a single tab.
+  Widget _flat(List<({String id, String label, String? repo, String? icon})> all) {
+    final rows = _filter(all);
+    if (rows.isEmpty) {
+      return _empty(_query.trim().isEmpty ? 'No sources here' : 'No matches');
+    }
+    // Pinned sources float to the top of the tab.
+    final sorted = [
+      ...rows.where((s) => PinnedSources.isPinned(s.id)),
+      ...rows.where((s) => !PinnedSources.isPinned(s.id)),
+    ];
+    final focusId = _autofocusSourceId(sorted);
+    var focusGiven = false;
+    return ListView(
+      // NOT shrinkWrap: these lists sit inside an Expanded, so the height is
+      // already bounded. Shrink-wrapping a bounded list clipped the first row
+      // under the Auto Resolve row, and it builds every row eagerly — which
+      // with forty sources is forty rows laid out per frame.
+      shrinkWrap: false,
+      padding: EdgeInsets.zero,
+      children: [
+        for (final s in sorted)
+          _rowFor(
+            s,
+            autofocus: () {
+              if (focusGiven || focusId == null || s.id != focusId) {
+                return false;
+              }
+              focusGiven = true;
+              return true;
+            }(),
+          ),
+      ],
+    );
+  }
+
+  // A reading mode's single-bucket tab (Manga or Novel) — same flat list as
+  // [_flat], but a genuinely-empty bucket (nothing installed, not just a
+  // search with no matches) gets the install CTA instead of plain text.
+  Widget _readingFlat(List<({String id, String label, String? repo, String? icon})> all) {
+    final rows = _filter(all);
+    if (rows.isEmpty) {
+      if (all.isEmpty && _query.trim().isEmpty) return _installCta();
+      return _empty(_query.trim().isEmpty ? 'No sources here' : 'No matches');
+    }
+    final sorted = [
+      ...rows.where((s) => PinnedSources.isPinned(s.id)),
+      ...rows.where((s) => !PinnedSources.isPinned(s.id)),
+    ];
+    final focusId = _autofocusSourceId(sorted);
+    var focusGiven = false;
+    return ListView(
+      // NOT shrinkWrap: these lists sit inside an Expanded, so the height is
+      // already bounded. Shrink-wrapping a bounded list clipped the first row
+      // under the Auto Resolve row, and it builds every row eagerly — which
+      // with forty sources is forty rows laid out per frame.
+      shrinkWrap: false,
+      padding: EdgeInsets.zero,
+      children: [
+        for (final s in sorted)
+          _rowFor(
+            s,
+            autofocus: () {
+              if (focusGiven || focusId == null || s.id != focusId) {
+                return false;
+              }
+              focusGiven = true;
+              return true;
+            }(),
+          ),
+      ],
+    );
+  }
+
+  /// Anime and Movies/Series as ONE list. They were split by the type a
+  /// source declares, which is not the question being asked here — plenty
+  /// carry both, the pool is shared, and hunting for a source under a heading
+  /// that guessed wrong is worse than one alphabetical list. NSFW stays
+  /// separate: that split is deliberate and gated on the Privacy toggle.
+  List<({String id, String label, String? repo, String? icon})> get _video => [
+    ...widget.buckets.anime,
+    ...widget.buckets.movies,
+  ]..sort((x, y) => x.label.toLowerCase().compareTo(y.label.toLowerCase()));
+
+  /// Source id that should receive autofocus on TV — current selection if
+  /// present, else the first row. Null when Auto Resolve owns autofocus.
+  String? _autofocusSourceId(
+    List<({String id, String label, String? repo, String? icon})> rows,
+  ) {
+    if (!_isTv || rows.isEmpty) return null;
+    if (widget.autoSelected && widget.onAutoResolve != null) return null;
+    if (rows.any((s) => s.id == widget.currentId)) return widget.currentId;
+    return rows.first.id;
+  }
+
+  // The "All" tab: each (filtered) bucket under its own header. Anime mode
+  // groups Anime/Movies & Series/NSFW exactly as before; a reading mode
+  // groups its own single bucket (Manga or Novel) instead — never any of
+  // anime/movies/nsfw, which are always empty there anyway.
+  Widget _grouped() {
+    final b = widget.buckets;
+    final mode = widget.mode;
+    Widget header(String t) => Padding(
+      padding: const EdgeInsets.fromLTRB(20, 14, 20, 6),
+      child: Text(
+        t.toUpperCase(),
+        style: AppText.overline.copyWith(color: AppColors.textTertiary),
+      ),
+    );
+    final video = _video;
+    final categories = mode.isReading
+        ? [
+            (
+              title: mode.label,
+              rows: mode == ContentMode.manga ? b.manga : b.novel,
+            ),
+          ]
+        : [(title: 'Sources', rows: video), (title: 'NSFW', rows: b.nsfw)];
+    // Pinned first (in pin order, from any bucket); drop them from the category
+    // groups below so they aren't listed twice.
+    final pinnedIds = PinnedSources.notifier.value;
+    final allRows = [for (final c in categories) ...c.rows];
+    final pinned = _filter([
+      for (final id in pinnedIds) ...allRows.where((s) => s.id == id),
+    ]);
+    bool unpinned(({String id, String label, String? repo, String? icon}) s) =>
+        !pinnedIds.contains(s.id);
+    final focusCandidates = <({String id, String label, String? repo, String? icon})>[
+      ...pinned,
+      for (final c in categories) ..._filter(c.rows.where(unpinned).toList()),
+    ];
+    final focusId = _autofocusSourceId(focusCandidates);
+    var focusGiven = false;
+    bool takeFocus(({String id, String label, String? repo, String? icon}) s) {
+      if (focusGiven || focusId == null || s.id != focusId) return false;
+      focusGiven = true;
+      return true;
+    }
+
+    final children = <Widget>[];
+    if (pinned.isNotEmpty) {
+      children.add(header('Pinned'));
+      children.addAll(pinned.map((s) => _rowFor(s, autofocus: takeFocus(s))));
+    }
+    for (final c in categories) {
+      final rows = _filter(c.rows.where(unpinned).toList());
+      if (rows.isNotEmpty) {
+        children.add(header(c.title));
+        children.addAll(rows.map((s) => _rowFor(s, autofocus: takeFocus(s))));
+      }
+    }
+    if (children.isEmpty) {
+      if (mode.isReading && _query.trim().isEmpty) return _installCta();
+      return _empty(
+        _query.trim().isEmpty ? 'No enabled sources' : 'No matches',
+      );
+    }
+    return ListView(
+      // NOT shrinkWrap: these lists sit inside an Expanded, so the height is
+      // already bounded. Shrink-wrapping a bounded list clipped the first row
+      // under the Auto Resolve row, and it builds every row eagerly — which
+      // with forty sources is forty rows laid out per frame.
+      shrinkWrap: false,
+      padding: EdgeInsets.zero,
+      children: children,
+    );
+  }
+
+  /// True if there's at least one source relevant to the current mode —
+  /// gates the "long-press to pin" nudge, which is nonsensical to show over
+  /// a genuinely empty sheet.
+  bool get _hasAnySources {
+    final b = widget.buckets;
+    if (widget.mode.isReading) {
+      return (widget.mode == ContentMode.manga ? b.manga : b.novel).isNotEmpty;
+    }
+    return b.anime.isNotEmpty || b.movies.isNotEmpty || b.nsfw.isNotEmpty;
+  }
+
+  /// Auto Resolve, drawn as one of the choices rather than a banner above
+  /// them — because that is what it is: [_SourcePickerSheetState] computes
+  /// `isActive: !autoSelected && ...`, so picking auto DESELECTS every source.
+  /// It therefore gets the same selected treatment a source row gets (accent
+  /// bar + wash), and the sheet shows exactly one selected row at a time.
+  Widget _autoResolveRow() {
+    final on = widget.autoSelected;
+    final body = DecoratedBox(
+      decoration: BoxDecoration(
+        color: on ? AppColors.accent.withValues(alpha: 0.10) : Colors.transparent,
+        border: Border(
+          left: BorderSide(
+            color: on ? AppColors.accent : Colors.transparent,
+            width: 3,
+          ),
+        ),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(14, 8, 16, 8),
+        child: Row(
+          children: [
+            // Same 30px tile the source avatars use, so it sits in the list
+            // rather than on top of it.
+            Container(
+              width: 30,
+              height: 30,
+              margin: const EdgeInsets.only(right: 10),
+              decoration: BoxDecoration(
+                color: AppColors.accent.withValues(alpha: 0.18),
+                borderRadius: BorderRadius.circular(9),
+              ),
+              alignment: Alignment.center,
+              child: Icon(
+                Icons.auto_awesome_rounded,
+                color: AppColors.accent,
+                size: 17,
+              ),
+            ),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text('Auto Resolve', style: AppText.headline),
+                  Padding(
+                    padding: const EdgeInsets.only(top: 2),
+                    child: Text(
+                      'Try every installed source until one matches',
+                      style: AppText.body.copyWith(
+                        fontSize: 11.5,
+                        height: 1.0,
+                        color: AppColors.textTertiary,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            if (on) Icon(Icons.check, color: AppColors.accent, size: 18),
+          ],
+        ),
+      ),
+    );
+    if (_isTv) {
+      return TvListFocusable(
+        autofocus: widget.autoSelected,
+        onTap: widget.onAutoResolve!,
+        semanticLabel: 'Auto Resolve',
+        child: ExcludeSemantics(child: body),
+      );
+    }
+    return InkWell(onTap: widget.onAutoResolve, child: body);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final b = widget.buckets;
+    final mode = widget.mode;
+    // Tabs: anime mode keeps All/Anime/Movies/Series, and NSFW only when
+    // there are NSFW sources to show (Privacy toggle on) — unchanged from
+    // before. A reading mode shows All + its own single bucket (Manga or
+    // Novel) instead; it never had an Anime/Movies/NSFW tab to show and
+    // showing an empty one would be exactly the "three tabs of nothing"
+    // this replaces.
+    final tabs = <({String title, Widget Function() body})>[
+      if (!mode.isReading) ...[
+        (title: 'All', body: _grouped),
+        // By WHERE a source came from, not by the content type it declared.
+        // The old Anime / Movies-Series tabs cut the list by something the
+        // source claimed about itself, which is not how anyone looks for one;
+        // "it's one of my CloudStream ones" is. A tab only appears when it has
+        // something in it.
+        for (final eco in ecosystemTabs(_video))
+          (title: eco.title, body: () => _flat(eco.rows)),
+        if (b.nsfw.isNotEmpty) (title: 'NSFW', body: () => _flat(b.nsfw)),
+      ] else ...[
+        (title: 'All', body: _grouped),
+        (
+          title: mode.label,
+          body: () =>
+              _readingFlat(mode == ContentMode.manga ? b.manga : b.novel),
+        ),
+      ],
+    ];
+
+    // TV: one grouped list (no TabBar / TextField). Tabs and search steal or
+    // eat D-pad focus; the phone sheet keeps both.
+    if (_isTv) {
+      return SafeArea(
+        child: SizedBox(
+          height: widget.height,
+          child: Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    'Select Source',
+                    style: AppText.title.copyWith(color: AppColors.textPrimary),
+                  ),
+                ),
+              ),
+              if (widget.onAutoResolve != null) ...[
+                _autoResolveRow(),
+                const Divider(height: 1, color: AppColors.hairline),
+              ],
+              Expanded(child: _grouped()),
+              if (PinnedSources.notifier.value.isEmpty && _hasAnySources)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 6, 20, 10),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(
+                        Icons.push_pin_outlined,
+                        size: 13,
+                        color: AppColors.textTertiary,
+                      ),
+                      const SizedBox(width: 6),
+                      Text(
+                        'Hold Select to pin a source to the top',
+                        style: AppText.caption,
+                      ),
+                    ],
+                  ),
+                ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    return SafeArea(
+      child: SizedBox(
+        height: widget.height,
+        child: DefaultTabController(
+          length: tabs.length,
+          child: Column(
+            children: [
+              Container(
+                margin: const EdgeInsets.only(top: 12, bottom: 8),
+                width: 36,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: AppColors.textTertiary.withValues(alpha: 0.5),
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+              if (widget.showSearch)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(14, 2, 14, 6),
+                  child: _PickerSearchField(
+                    controller: _searchCtrl,
+                    onChanged: (q) => setState(() => _query = q),
+                  ),
+                ),
+              TabBar(
+                isScrollable: true,
+                tabAlignment: TabAlignment.start,
+                padding: const EdgeInsets.only(left: 16),
+                labelPadding: const EdgeInsets.only(right: 24),
+                labelColor: AppColors.accent,
+                unselectedLabelColor: AppColors.textSecondary,
+                indicatorColor: AppColors.accent,
+                indicatorSize: TabBarIndicatorSize.label,
+                dividerColor: AppColors.hairline,
+                labelStyle: AppText.body.copyWith(fontWeight: FontWeight.w600),
+                tabs: [for (final t in tabs) Tab(text: t.title)],
+              ),
+              if (widget.onAutoResolve != null) ...[
+                _autoResolveRow(),
+                // A hairline, not a caption: "OR PICK ONE" cost a whole line
+                // to say what the gap already says.
+                const Divider(height: 18, thickness: 1, color: AppColors.hairline),
+              ],
+              Expanded(
+                child: TabBarView(children: [for (final t in tabs) t.body()]),
+              ),
+              // One-time nudge — hidden the moment the user pins anything,
+              // and whenever there's nothing to pin in the first place.
+              if (PinnedSources.notifier.value.isEmpty && _hasAnySources)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 6, 20, 10),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(
+                        Icons.push_pin_outlined,
+                        size: 13,
+                        color: AppColors.textTertiary,
+                      ),
+                      const SizedBox(width: 6),
+                      Text(
+                        'Long-press a source to pin it to the top',
+                        style: AppText.caption,
+                      ),
+                    ],
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Compact search field for the picker sheet (self-contained so `core/ui` does
+/// not depend on the `features/sources` search widget).
+class _PickerSearchField extends StatelessWidget {
+  const _PickerSearchField({required this.controller, required this.onChanged});
+
+  final TextEditingController controller;
+  final ValueChanged<String> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return TextField(
+      controller: controller,
+      onChanged: onChanged,
+      style: AppText.body,
+      cursorColor: AppColors.accent,
+      decoration: InputDecoration(
+        hintText: 'Search sources',
+        hintStyle: AppText.body.copyWith(color: AppColors.textSecondary),
+        prefixIcon: const Icon(
+          Icons.search,
+          color: AppColors.textSecondary,
+          size: 18,
+        ),
+        suffixIcon: controller.text.isEmpty
+            ? null
+            : IconButton(
+                icon: const Icon(
+                  Icons.close,
+                  color: AppColors.textSecondary,
+                  size: 18,
+                ),
+                tooltip: 'Clear',
+                onPressed: () {
+                  controller.clear();
+                  onChanged('');
+                },
+              ),
+        isDense: true,
+        filled: true,
+        fillColor: AppColors.surface2,
+        contentPadding: const EdgeInsets.symmetric(
+          horizontal: 14,
+          vertical: 8,
+        ),
+        // Pill rather than a rounded rectangle: the sheet is a short stack of
+        // round shapes (avatars, chips), and a 12px box read as a form field
+        // dropped into it.
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(999),
+          borderSide: BorderSide.none,
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(999),
+          borderSide: BorderSide(color: AppColors.accent, width: 1.5),
+        ),
+      ),
+    );
+  }
+}
+
+class _SourceRow extends StatelessWidget {
+  const _SourceRow({
+    required this.label,
+    required this.isActive,
+    required this.onTap,
+    this.repo,
+    this.icon,
+    this.isPinned = false,
+    this.autofocus = false,
+    this.onLongPress,
+    this.trailing,
+  });
+
+  final String label;
+
+  /// Origin repo, shown small + dim under the name. Null/empty → not shown.
+  final String? repo;
+
+  /// The source's own icon URL. Null/empty (most sources — see
+  /// `categorizedSources`) → the letter tile below is the permanent look,
+  /// not a loading state.
+  final String? icon;
+  final bool isActive;
+  final bool isPinned;
+  final bool autofocus;
+  final VoidCallback onTap;
+  final VoidCallback? onLongPress;
+
+  /// Extra controls for this row (Z Mode adds per-source settings and a
+  /// Cloudflare solve). Null everywhere else, so the row is untouched.
+  final Widget? trailing;
+
+  @override
+  Widget build(BuildContext context) {
+    final hasRepo = repo != null && repo!.isNotEmpty;
+    final body = DecoratedBox(
+      // Selected row: accent bar down the leading edge plus a wash, instead
+      // of a tick stranded on the far right of a wide row.
+      decoration: BoxDecoration(
+        color: isActive
+            ? AppColors.accent.withValues(alpha: 0.10)
+            : Colors.transparent,
+        border: Border(
+          left: BorderSide(
+            color: isActive ? AppColors.accent : Colors.transparent,
+            width: 3,
+          ),
+        ),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(14, 8, 16, 8),
+        child: Row(
+          children: [
+            Padding(
+              padding: const EdgeInsets.only(right: 10),
+              // sourceRowName first: the tag ("CS · ", "Ani · ") is not part
+              // of the name, and every CloudStream row would read "C".
+              child: SourceIconTile(name: sourceRowName(label), icon: icon),
+            ),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(label, style: AppText.headline),
+                  if (hasRepo)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 2),
+                      child: Text(
+                        repo!,
+                        style: AppText.body.copyWith(
+                          fontSize: 11.5,
+                          height: 1.0,
+                          color: AppColors.textTertiary,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+            if (isPinned)
+              Padding(
+                padding: EdgeInsets.only(
+                  right: isActive || trailing != null ? 10 : 0,
+                ),
+                child: Icon(
+                  Icons.push_pin,
+                  size: 15,
+                  color: AppColors.textTertiary,
+                ),
+              ),
+            ?trailing,
+          ],
+        ),
+      ),
+    );
+
+    final isTv = sl.isRegistered<AppMode>() && sl<AppMode>().isTv;
+    if (isTv) {
+      return TvListFocusable(
+        autofocus: autofocus,
+        onTap: onTap,
+        onLongPress: onLongPress,
+        semanticLabel: label,
+        child: ExcludeSemantics(child: body),
+      );
+    }
+    return InkWell(
+      onTap: onTap,
+      onLongPress: onLongPress,
+      splashColor: AppColors.accent.withValues(alpha: 0.08),
+      highlightColor: AppColors.accent.withValues(alpha: 0.04),
+      child: body,
+    );
+  }
+}
