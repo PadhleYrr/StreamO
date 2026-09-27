@@ -1,0 +1,325 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <!-- Network: Flutter only auto-adds INTERNET to debug builds, so it MUST be
+         declared here or release builds have no network at all (streaming,
+         providers, downloads). -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <!-- Download progress notification (Android 13+). -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <!-- In-app update: install the downloaded APK via the system installer. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
+    <!-- Foreground service so HLS downloads continue in the background. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+    <!-- Saving player screenshots to the gallery (gal); Android 10+ needs none. -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28"/>
+    <!-- Android TV leanback: required=false so the app still installs on phones. -->
+    <uses-feature android:name="android.software.leanback" android:required="false" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <!-- enableOnBackInvokedCallback stays FALSE. Turning on Android's predictive
+         back gesture froze the UI when swiping back on some GPUs (confirmed on a
+         MediaTek Helio G100 / Mali-G57) under Impeller — the gesture's route-
+         snapshot render hangs there. We don't draw the predictive peek anyway
+         (no PredictiveBackPageTransitionsBuilder), so this just uses the legacy
+         back gesture, which works everywhere. Re-enabling needs both the theme
+         transition builder AND a re-test on that device. -->
+    <!-- android:icon below is the brand mark, NOT whichever launcher icon is
+         selected. That one value is what the system shows in the installer,
+         Settings → Apps, notifications, recents and share sheets, and it cannot
+         follow the user's pick: Android resolves it at install time, while the
+         <activity-alias> icons further down only ever affect the home screen.
+         So it names the current mark and stays there — someone who picks Katana
+         or Classic changes their home screen, not this. -->
+    <application
+        android:label="Zangetsu"
+        android:name="${applicationName}"
+        android:icon="@mipmap/ic_launcher_crescent"
+        android:banner="@drawable/tv_banner"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:enableOnBackInvokedCallback="false">
+        <!-- flutter_background_service declares this service but without a
+             foregroundServiceType, which Android 14+ requires for dataSync.
+             Same attrs as the plugin + the type (merged, no conflict). -->
+        <service
+            android:name="id.flutter.flutter_background_service.BackgroundService"
+            android:enabled="true"
+            android:exported="true"
+            android:stopWithTask="false"
+            android:foregroundServiceType="dataSync" />
+        <!-- Keeps the process alive for native torrent downloads (phase 2). -->
+        <service
+            android:name=".TorrentDownloadService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:taskAffinity=""
+            android:theme="@style/LaunchTheme"
+            android:supportsPictureInPicture="true"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize">
+            <!-- Specifies an Android theme to apply to this Activity as soon as
+                 the Android process has started. This theme is visible to the user
+                 while the Flutter UI initializes. After that, this theme continues
+                 to determine the Window background behind the Flutter UI. -->
+            <meta-data
+              android:name="io.flutter.embedding.android.NormalTheme"
+              android:resource="@style/NormalTheme"
+              />
+            <!-- Flutter's `flutter run` / IDE launch parses THIS file (not the
+                 merged APK) and requires an <activity> with MAIN + LAUNCHER. It
+                 ignores <activity-alias>, so putting the phone launcher only on
+                 the aliases below makes the tool fail with "package identifier
+                 or launch activity not found" whenever no built APK is sitting
+                 in build/ yet (first run, after clean, Cursor/VS Code debug).
+
+                 The aliases remain the real home-screen entries (Settings →
+                 Appearance flips them). src/release/AndroidManifest.xml strips
+                 this filter so a shipped APK does not grow a second icon.
+
+                 LEANBACK stays on the activity itself. TV has no icon picker and
+                 uses android:banner, and moving this would risk the app losing
+                 its home entry on a TV entirely. -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+            <!-- Tracker OAuth redirects (AniList / MyAnimeList / Simkl) sent back
+                 to zangetsu://<host> and captured by app_links. -->
+            <intent-filter android:autoVerify="false">
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <category android:name="android.intent.category.BROWSABLE"/>
+                <data android:scheme="zangetsu" android:host="anilist-auth"/>
+                <data android:scheme="zangetsu" android:host="mal-auth"/>
+                <data android:scheme="zangetsu" android:host="simkl-auth"/>
+                <data android:scheme="zangetsu" android:host="mangabaka-auth"/>
+                <!-- Shared-title deep link: zangetsu://open?d=…&t=… (see OpenLinkService). -->
+                <data android:scheme="zangetsu" android:host="open"/>
+                <data android:scheme="zangetsu" android:host="room"/>
+                <!-- TV pairing QR: zangetsu://pair?code=… (see OpenLinkService). -->
+                <data android:scheme="zangetsu" android:host="pair"/>
+            </intent-filter>
+            <!-- "Open with" for local video files, so a file manager / Downloads
+                 offers Zangetsu the way it offers any other player.
+
+                 Deliberately NOT http/https: claiming those would put Zangetsu
+                 in the chooser for every video link on the web, which is the
+                 fast way to make the app feel like spyware. file:// and
+                 content:// only — something the user already has on the device.
+
+                 Separate <intent-filter> from the zangetsu:// block above on
+                 purpose: within one filter Android ORs the schemes with the
+                 mime types, so merging them would also claim zangetsu://*
+                 video/* and, worse, every file:// host for the tracker hosts. -->
+            <intent-filter android:label="Zangetsu">
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <category android:name="android.intent.category.BROWSABLE"/>
+                <data android:scheme="file"/>
+                <data android:scheme="content"/>
+                <data android:mimeType="video/*"/>
+                <data android:mimeType="application/x-mpegURL"/>
+                <data android:mimeType="application/vnd.apple.mpegurl"/>
+            </intent-filter>
+        </activity>
+
+        <!-- Home-screen icon choices. Each alias is the same MainActivity behind a
+             different icon; exactly ONE is ever enabled, and AppIconService flips
+             them via PackageManager.setComponentEnabledSetting.
+
+             Aliases (rather than swapping a drawable) are the only way Android
+             allows this: the launcher icon is baked into the manifest at install
+             time and cannot be changed at runtime.
+
+             Renaming or removing an alias orphans it on users' home screens, so
+             these names are permanent once shipped. -->
+        <activity-alias
+            android:name=".MainActivityCrescent"
+            android:targetActivity=".MainActivity"
+            android:exported="true"
+            android:enabled="true"
+            android:icon="@mipmap/ic_launcher_crescent"
+            android:label="Zangetsu">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".MainActivityDefault"
+            android:targetActivity=".MainActivity"
+            android:exported="true"
+            android:enabled="false"
+            android:icon="@mipmap/ic_launcher"
+            android:label="Zangetsu">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".MainActivityClassic"
+            android:targetActivity=".MainActivity"
+            android:exported="true"
+            android:enabled="false"
+            android:icon="@mipmap/ic_launcher_classic"
+            android:label="Zangetsu">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity-alias>
+
+        <!-- Hosts a CloudStream plugin's own settings UI (it casts the Context to
+             AppCompatActivity and shows a BottomSheetDialogFragment). Transparent
+             Material theme; finishes when the sheet is dismissed. -->
+        <activity
+            android:name=".cloudstream.CloudStreamSettingsActivity"
+            android:exported="false"
+            android:taskAffinity=""
+            android:theme="@style/Theme.CloudStreamSettings"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode" />
+        <!-- Invisible AppCompatActivity used only to (re)load CloudStream plugins
+             that cast their load context to AppCompatActivity (our main screen is a
+             FlutterActivity). Transparent, no history, hidden from recents. -->
+        <activity
+            android:name=".cloudstream.CsPluginLoaderActivity"
+            android:exported="false"
+            android:taskAffinity=""
+            android:noHistory="true"
+            android:excludeFromRecents="true"
+            android:theme="@style/Theme.CloudStreamSettings"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode" />
+        <!-- Hosts an Aniyomi extension's ConfigurableAnimeSource settings UI via a
+             PreferenceFragmentCompat. Launched by AniyomiBridge.openSourceSettings. -->
+        <activity
+            android:name=".aniyomi.AniyomiSettingsActivity"
+            android:exported="false"
+            android:taskAffinity=""
+            android:theme="@style/Theme.AniyomiSettings"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode" />
+        <!-- Hosts a Mihon extension's ConfigurableSource settings UI via a
+             PreferenceFragmentCompat. Launched by MihonBridge.openSourceSettings. -->
+        <activity
+            android:name=".mihon.MihonSettingsActivity"
+            android:exported="false"
+            android:taskAffinity=""
+            android:theme="@style/Theme.MihonSettings"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode" />
+        <!-- Visible WebView to solve a source's Cloudflare (interactive Turnstile)
+             challenge; cf_clearance lands in the shared CookieManager the Mihon
+             OkHttp client reads. -->
+        <activity
+            android:name=".mihon.SourceWebViewActivity"
+            android:exported="false"
+            android:taskAffinity=""
+            android:theme="@style/Theme.MihonSettings"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode" />
+        <!-- Fully-native TV video player (TvPlayerActivity). Landscape, no title
+             bar; renders ExoPlayer's SurfaceView straight to the window so TVs
+             that black-screen the Flutter platform-view player show video. -->
+        <activity
+            android:name=".TvPlayerActivity"
+            android:exported="false"
+            android:screenOrientation="landscape"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode" />
+        <!-- Native phone video player (PhonePlayerActivity). Rotates with the
+             device and stays in the app's own task; reached only when the
+             experimental player toggle is on, for devices where libmpv will
+             not load. -->
+        <activity
+            android:name=".PhonePlayerActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode" />
+        <!-- Google Cast Framework configuration. -->
+        <meta-data
+            android:name="com.google.android.gms.cast.framework.OPTIONS_PROVIDER_CLASS_NAME"
+            android:value="com.spyou.watch_app.cast.CastOptionsProvider" />
+        <!-- Don't delete the meta-data below.
+             This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
+        <meta-data
+            android:name="flutterEmbedding"
+            android:value="2" />
+        <!-- No Impeller flag on purpose. Built on Flutter 3.41.x, whose default
+             renderer this device handles (1.8.0 shipped with no flag and worked).
+             Forcing EnableImpeller=false here black-screened it, so we match
+             1.8.0 exactly and leave the default. mpv gpu-next video is separate. -->
+
+        <!-- Lets an external player read a DOWNLOADED episode. A download
+             arrives as a bare filesystem path, which is a URI with no scheme
+             at all: lenient players guess it is a file, a strict one resolves
+             nothing and the launch fails. Android 7+ refuses a file:// handed
+             to another app, so content:// is the only form left. Used ONLY as
+             a fallback after a direct launch finds no activity, so every
+             launch that works today is untouched. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.videoprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/video_paths" />
+        </provider>
+    </application>
+    <!-- Required to query activities that can process text, see:
+         https://developer.android.com/training/package-visibility and
+         https://developer.android.com/reference/android/content/Intent#ACTION_PROCESS_TEXT.
+
+         In particular, this is used by the Flutter engine in io.flutter.plugin.text.ProcessTextPlugin. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.PROCESS_TEXT"/>
+            <data android:mimeType="text/plain"/>
+        </intent>
+        <!-- Any installed app that can open a video, so the external-player
+             picker isn't limited to the handful we know by name below. Without
+             this, Android 11+ hides them and the picker silently under-reports.
+             Both mimes: plain files resolve as video/*, HLS as x-mpegURL. -->
+        <intent>
+            <action android:name="android.intent.action.VIEW"/>
+            <data android:mimeType="video/*"/>
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW"/>
+            <data android:mimeType="application/x-mpegURL"/>
+        </intent>
+        <!-- External video players we send tailored extras to (headers, subs,
+             resume position). Listed by name as well as by the intents above:
+             the mime queries alone don't reach a player whose filter doesn't
+             advertise these exact types, and these are the ones that must
+             always resolve. -->
+        <package android:name="com.mxtech.videoplayer.ad"/>
+        <package android:name="com.mxtech.videoplayer.pro"/>
+        <package android:name="org.videolan.vlc"/>
+        <package android:name="is.xyz.mpv"/>
+        <package android:name="com.brouken.player"/>
+        <package android:name="dev.anilbeesetti.nextplayer"/>
+        <!-- SPlayer ships under two ids; both were in knownPlayers but missing
+             here, so getPackageInfo threw and it never showed up. -->
+        <package android:name="com.young.simple.player"/>
+        <package android:name="com.ttee.leeplayer"/>
+        <!-- UPI apps — the donate screen deep-links upi://pay. Needed for
+             url_launcher to resolve an installed UPI app on Android 11+. -->
+        <intent>
+            <action android:name="android.intent.action.VIEW"/>
+            <data android:scheme="upi"/>
+        </intent>
+        <!-- System speech recogniser — TV voice search resolves this intent
+             (package visibility on Android 11+). -->
+        <intent>
+            <action android:name="android.speech.action.RECOGNIZE_SPEECH"/>
+        </intent>
+    </queries>
+</manifest>
