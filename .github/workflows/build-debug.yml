@@ -1,0 +1,166 @@
+name: Build Debug APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - dev
+      - develop
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      upload_artifact:
+        description: 'Upload APK as artifact'
+        required: false
+        default: 'true'
+        type: boolean
+
+concurrency:
+  # One build per branch at a time; cancel the in-flight run when a new
+  # commit lands so CI slots aren't wasted on stale code.
+  group: build-debug-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-debug-apk:
+    name: Debug APK (arm64-v8a + armeabi-v7a)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # ── 1. Source ────────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # ── 2. Java 17 ───────────────────────────────────────────────────────────
+      # AGP 8.11.1 + Kotlin 2.2.20 require Java 17.
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # ── 3. Flutter ───────────────────────────────────────────────────────────
+      # pubspec.yaml requires Dart SDK ^3.11.5 — use stable channel so the
+      # runner always gets the latest stable Flutter (which ships a matching
+      # Dart). Pin to a known-good version if you need reproducible builds.
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+          cache-key: flutter-stable-${{ runner.os }}
+
+      - name: Flutter version
+        run: flutter --version
+
+      # ── 4. Pub cache ─────────────────────────────────────────────────────────
+      - name: Cache pub packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            ${{ env.FLUTTER_HOME }}/.pub-cache
+          key: pub-${{ runner.os }}-${{ hashFiles('**/pubspec.lock') }}
+          restore-keys: |
+            pub-${{ runner.os }}-
+
+      # ── 5. Gradle cache ──────────────────────────────────────────────────────
+      # The CloudStream + Aniyomi transitive graph is large (~600 MB of jars).
+      # Caching the Gradle home saves 3-5 minutes on every non-clean run.
+      - name: Cache Gradle home
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      # ── 6. Gradle JVM memory ─────────────────────────────────────────────────
+      # gradle.properties requests -Xmx8G which exceeds the ubuntu-latest
+      # runner's 7 GB. Cap it at 5 GB so the build finishes instead of OOMing.
+      # The Kotlin compiler daemon gets 2 GB; that's enough for Kotlin 2.2.20's
+      # serialization plugin + context-parameters feature pass.
+      - name: Override Gradle JVM args for CI
+        run: |
+          sed -i \
+            's|org.gradle.jvmargs=.*|org.gradle.jvmargs=-Xmx5G -XX:MaxMetaspaceSize=2G -XX:ReservedCodeCacheSize=512m -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8|' \
+            android/gradle.properties
+          echo "GRADLE_OPTS=-Dorg.gradle.daemon=false" >> "$GITHUB_ENV"
+          echo "KOTLIN_DAEMON_JVM_OPTS=-Xmx2G" >> "$GITHUB_ENV"
+
+      # ── 7. Pub get ───────────────────────────────────────────────────────────
+      - name: flutter pub get
+        run: flutter pub get
+
+      # ── 8. Debug APK ─────────────────────────────────────────────────────────
+      # Build both ARM ABIs; skip x86/x86_64 (emulator-only, already excluded
+      # via packaging.jniLibs.excludes in app/build.gradle.kts).
+      # --no-shrink is explicit even though isMinifyEnabled = false in the
+      # Gradle config — belts + suspenders for the CloudStream class-name links.
+      - name: Build debug APK (arm64 + arm)
+        run: |
+          flutter build apk \
+            --debug \
+            --target-platform android-arm64,android-arm \
+            --split-per-abi \
+            --no-shrink
+        env:
+          # Suppress the Firebase plugin's "google-services.json not found"
+          # warning — the Gradle script already handles it gracefully.
+          FLUTTER_SUPPRESS_ANALYTICS: true
+
+      # ── 9. Collect outputs ───────────────────────────────────────────────────
+      - name: List APKs
+        run: |
+          echo "=== APKs built ==="
+          find build/app/outputs/apk/debug -name "*.apk" | while read f; do
+            size=$(du -sh "$f" | cut -f1)
+            echo "  $f  [$size]"
+          done
+
+      # ── 10. Upload artifact ──────────────────────────────────────────────────
+      - name: Upload debug APKs
+        if: ${{ github.event_name != 'pull_request' || inputs.upload_artifact == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: zangetsu-debug-${{ github.sha }}
+          # Grab all per-ABI debug APKs produced by --split-per-abi
+          path: build/app/outputs/apk/debug/*.apk
+          retention-days: 14
+          if-no-files-found: error
+
+      # ── 11. Build summary ────────────────────────────────────────────────────
+      - name: Write build summary
+        if: always()
+        run: |
+          {
+            echo "## Build result"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Commit | \`${{ github.sha }}\` |"
+            echo "| Branch | \`${{ github.ref_name }}\` |"
+            echo "| Runner | \`${{ runner.os }}\` |"
+            echo "| Flutter channel | stable |"
+            echo ""
+            flutter --version 2>&1 | head -1 | awk '{print "**Flutter**: "$0}'
+            echo ""
+            echo "### APKs"
+            echo "\`\`\`"
+            find build/app/outputs/apk/debug -name "*.apk" 2>/dev/null \
+              | while read f; do echo "$(basename $f)  [$(du -sh "$f" | cut -f1)]"; done \
+              || echo "(build failed — no APKs)"
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
