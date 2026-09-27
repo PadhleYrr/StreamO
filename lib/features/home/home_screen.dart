@@ -1,0 +1,2320 @@
+import 'dart:async';
+import 'dart:io';
+
+import 'package:flutter/material.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:cached_network_image/cached_network_image.dart';
+import 'package:hive_flutter/hive_flutter.dart';
+
+import '../../core/app_mode.dart';
+import '../../core/aniyomi/aniyomi_image_provider.dart';
+import '../../core/di/injector.dart';
+import '../../core/metadata/streaming_service.dart';
+import '../../core/zmode/tmdb_catalogue.dart';
+import '../../core/platform/apple_tv.dart';
+import '../../core/mihon/mihon_extension_service.dart';
+import '../../core/mihon/mihon_image_provider.dart';
+import '../../core/mode/content_mode.dart';
+import '../../core/mode/content_mode_cubit.dart';
+import '../../core/models/watch_status.dart';
+import '../../core/tracker/tracker_hub.dart';
+import '../../core/notify/notification_service.dart';
+import '../../core/ui/global_messenger.dart';
+import '../../core/update/extension_auto_updater.dart';
+import '../../core/provider/cloudstream_provider.dart';
+import '../../core/provider/provider_manager.dart';
+import '../../core/models/episode.dart';
+import '../../core/models/home_row.dart';
+import '../../core/models/home_section.dart';
+import '../../core/models/media_detail.dart';
+import '../../core/models/media_item.dart';
+import '../../core/models/video_source.dart';
+import '../../core/models/provider_info.dart';
+import '../../core/playback/my_list.dart';
+import '../../core/playback/playback_prefs.dart';
+import '../../core/playback/resume_store.dart';
+import '../../core/playback/title_prefs.dart';
+import '../../core/playback/watch_history.dart';
+import '../../core/reading/read_history.dart';
+import '../../core/repository/catalogue_repository.dart';
+import '../../core/repository/source_repository.dart';
+import '../../core/privacy/incognito_mode.dart';
+import '../../core/state/active_source_cubit.dart';
+import '../../core/tracker/tracker.dart';
+import '../../core/tracker/tracker_item_url.dart';
+import '../../core/theme/app_colors.dart';
+import '../../core/theme/app_text.dart';
+import '../../core/zmode/zmode_prefs.dart';
+import '../../l10n/l10n.dart';
+import '../../core/announce/announcement.dart';
+import '../announce/announcement_sheet.dart';
+import '../community/community_sheet.dart';
+import '../downloads/downloads_screen.dart';
+import '../notify/subscriptions_screen.dart';
+import '../reader/manga_reader_screen.dart';
+import '../reader/novel_reader_screen.dart';
+import '../settings/streaming_services_screen.dart';
+import '../sources/aniyomi_repo_tab.dart' show kAniyomiReposBoxName;
+import '../sources/providers_hub_screen.dart';
+import '../sources/zangetsu_sources_screen.dart';
+import '../update/update_dialog.dart';
+import 'continue_section.dart';
+import 'my_list_screen.dart';
+import 'tracker_continue_section.dart';
+import '../../core/ui/content_row.dart';
+import '../../core/ui/banner_style.dart';
+import '../../core/ui/featured_banner_panels.dart';
+import '../../core/ui/featured_carousel.dart';
+import '../../core/ui/featured_hero.dart';
+import '../../core/metadata/title_logo_service.dart';
+import 'metadata_switch_sheet.dart';
+import '../../core/ui/list_status_sheet.dart';
+import '../../core/ui/media_info_sheet.dart';
+import '../../core/ui/poster_card.dart';
+import '../../core/ui/row_skeleton.dart';
+import '../../core/ui/source_switcher.dart';
+import '../../core/ui/states.dart';
+import '../auth/auth_cubit.dart';
+import '../auth/reconnect.dart';
+import '../detail/detail_screen.dart';
+import '../history/history_screen.dart';
+import '../player/player_screen.dart';
+import '../schedule/schedule_screen.dart';
+import '../shell/dock_icons.dart';
+import '../../core/zmode/source_matcher.dart';
+import '../../core/zmode/metadata_repository.dart';
+import '../../core/zmode/match_store.dart';
+import '../../core/zmode/zmode_ids.dart';
+import 'streaming_services_row.dart';
+import 'cubit/home_cubit.dart';
+import 'home_screen_tv.dart';
+import 'lists_hub_screen.dart';
+import 'genres_screen.dart';
+import 'search_screen.dart';
+import 'cubit/tracker_home_rows.dart' show releasedCount;
+import 'see_all_screen.dart';
+
+/// Provides the [HomeCubit] (which owns the three browse rows + the carousel's
+/// trending source) and kicks off the first load. The view itself stays
+/// Stateful for the per-item lazy hero-description cache and the navigation
+/// helpers.
+class HomeScreen extends StatelessWidget {
+  const HomeScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    // Use the shared singleton so the splash can warm it before this mounts.
+    return BlocProvider.value(value: sl<HomeCubit>(), child: const _HomeView());
+  }
+}
+
+class _HomeView extends StatefulWidget {
+  const _HomeView();
+
+  @override
+  State<_HomeView> createState() => _HomeViewState();
+}
+
+class _HomeViewState extends State<_HomeView>
+    with SingleTickerProviderStateMixin {
+  final _repo = sl<CatalogueRepository>();
+  final _myList = sl<MyListStore>();
+
+  /// Hero metadata cache: key = "sourceId:id". Futures are stored so they're
+  /// never re-fetched on carousel rotation; pre-warmed when hero items load.
+  final Map<String, Future<HeroMeta?>> _metaCache = {};
+  bool _heroPrewarmed = false;
+  bool _resumePrewarmed = false;
+
+  // ── Logo-strike mode transition ──────────────────────────────────────────
+  // Tapping a mode card runs a full-screen overlay: the Zangetsu mark springs
+  // in at centre behind a scrim, a red glow pulses and a steel glint sweeps the
+  // blade, the mode swaps hidden at that peak, then it reveals. Self-contained —
+  // see [_enterMode] / [_slashOverlay].
+  late final AnimationController _slashCtrl;
+  bool _slashing = false;
+  bool _slashSwapped = false;
+  ContentMode? _slashTarget;
+
+  // Auto update-check runs at most once per app process (not on every rebuild
+  // or tab revisit). Static so it survives this widget being recreated.
+  static bool _updateChecked = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // Swap the content mode at the slash's peak (hidden behind the scrim), then
+    // tear the overlay down once it finishes.
+    _slashCtrl =
+        AnimationController(
+            vsync: this,
+            duration: const Duration(milliseconds: 600),
+          )
+          ..addListener(() {
+            if (!_slashSwapped &&
+                _slashTarget != null &&
+                _slashCtrl.value >= 0.5) {
+              _slashSwapped = true;
+              sl<ContentModeCubit>().setMode(_slashTarget!);
+            }
+          })
+          ..addStatusListener((status) {
+            if (status == AnimationStatus.completed && mounted) {
+              setState(() {
+                _slashing = false;
+                _slashTarget = null;
+              });
+            }
+          });
+    // The splash usually pre-warms the rows; only fetch here if it didn't
+    // (e.g. first run right after onboarding, or a source with no warm yet).
+    // tvOS: provider JS loads AFTER the splash (runDeferredAppleTvBootTasks).
+    // load() here races that step and wedges QuickJS on the first RootShell
+    // frame — looks stuck on the splash after a cloud restore (onboarded=true
+    // pushes Home immediately; fresh installs see Onboarding first and miss it).
+    if (!isAppleTv) {
+      final cubit = context.read<HomeCubit>();
+      if (cubit.state.sections == null && !cubit.state.loading) cubit.load();
+    }
+    // Silently check GitHub Releases once on launch; the dialog only appears if
+    // a newer, non-skipped version exists. Best-effort — never blocks startup.
+    if (!_updateChecked && !isAppleTv) {
+      _updateChecked = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
+        if (!mounted) return;
+        await maybeShowUpdateDialog(context);
+        // One-time community welcome (its own flag, independent of the per-id
+        // announcement feed), then any new developer announcement — all awaited
+        // in sequence so the modals never fight over the stack.
+        if (mounted) await maybeShowCommunitySheet(context);
+        if (mounted) await maybeShowAnnouncement(context);
+      });
+      _checkSourceUpdates();
+    }
+  }
+
+  @override
+  void dispose() {
+    _slashCtrl.dispose();
+    super.dispose();
+  }
+
+  /// Best-effort, non-blocking check for CloudStream source updates on launch.
+  /// READ-ONLY (re-fetches catalogs, downloads nothing); posts a notification
+  /// when updates exist and the user left that toggle on. Deferred a few seconds
+  /// so it never competes with first content load, and fully guarded so it can
+  /// NEVER affect startup or playback.
+  Future<void> _checkSourceUpdates() async {
+    final prefs = sl<PlaybackPrefs>();
+    final autoUpdate = prefs.autoUpdateExtensions;
+    // The read-only notify path below is Android-only; keep that gate unless
+    // we're auto-updating (JS providers auto-update on any platform).
+    if (!autoUpdate && !Platform.isAndroid) return;
+    await Future<void>.delayed(const Duration(seconds: 4));
+    if (!mounted) return;
+
+    // Auto-update path: apply updates across all ecosystems, throttled to
+    // ~once a day across launches. Best-effort — never touches startup.
+    if (autoUpdate) {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      const dayMs = 24 * 60 * 60 * 1000;
+      if (now - prefs.lastExtensionUpdateMs < dayMs) return;
+      await prefs.setLastExtensionUpdateMs(now);
+      final updated = await ExtensionAutoUpdater.run();
+      if (!mounted) return;
+      if (updated > 0) {
+        final title = context.l10n.extensionsUpdated;
+        await NotificationService.instance.showMessage(
+          id: 779100,
+          title: title,
+          body:
+              '$updated extension${updated == 1 ? '' : 's'} updated to the latest version.',
+        );
+      }
+      return;
+    }
+
+    try {
+      final csManager = sl<CloudStreamManager>();
+      final csCount = await csManager.checkAllUpdates();
+
+      var aniCount = 0;
+      try {
+        final repoUrls = Hive.isBoxOpen(kAniyomiReposBoxName)
+            ? Hive.box<String>(kAniyomiReposBoxName).values.toList()
+            : const <String>[];
+        if (repoUrls.isNotEmpty) {
+          aniCount = await sl<AniyomiManager>().checkAllUpdates(repoUrls);
+        }
+      } catch (_) {
+        /* aniyomi check must never break the CS check or startup */
+      }
+
+      final total = csCount + aniCount;
+      if (total > 0 && csManager.notifyUpdates) {
+        await NotificationService.instance.showSourceUpdates(count: total);
+      }
+    } catch (_) {
+      /* never affects startup */
+    }
+  }
+
+  /// Genres + episode count for the hero banner (lazily fetched, cached).
+  ///
+  /// Settles on the FIRST of two answers: the partial a metadata title hands
+  /// over once its catalogue has replied, or the finished detail. A metadata
+  /// title's `detail()` also pairs the title with an installed source before
+  /// it returns, and that pairing searches every installed source in turn —
+  /// one report spent 18 seconds on a title no source carried, with the
+  /// banner's caption blank the whole time and the carousel rotating on. The
+  /// caption is genres, a count and a year; the catalogue supplies all three
+  /// up front, and the source is only needed for episode *urls*, which the
+  /// banner never reads. The match still finishes in the background, so the
+  /// title is already paired by the time anyone taps Play.
+  ///
+  /// A source-backed title never calls `onPartial` — it has nothing to search
+  /// for — and completes on the second branch exactly as it always did.
+  Future<HeroMeta?> _heroMeta(MediaItem m) =>
+      _metaCache.putIfAbsent('${m.sourceId}:${m.id}', () async {
+        final first = Completer<MediaDetail?>();
+        void settle(MediaDetail? d) {
+          if (!first.isCompleted) first.complete(d);
+        }
+
+        // _detailOf swallows its errors, so this always settles.
+        unawaited(_detailOf(m.url, m.sourceId, onPartial: settle).then(settle));
+        final d = await first.future;
+        if (d == null) return null;
+        return HeroMeta(
+          genres: d.genres,
+          episodeCount: d.episodes.length,
+          year: d.year,
+        );
+      });
+
+  /// Warm ONLY the first hero's metadata (the slide shown first). The rest load
+  /// lazily, one at a time, as the carousel rotates — each via the hero's own
+  /// `FutureBuilder` on [_heroMeta] (cached). Firing ALL of them up front fired
+  /// one `detail()` per hero AT ONCE; for a heavy CloudStream source (e.g.
+  /// MovieBox) those N concurrent `load()`s saturated the read pool and froze
+  /// the UI thread → ANR. One-at-a-time on rotation is fine even for MovieBox.
+  /// Resolve the stream for the top Continue Watching row before it is tapped.
+  ///
+  /// It is the most-tapped thing on Home, and the caches that make a resolve
+  /// instant live in memory only — so the first play after opening the app
+  /// always paid full price (7.3s median across 139 plays on 2.2.0, 20s at
+  /// p90). The episode url is already on the history row, so this costs one
+  /// resolve and no source search.
+  ///
+  /// Only the first row: warming the whole rail would fire a resolve per show
+  /// for shows nobody asked for. Fire-and-forget, after the frame, so it never
+  /// competes with Home rendering — and a failure just means Play does the
+  /// work itself, as before.
+  void _prewarmResume() {
+    if (_resumePrewarmed) return;
+    _resumePrewarmed = true;
+    final rows = sl<WatchHistory>().all();
+    if (rows.isEmpty) return;
+    final e = rows.first;
+    if (e.episodeUrl.isEmpty) return;
+    // In Z Mode a title has no source of its own; without a match already
+    // stored this would search every installed source. See DetailScreen.
+    if (e.sourceId == ZmodeIds.sourceId) {
+      final c = ZmodeIds.parseShow(e.showUrl);
+      if (c == null ||
+          !sl.isRegistered<MatchStore>() ||
+          sl<MatchStore>().bestFor(c) == null) {
+        return;
+      }
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _repo
+          .sources(e.episodeUrl, sourceId: e.sourceId, fast: true)
+          .catchError((_) => <VideoSource>[]);
+    });
+  }
+
+  void _prewarmHeroMeta(List<MediaItem> items) {
+    if (_heroPrewarmed || items.isEmpty) return;
+    _heroPrewarmed = true;
+    _prewarmResume();
+    _heroMeta(items.first);
+    // Warm the TMDB title logos for the whole carousel up front. The service
+    // resolves them SEQUENTIALLY (so no request burst at TMDB) and caches both
+    // in memory and on disk — so each logo is ready before its banner rotates
+    // in (no pop-in), and it barely touches TMDB on later launches.
+    sl<TitleLogoService>().prefetch(items);
+  }
+
+  void _openDetail(MediaItem item) {
+    Navigator.push(context, DetailScreen.route(item)).then((_) {
+      // Refresh Continue Watching + My List row when returning from detail.
+      if (mounted) setState(() {});
+    });
+  }
+
+  String _typeLabel(ProviderType t) =>
+      t == ProviderType.movie ? 'Movie' : 'Anime';
+
+  Future<MediaDetail?> _detailOf(
+    String url,
+    String sourceId, {
+    void Function(MediaDetail partial)? onPartial,
+  }) async {
+    try {
+      return await _repo.detail(url, sourceId: sourceId, onPartial: onPartial);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Netflix-style long-press info card for a browse-row item.
+  void _showInfo(MediaItem item) {
+    showMediaInfoSheet(
+      context,
+      title: item.title,
+      englishTitle: item.englishTitle,
+      cover: item.cover,
+      headers: item.coverHeaders,
+      typeLabel: _typeLabel(item.type),
+      subCount: item.subCount,
+      dubCount: item.dubCount,
+      detail: _detailOf(item.url, item.sourceId),
+      inMyList: _myList.contains(item),
+      onPlay: () => _playFeatured(item),
+      onOpenDetail: () => _openDetail(item),
+      onToggleMyList: () async {
+        await showListStatusSheet(
+          context,
+          item: item,
+          onChanged: () {
+            if (mounted) setState(() {});
+          },
+        );
+        return _myList.contains(item);
+      },
+    );
+  }
+
+  /// Long-press info card for a Continue Watching item — adds Resume + Remove.
+  void _showContinueInfo(HistoryEntry e) {
+    final stub = MediaItem(
+      id: e.showId,
+      title: e.showTitle,
+      cover: e.cover,
+      coverHeaders: e.coverHeaders,
+      url: e.showUrl,
+      type: ProviderType.anime,
+      sourceId: e.sourceId,
+    );
+    final pct = (e.progress * 100).round();
+    showMediaInfoSheet(
+      context,
+      title: e.showTitle,
+      cover: e.cover,
+      headers: e.coverHeaders,
+      detail: _detailOf(e.showUrl, e.sourceId),
+      inMyList: _myList.contains(stub),
+      playLabel: 'Resume',
+      progress: e.progress,
+      progressLabel: e.episodeNumber != null
+          ? 'Episode ${e.episodeNumber!.toInt()} · $pct% watched'
+          : '$pct% watched',
+      onPlay: () => _resume(e),
+      onOpenDetail: () => _openDetail(stub),
+      onToggleMyList: () async {
+        await showListStatusSheet(
+          context,
+          item: stub,
+          onChanged: () {
+            if (mounted) setState(() {});
+          },
+        );
+        return _myList.contains(stub);
+      },
+      onRemoveFromContinue: () async {
+        // Tapping Remove and having the row stay put with no explanation is
+        // the worst version of this: it reads as the button being broken.
+        try {
+          await sl<WatchHistory>().remove(e.sourceId, e.showId);
+        } catch (_) {
+          showGlobalSnack("Couldn't remove from Continue Watching");
+          return;
+        }
+        if (mounted) setState(() {});
+      },
+    );
+  }
+
+  /// Long-press info card for a Continue Reading item — the manga/novel twin of
+  /// [_showContinueInfo]: Read + Remove + My List, backed by [ReadHistory].
+  void _showContinueReadingInfo(ReadEntry e) {
+    final stub = MediaItem(
+      id: e.showId,
+      title: e.title,
+      cover: e.cover,
+      url: e.showId,
+      type: e.type,
+      sourceId: e.sourceId,
+    );
+    final pct = e.total > 0 ? ((e.pos / e.total) * 100).round() : 0;
+    final progress = e.total > 0 ? (e.pos / e.total).clamp(0.0, 1.0) : 0.0;
+    showMediaInfoSheet(
+      context,
+      title: e.title,
+      cover: e.cover,
+      detail: _detailOf(e.showId, e.sourceId),
+      inMyList: _myList.contains(stub),
+      playLabel: 'Read',
+      progress: progress,
+      progressLabel: e.chapterNumber != null
+          ? 'Chapter ${e.chapterNumber!.toInt()} · $pct% read'
+          : '$pct% read',
+      onPlay: () => _resumeReading(e),
+      onOpenDetail: () => _openDetail(stub),
+      onToggleMyList: () async {
+        await showListStatusSheet(
+          context,
+          item: stub,
+          onChanged: () {
+            if (mounted) setState(() {});
+          },
+        );
+        return _myList.contains(stub);
+      },
+      onRemoveFromContinue: () async {
+        // Tapping Remove and having the row stay put with no explanation is
+        // the worst version of this: it reads as the button being broken.
+        try {
+          await sl<ReadHistory>().remove(e.sourceId, e.showId);
+        } catch (_) {
+          showGlobalSnack("Couldn't remove from Continue Reading");
+          return;
+        }
+        if (mounted) setState(() {});
+      },
+    );
+  }
+
+  Future<void> _playFeatured(MediaItem item) async {
+    // Manga/novel: the hero's primary action says "Read", so it must not drop
+    // into the video player. Route to the title instead — Detail owns the real
+    // Read button, which resolves the chapter list, picks up the saved reading
+    // position and routes manga vs novel to the right reader. Duplicating that
+    // here would mean re-implementing chapter resolution on Home.
+    if (sl<ContentModeCubit>().state.isReading) {
+      _openDetail(item);
+      return;
+    }
+    // A metadata title only plays once a source has been paired with it. If
+    // that pairing isn't known yet, go to Detail rather than into the player:
+    // Detail resolves it, and when nothing matches it says so (dimmed Play,
+    // "No episodes available from this source", Wrong title?). Pushing the
+    // player instead just spins and fails, and that got more likely once one
+    // declared source replaced the search-every-source sweep.
+    //
+    // `saved` is a synchronous store read, so a title you have opened before
+    // still plays instantly — only the unknown ones take the detour.
+    if (ZmodeIds.isZ(item.url)) {
+      final c = ZmodeIds.parseShow(item.url);
+      if (c == null || sl<SourceMatcher>().saved(c) == null) {
+        _openDetail(item);
+        return;
+      }
+    }
+    // Fresh play: prefer a saved per-title sub/dub choice, else the global
+    // default category, else 'sub'.
+    final category =
+        sl<TitlePrefsStore>().category(item.sourceId, item.url) ??
+        sl<PlaybackPrefs>().defaultCategory;
+    // Instant nav — the player resolves the episode list behind its loader.
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => PlayerScreen(
+          sourceId: item.sourceId,
+          episodesResolver: () =>
+              _repo.episodes(item.url, sourceId: item.sourceId),
+          resume: sl<ResumeStore>(),
+          resolveSources: (u) =>
+              _repo.sources(u, sourceId: item.sourceId, fast: true),
+          history: sl<WatchHistory>(),
+          showTitle: item.title,
+          cover: item.cover,
+          coverHeaders: item.coverHeaders,
+          showUrl: item.url,
+          category: category,
+          malId: item.malId,
+          scrobbleTitle: item.type == ProviderType.anime ? item.title : null,
+          tmdbId: item.tmdbId,
+          tmdbIsTv: item.tmdbIsTv,
+        ),
+      ),
+    );
+    if (mounted) setState(() {});
+  }
+
+  /// Resume from Continue Watching. Navigates to the player INSTANTLY; the
+  /// player resolves the episode list behind its own branded loader (no blocking
+  /// pre-navigation spinner).
+  Future<void> _resume(HistoryEntry e) async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => PlayerScreen(
+          sourceId: e.sourceId,
+          episodesResolver: () => _repo.episodes(
+            e.showUrl,
+            category: e.category,
+            sourceId: e.sourceId,
+          ),
+          resumeEpisodeId: e.episodeId,
+          resumeEpisodeNumber: e.episodeNumber,
+          resumePosition: e.position,
+          resume: sl<ResumeStore>(),
+          resolveSources: (u) =>
+              _repo.sources(u, sourceId: e.sourceId, fast: true),
+          history: sl<WatchHistory>(),
+          showTitle: e.showTitle,
+          cover: e.cover,
+          coverHeaders: e.coverHeaders,
+          showUrl: e.showUrl,
+          category: e.category,
+          malId: e.malId,
+          scrobbleTitle: e.malId != null ? e.showTitle : null,
+        ),
+      ),
+    );
+    if (mounted) setState(() {});
+  }
+
+  /// Resume from Continue Reading. [ReadEntry] only carries the last-read
+  /// CHAPTER's own url (not the show's page url — unlike [HistoryEntry],
+  /// which has both), so this can't re-resolve the show's full chapter list
+  /// up front the way [_resume] does for video. It reopens exactly that one
+  /// chapter at its saved scroll position (restored by the reader itself via
+  /// ReadStore) and passes `resolveChapters: true` — the reader fetches the
+  /// full list itself in the background and lights up prev/next once it
+  /// lands, without touching the chapter already on screen.
+  ///
+  /// Routes to [MangaReaderScreen] or [NovelReaderScreen] by [ReadEntry.type]
+  /// — see [readerFor]. [ReadEntry] has no malId of its own (it's populated
+  /// from the tapped MediaItem/detail at read-start, same as WatchHistory's
+  /// scrobbleTitle path), so a resumed session still can't scrobble; that's
+  /// an existing gap, not something this resume path can close on its own.
+  Future<void> _resumeReading(ReadEntry e) async {
+    final chapter = Episode(
+      id: e.chapterId,
+      title: e.chapterNumber != null
+          ? 'Chapter ${e.chapterNumber!.toInt()}'
+          : 'Chapter',
+      number: e.chapterNumber,
+      url: e.chapterUrl,
+    );
+    await Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => readerFor(e, chapter)),
+    );
+    if (mounted) setState(() {});
+  }
+
+  /// Row entrance is now handled per-item by [RevealItem] (the cascade
+  /// cascade). This wrapper used to fade the whole row in, which MASKED that
+  /// cascade — so it's now a passthrough, kept only so its call sites are
+  /// untouched. Returns [child] unchanged.
+  Widget _animated(Widget child) => child;
+
+  /// Floating brand header — always positioned on top of the hero or bg.
+  Widget _buildHeader() {
+    return SafeArea(
+      bottom: false,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+        child: Row(
+          children: [
+            // Brand wordmark — the actual logo lettering (exact font).
+            // Tapping it swaps the metadata provider for wherever you are
+            // (AniList/MyAnimeList, or TMDB/Simkl on movies), which used to
+            // mean digging through Settings. Align sizes to the image, so
+            // the tap area is the wordmark itself and the rest of the row
+            // is untouched.
+            Expanded(
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: () => showMetadataSwitchSheet(context),
+                  child: Padding(
+                    // Only the padding is new: 22px of artwork is under the
+                    // 48px minimum tap target, and vertical padding alone
+                    // cannot shift a left-aligned image.
+                    padding: const EdgeInsets.symmetric(vertical: 8),
+                    child: Image.asset(
+                      'assets/icon/wordmark.png',
+                      height: 22,
+                      fit: BoxFit.contain,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            const _IncognitoChip(),
+            _headerDownloadButton(),
+            _notificationBell(context),
+            const HomeSearchAction(),
+            const HomeSourceSwitcherSlot(),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// The banner for [bannerId], with the same items and the same callbacks
+  /// whichever one is showing.
+  ///
+  /// [BannerStyle.defaultId] returns the carousel exactly as it was written —
+  /// this switch is the only thing standing between Home and the banner every
+  /// install already has, and the other branch is a separate widget that never
+  /// runs unless someone opts in.
+  Widget _featuredBanner(String bannerId, List<MediaItem> heroItems) {
+    final reading = sl<ContentModeCubit>().state.isReading;
+    void toggleList(MediaItem m) => showListStatusSheet(
+      context,
+      item: m,
+      onChanged: () {
+        if (mounted) setState(() {});
+      },
+    );
+
+    switch (bannerId) {
+      case BannerStyle.panelsId:
+        return FeaturedBannerPanels(
+          items: heroItems,
+          reading: reading,
+          inList: (m) => _myList.contains(m),
+          onPlay: _playFeatured,
+          onInfo: _openDetail,
+          onToggleList: toggleList,
+          meta: _heroMeta,
+        );
+      default:
+        // Auto-rotating carousel (up to 6 trending items)
+        return FeaturedCarousel(
+          items: heroItems,
+          reading: reading,
+          inList: (m) => _myList.contains(m),
+          onPlay: _playFeatured,
+          onInfo: _openDetail,
+          onToggleList: toggleList,
+          meta: _heroMeta,
+          style: HeroTransition.cinematic,
+        );
+    }
+  }
+
+  /// Header download shortcut → [DownloadsScreen]. Same shape as
+  /// [HomeSearchAction]: flat icon, no badge — the screen itself is the
+  /// progress view, so there's nothing to surface here. Pushed as a normal
+  /// route (with back), unlike the dock tab which suppresses it.
+  Widget _headerDownloadButton() {
+    return IconButton(
+      icon: const DockIcon(
+        DockGlyph.download,
+        color: AppColors.textSecondary,
+        size: 22,
+      ),
+      tooltip: context.l10n.downloads,
+      onPressed: () => Navigator.of(
+        context,
+      ).push(MaterialPageRoute<void>(builder: (_) => const DownloadsScreen())),
+    );
+  }
+
+  /// Flat bell → Notifications screen. The accent dot shows while any
+  /// announcement is unseen and clears itself reactively (the screen calls
+  /// markAllSeen, the Hive box updates, the listenable rebuilds).
+  Widget _notificationBell(BuildContext context) {
+    // Built fresh inside the listenable's builder — a captured widget
+    // instance would be canonical and the rebuild would be skipped.
+    Widget bell() => GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: () => Navigator.of(context).push(
+        MaterialPageRoute<void>(builder: (_) => const SubscriptionsScreen()),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(4),
+        child: Stack(
+          clipBehavior: Clip.none,
+          children: [
+            const DockIcon(
+              DockGlyph.bell,
+              color: AppColors.textSecondary,
+              size: 22,
+            ),
+            if (Hive.isBoxOpen(AnnouncementStore.boxName) &&
+                AnnouncementStore().unseenCount() > 0)
+              Positioned(
+                top: 1,
+                right: 2,
+                child: Container(
+                  width: 8,
+                  height: 8,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: AppColors.accent,
+                    border: Border.all(color: AppColors.bg, width: 1.5),
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+    // Rebuild the dot when the announcements box changes (e.g. markAllSeen).
+    if (!Hive.isBoxOpen(AnnouncementStore.boxName)) return bell();
+    return ValueListenableBuilder(
+      valueListenable: Hive.box(AnnouncementStore.boxName).listenable(),
+      builder: (context, _, child) => bell(),
+    );
+  }
+
+  /// Builds one provider-defined browse row (poster cards). The section is
+  /// already guaranteed non-empty by [SourceRepository.home].
+  Widget _sectionRow(HomeSection section) {
+    final items = section.items;
+    return _animated(
+      ContentRow(
+        title: section.title,
+        itemWidth: 116,
+        itemHeight: 216,
+        itemCount: items.length,
+        onSeeAll: () => _openSeeAll(section),
+        itemBuilder: (c, i) => PosterCard(
+          title: items[i].title,
+          imageUrl: items[i].cover,
+          headers: items[i].coverHeaders,
+          cellWidth: 116,
+          qualityBadge: items[i].quality,
+          scoreBadge: items[i].score,
+          dubBadge: items[i].dubBadge,
+          onTap: () => _openDetail(items[i]),
+          onLongPress: () => _showInfo(items[i]),
+        ),
+      ),
+    );
+  }
+
+  /// Open one streaming service's catalogue from the rail.
+  ///
+  /// Goes straight to the paginated grid rather than via the services screen —
+  /// the rail already IS the service picker, so a stop in between would be a
+  /// screen you pass through.
+  Future<void> _openStreamingService(StreamingService s) async {
+    final repo = sl<MetadataRepository>();
+    final more = BrowseMore(
+      sourceId: ZmodeIds.sourceId,
+      kind: 'zm_video',
+      categoryId: TmdbCatalogue.wpRowId(s.id),
+    );
+    List<MediaItem> first;
+    try {
+      first = await repo.browseMore(more, 1);
+    } catch (_) {
+      first = const [];
+    }
+    if (!mounted) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => SeeAllScreen(
+          title: s.name,
+          items: first,
+          onTap: (m) => Navigator.push(context, DetailScreen.route(m)),
+          onLoadMore: (page) => repo.browseMore(more, page),
+        ),
+      ),
+    );
+  }
+
+  /// One row of the merged home arrangement, as a sliver. Every [HomeRow]
+  /// type maps to the widget that already renders that shape — the sealed
+  /// switch makes a future row type a compile error here instead of a silent
+  /// gap, and the local row reuses [ContinueSection] itself so its reactive
+  /// Hive/mode behaviour is identical wherever the user drags it.
+  Widget _homeRowSliver(HomeRow row, {required bool loggedIn}) => switch (row) {
+    LocalContinueHomeRow() => ContinueSection(
+      loggedIn: loggedIn,
+      onResume: _resume,
+      onLongPress: _showContinueInfo,
+      onSeeAll: _openHistory,
+      onResumeReading: _resumeReading,
+      onLongPressReading: _showContinueReadingInfo,
+    ),
+    StreamingServicesHomeRow() => SliverToBoxAdapter(
+      child: StreamingServicesRow(
+        onOpen: _openStreamingService,
+        onSeeAll: () => Navigator.of(context).push(
+          MaterialPageRoute<void>(
+            builder: (_) => const StreamingServicesScreen(),
+          ),
+        ),
+      ),
+    ),
+    ProviderHomeRow(:final section) => SliverToBoxAdapter(
+      child: _sectionRow(section),
+    ),
+    TrackerContinueHomeRow(:final items, :final trackerName) =>
+      SliverToBoxAdapter(
+        child: TrackerContinueSection(
+          items: items,
+          trackerName: trackerName,
+          onOpen: _openTrackerEntry,
+          onSeeAll: () => _openTrackerList(trackerName, WatchStatus.watching),
+          onLongPress: _showTrackerInfo,
+        ),
+      ),
+    NewEpisodesHomeRow(:final items, :final trackerName) => SliverToBoxAdapter(
+      child: NewEpisodesSection(
+        items: items,
+        trackerName: trackerName,
+        onOpen: _openTrackerEntry,
+        onSeeAll: () => _openNewEpisodes(items),
+        onLongPress: _showTrackerInfo,
+      ),
+    ),
+    TrackerListHomeRow(:final status, :final items, :final trackerName) =>
+      SliverToBoxAdapter(
+        child: TrackerListSection(
+          status: status,
+          items: items,
+          trackerName: trackerName,
+          onOpen: _openTrackerEntry,
+          onSeeAll: () => _openTrackerList(trackerName, status),
+          onLongPress: _showTrackerInfo,
+        ),
+      ),
+  };
+
+  /// "See all" on New Episodes: the same entries as a grid, keeping the count
+  /// badge so the reason each one is here survives the jump.
+  ///
+  /// A fixed list, not a paginated one — this row is computed from the library
+  /// already in hand, so there is no next page to ask anyone for.
+  void _openNewEpisodes(List<TrackerListItem> items) {
+    final waiting = {
+      for (final e in items) e.item.id: releasedCount(e) - (e.progress ?? 0),
+    };
+    Navigator.push(
+      context,
+      MaterialPageRoute<void>(
+        builder: (_) => SeeAllScreen(
+          title: context.l10n.homeRowNewEpisodes,
+          items: [for (final e in items) e.item],
+          onTap: _openTrackerItem,
+          tagsFor: (item) => ['+${waiting[item.id] ?? 0}'],
+        ),
+      ),
+    );
+  }
+
+  /// "See all" on a tracker row: that tracker's whole library, opened on the
+  /// tab the row came from.
+  ///
+  /// Reuses [MyListScreen] rather than a thinner grid, the same way the lists
+  /// hub does — statuses, custom lists, sort and filter all keep working, and
+  /// a purpose-built screen would have quietly lost them.
+  void _openTrackerList(String trackerName, WatchStatus status) {
+    if (!sl.isRegistered<TrackerHub>()) return;
+    Tracker? tracker;
+    for (final t in sl<TrackerHub>().trackers) {
+      if (t.displayName == trackerName) tracker = t;
+    }
+    if (tracker == null) return;
+    Navigator.push(
+      context,
+      MaterialPageRoute<void>(
+        builder: (_) => MyListScreen(
+          initialTracker: tracker,
+          // The row was built for the mode Home is in, so the library has to
+          // open on the same kind rather than following the app afterwards.
+          initialKind: sl<ContentModeCubit>().state,
+          initialStatus: status,
+        ),
+      ),
+    );
+  }
+
+  /// Open a tracker entry from the home rows. The stub carries no provider,
+  /// but it carries the id the metadata catalogue is keyed by, so a tap opens
+  /// its Detail page directly; an entry with no id falls back to a search for
+  /// its own title — the same open path My List uses.
+  void _openTrackerEntry(TrackerListItem entry) => _openTrackerItem(entry.item);
+
+  /// The info sheet for a tracker row, the same one every other poster on Home
+  /// opens on a long-press. Re-keyed first so the sheet can look the title up
+  /// in the catalogue — a raw stub carries no resolvable url.
+  void _showTrackerInfo(TrackerListItem entry) =>
+      _showInfo(playableTrackerItem(entry.item) ?? entry.item);
+
+  /// The same open, from a bare item — the See All grid hands back MediaItems.
+  void _openTrackerItem(MediaItem item) {
+    final playable = playableTrackerItem(item);
+    if (playable != null) {
+      _openDetail(playable);
+      return;
+    }
+    Navigator.push(
+      context,
+      MaterialPageRoute<void>(
+        builder: (_) => SearchScreen(initialQuery: item.title),
+      ),
+    );
+  }
+
+  /// Open the full history screen ("See all"). Lands on the tab matching the
+  /// current content mode — the [ContentMode] enum is ordered anime/manga/novel,
+  /// the same order as the History tabs — so reading modes open on Manga/Novel.
+  void _openHistory() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) =>
+            HistoryScreen(initialIndex: sl<ContentModeCubit>().state.index),
+      ),
+    ).then((_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  /// Open the full-grid "See All" view of a browse row.
+  void _openSeeAll(HomeSection section) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => SeeAllScreen(
+          title: section.title,
+          items: section.items,
+          onTap: _openDetail,
+          onLongPress: _showInfo,
+          // Only paginable rows carry a `more` descriptor; everything else
+          // stays a fixed list. Pagination isn't part of CatalogueRepository,
+          // so go to whichever repository owns the row: the metadata providers
+          // stamp the Z Mode source id, everything else is a real source.
+          onLoadMore: section.more == null
+              ? null
+              // Compare the source id, NOT ZmodeIds.isZ — that tests a zm://
+              // URL, and a sourceId is never one, so every metadata row would
+              // have been sent to the source repository instead.
+              : (page) => section.more!.sourceId == ZmodeIds.sourceId
+                    ? sl<MetadataRepository>().browseMore(section.more!, page)
+                    : sl<SourceRepository>().browseMore(section.more!, page),
+        ),
+      ),
+    ).then((_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  /// Shown at the top of Home when the session lapsed — cloud sync is silently
+  /// off until the user reconnects. Tapping re-authenticates in place (no logout
+  /// / no wipe) and then refreshes Home to surface the freshly-synced rows.
+  Widget _reconnectBanner() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+      child: Material(
+        color: AppColors.accentSoft,
+        borderRadius: BorderRadius.circular(14),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(14),
+          onTap: () async {
+            final ok = await showReconnectDialog(context) ?? false;
+            if (ok && mounted) context.read<HomeCubit>().load();
+          },
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+            child: Row(
+              children: [
+                Icon(
+                  Icons.sync_problem_rounded,
+                  color: AppColors.accent,
+                  size: 20,
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(context.l10n.reconnectToSync, style: AppText.body),
+                      Text(
+                        'Your session expired — tap to sign in and sync your library.',
+                        style: AppText.caption,
+                      ),
+                    ],
+                  ),
+                ),
+                Icon(
+                  Icons.chevron_right_rounded,
+                  color: AppColors.textSecondary,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// A row of cards under the banner, showing the modes you're NOT in plus —
+  /// in Anime mode only — a Schedule card (Schedule has nothing to show in a
+  /// reading mode; see [DockTab.isAnimeOnly]). Reactive to [ContentModeCubit]
+  /// so they re-label the instant a switch lands. Tapping a mode card runs
+  /// the sword-slash into that mode; Schedule opens the same [ScheduleScreen]
+  /// its dock tab does.
+  Widget _modeCards() {
+    return BlocBuilder<ContentModeCubit, ContentMode>(
+      bloc: sl<ContentModeCubit>(),
+      builder: (context, current) {
+        // Z Mode drives the mode from its own controls, so the switcher cards
+        // would duplicate them. The hub card stays in BOTH modes: with no
+        // Schedule dock tab and no tracker cards, it is the only way in.
+        final others = ZModePrefs.enabled
+            ? const <ContentMode>[]
+            : ContentMode.values.where((m) => m != current).toList();
+        // One row now. Schedule and the tracker libraries used to be a card
+        // each below this one, which meant a second row of near-identical
+        // slabs that grew with every tracker and had to be filtered per mode
+        // to stay a readable width. They live behind [ListsHubScreen] instead,
+        // so this row no longer changes shape with what you have connected.
+        // A brand new install has watched nothing and read nothing, so every
+        // card below falls through to its flat fill and the row opens dead.
+        // The catalogue is already loaded underneath it, so borrow from that
+        // instead — one cover per card that has none of its own, handed out
+        // in the order the Row draws them so no two cards land on the same
+        // picture.
+        final spare = _catalogueArt();
+        var next = 0;
+        ({String? cover, Map<String, String>? headers}) orBorrow(
+          ({String? cover, Map<String, String>? headers}) own,
+        ) {
+          if (own.cover?.isNotEmpty ?? false) return own;
+          return next < spare.length ? spare[next++] : own;
+        }
+
+        return Padding(
+          padding: const EdgeInsets.fromLTRB(16, 6, 16, 6),
+          child: Row(
+            children: [
+              for (final m in others) ...[
+                Expanded(child: _modeCard(m, orBorrow(_modeArt(m)))),
+                const SizedBox(width: 12),
+              ],
+              // Even halves with Genres beside it. Alone it still fills the
+              // row, so the old flex:2 (which existed to beat the switcher
+              // cards to a readable width) no longer buys anything.
+              Expanded(child: _hubCard(orBorrow(_modeArt(ContentMode.anime)))),
+              // Genres only means something on a catalogue that can actually
+              // narrow itself. MAL and Simkl take the parameter and answer
+              // with the same unfiltered list, so the card is not offered
+              // there rather than opening onto a screen that lies.
+              //
+              // isRegistered, not a bare sl<>: this row builds before the
+              // repository exists in some shells (and in every test that only
+              // cares about the dock), and a missing card is a better answer
+              // there than throwing the whole Home tree away.
+              if (sl.isRegistered<MetadataRepository>() &&
+                  sl<MetadataRepository>().supportsFilters) ...[
+                const SizedBox(width: 12),
+                Expanded(child: _genresCard(orBorrow(_genresArt()))),
+              ],
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _modeCard(
+    ContentMode m,
+    ({String? cover, Map<String, String>? headers}) art,
+  ) {
+    return GestureDetector(
+      onTap: _slashing ? null : () => _enterMode(m),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(16),
+        child: SizedBox(
+          height: 52,
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              // A cover from the user's recent content for this mode, one
+              // borrowed from the catalogue when they have none, and a tint
+              // of the accent only when there is no catalogue either.
+              _cardBg(art, scrim: _neutralScrim, empty: _emptyTint(0.16, 0.09)),
+              Center(
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(m.icon, size: 18, color: Colors.white),
+                    const SizedBox(width: 8),
+                    // Flexible, not bare: at three cards on a 320px phone the
+                    // label has ~68px and "Streaming" does not fit.
+                    Flexible(
+                      child: Text(
+                        m.label,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: AppText.body.copyWith(
+                          color: Colors.white,
+                          fontWeight: FontWeight.w700,
+                          fontSize: 14,
+                          shadows: const [
+                            Shadow(color: Colors.black, blurRadius: 6),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Same card shell as [_modeCard], but for [ListsHubScreen] — Schedule plus
+  /// every connected tracker library. One door rather than a card each, so the
+  /// row keeps its shape whether you have no trackers or four.
+  Widget _hubCard(({String? cover, Map<String, String>? headers}) art) {
+    return GestureDetector(
+      key: const ValueKey('home_lists_hub_card'),
+      onTap: _slashing
+          ? null
+          : () => Navigator.of(context).push(
+              MaterialPageRoute<void>(builder: (_) => const ListsHubScreen()),
+            ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(16),
+        child: SizedBox(
+          height: 52,
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              // Always the last thing you WATCHED, in every mode. Anime and
+              // movies share [WatchHistory], so this is a show cover whether
+              // you are browsing manga or not — and on the flat fallback
+              // gradient this card looked dead next to the switchers.
+              _cardBg(art, scrim: _neutralScrim, empty: _emptyTint(0.22, 0.11)),
+              Center(
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const DockIcon(
+                      DockGlyph.calendar,
+                      color: Colors.white,
+                      filled: true,
+                      size: 18,
+                    ),
+                    const SizedBox(width: 8),
+                    Flexible(
+                      child: Text(
+                        context.l10n.scheduleAndLists,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: AppText.body.copyWith(
+                          color: Colors.white,
+                          fontWeight: FontWeight.w700,
+                          fontSize: 14,
+                          shadows: const [
+                            Shadow(color: Colors.black, blurRadius: 6),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Art for the cards to borrow when the user's own history has none — a
+  /// fresh install, or a mode they have not opened yet.
+  ///
+  /// Comes from the rows already loaded below the cards, so it costs no fetch
+  /// and is guaranteed to be something the active source can actually show.
+  /// Anything the carousel directly above could rotate onto is skipped, by
+  /// TITLE rather than by url. Both halves of that matter: the hero is not
+  /// simply the first section (it prefers a Trending row — see
+  /// [HomeState.heroItems]), and a popular show sits in several rows with
+  /// different art in each, so matching urls alone still put the card on a
+  /// second picture of whatever the banner was already showing.
+  List<({String? cover, Map<String, String>? headers})> _catalogueArt() {
+    final state = context.read<HomeCubit>().state;
+    final hero = {for (final it in state.heroItems) it.title.toLowerCase()};
+    final out = <({String? cover, Map<String, String>? headers})>[];
+    final seen = <String>{};
+    for (final s in state.sections ?? const <HomeSection>[]) {
+      for (final it in s.items) {
+        if (hero.contains(it.title.toLowerCase())) continue;
+        final art = _itemArt(it);
+        final url = art.cover;
+        if (url == null || url.isEmpty || !seen.add(url)) continue;
+        out.add(art);
+        // Two switchers, the hub and Genres is every card the row can hold.
+        if (out.length == 4) return out;
+      }
+    }
+    return out;
+  }
+
+  /// Wide art if the item has it, else the poster. These cards are a 3:1
+  /// strip and a poster cropped to that is a sliver of someone's forehead.
+  ///
+  /// An item from an installed extension keeps its cover and headers
+  /// together: [_art] routes those through that source's own client, and a
+  /// banner url would not survive the trip.
+  ({String? cover, Map<String, String>? headers}) _itemArt(MediaItem it) {
+    final native =
+        it.coverHeaders?['x-ani-src'] != null ||
+        it.coverHeaders?['x-mihon-src'] != null;
+    final wide = native ? null : it.banner;
+    return (cover: wide ?? it.cover, headers: it.coverHeaders);
+  }
+
+  /// A cover for the Genres card that is NOT the one on the Lists card.
+  ///
+  /// The Lists card always shows the last thing watched, so feeding this the
+  /// same [_modeArt] put one image twice in a two-card row. Prefer something
+  /// read rather than watched, else the second distinct thing watched, else
+  /// nothing — at which point the tint below carries the difference.
+  ({String? cover, Map<String, String>? headers}) _genresArt() {
+    for (final m in const [ContentMode.manga, ContentMode.novel]) {
+      final a = _modeArt(m);
+      if (a.cover?.isNotEmpty ?? false) return a;
+    }
+    if (Hive.isBoxOpen(WatchHistory.boxName)) {
+      final seen = <String>{};
+      for (final e in sl<WatchHistory>().all()) {
+        final c = e.thumbnail ?? e.cover;
+        if (c == null || c.isEmpty) continue;
+        // The Lists card took the first, so hand back the second.
+        if (seen.add(c) && seen.length == 2) {
+          return (cover: c, headers: e.coverHeaders);
+        }
+      }
+    }
+    return (cover: null, headers: null);
+  }
+
+  /// Same card shell again, for [GenresScreen] — the genre list for whatever
+  /// mode you are in, each one a way straight into a filtered Search.
+  Widget _genresCard(({String? cover, Map<String, String>? headers}) art) {
+    return GestureDetector(
+      key: const ValueKey('home_genres_card'),
+      onTap: _slashing
+          ? null
+          : () => Navigator.of(context).push(
+              MaterialPageRoute<void>(builder: (_) => const GenresScreen()),
+            ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(16),
+        child: SizedBox(
+          height: 52,
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              // Accent-tinted rather than the neutral black the Lists card
+              // uses: side by side at equal width, two identically scrimmed
+              // cards read as one wide slab split by a gap. Not at 0.82
+              // though — that buried the cover under a flat sheet of accent,
+              // so the tint now sits over the art rather than in place of it.
+              _cardBg(
+                art,
+                // Toned, not the raw accent: a light Material You accent
+                // washed the card out and took the white label with it.
+                scrim: [
+                  _toned(0.30).withValues(alpha: 0.78),
+                  Colors.black.withValues(alpha: 0.55),
+                ],
+                empty: _emptyTint(0.32, 0.15),
+              ),
+              Center(
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(
+                      Icons.local_offer_outlined,
+                      size: 18,
+                      color: Colors.white,
+                    ),
+                    const SizedBox(width: 8),
+                    Flexible(
+                      child: Text(
+                        context.l10n.genres,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: AppText.body.copyWith(
+                          color: Colors.white,
+                          fontWeight: FontWeight.w700,
+                          fontSize: 14,
+                          shadows: const [
+                            Shadow(color: Colors.black, blurRadius: 6),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// A representative cover for [m] from the user's own history — last watched
+  /// show (streaming) or last read manga/novel. Null when there's nothing yet.
+  ({String? cover, Map<String, String>? headers}) _modeArt(ContentMode m) {
+    if (m == ContentMode.anime) {
+      if (!Hive.isBoxOpen(WatchHistory.boxName))
+        return (cover: null, headers: null);
+      for (final e in sl<WatchHistory>().all()) {
+        final c = e.thumbnail ?? e.cover;
+        if (c != null && c.isNotEmpty)
+          return (cover: c, headers: e.coverHeaders);
+      }
+      return (cover: null, headers: null);
+    }
+    if (!Hive.isBoxOpen(ReadHistory.boxName))
+      return (cover: null, headers: null);
+    final type = m == ContentMode.manga
+        ? ProviderType.manga
+        : ProviderType.novel;
+    for (final e in sl<ReadHistory>().all()) {
+      if (e.type == type && (e.cover?.isNotEmpty ?? false)) {
+        return (cover: e.cover, headers: e.coverHeaders);
+      }
+    }
+    return (cover: null, headers: null);
+  }
+
+  /// The neutral scrim the switcher and Lists cards lay over their art, so a
+  /// white icon and label stay legible whatever the cover looks like.
+  static const _neutralScrim = [Color(0xCC000000), Color(0x55000000)];
+
+  /// The accent's hue at a darkness we choose.
+  ///
+  /// The accent cannot be used raw here. With Material You on it is tone 80
+  /// of the wallpaper palette (see [ThemeController]) — a LIGHT colour, meant
+  /// for text and icons ON a dark ground. Tinting a card with it lightened
+  /// the card instead of colouring it, and took the white label with it.
+  /// Hue and saturation carry the theme; the lightness is this screen's.
+  Color _toned(double lightness) =>
+      HSLColor.fromColor(AppColors.accent).withLightness(lightness).toColor();
+
+  /// Gradient for a card with no art behind it, [from] darkness to [to].
+  ///
+  /// Flat grey is what an empty history used to get — the fallback was
+  /// surface2 to surface, and the scrim on top then knocked even that back,
+  /// so a fresh install opened onto a row of dead slabs. These sit in the
+  /// same dark range as the surfaces, just carrying the theme's colour.
+  List<Color> _emptyTint(double from, double to) => [_toned(from), _toned(to)];
+
+  /// Background for one of the 52dp cards: the art under [scrim], or the
+  /// [empty] gradient alone when there is no art. The scrim is skipped in
+  /// that case — it is there to tame a photograph, and over a flat fill it
+  /// only muddies it.
+  Widget _cardBg(
+    ({String? cover, Map<String, String>? headers}) art, {
+    required List<Color> scrim,
+    required List<Color> empty,
+  }) {
+    final url = art.cover;
+    if (url == null || url.isEmpty) {
+      return DecoratedBox(
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: empty,
+          ),
+        ),
+      );
+    }
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        _art(url, art.headers),
+        DecoratedBox(
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.centerLeft,
+              end: Alignment.centerRight,
+              colors: scrim,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _art(String url, Map<String, String>? headers) {
+    if (headers?['x-ani-src'] != null || headers?['x-mihon-src'] != null) {
+      return Image(
+        image: ResizeImage(
+          headers?['x-ani-src'] != null
+              ? AniyomiImage(int.parse(headers!['x-ani-src']!), url)
+              : MihonImage(int.parse(headers!['x-mihon-src']!), url),
+          width: 420,
+        ),
+        fit: BoxFit.cover,
+        alignment: const Alignment(0, -0.2),
+        errorBuilder: (_, _, _) => ColoredBox(color: AppColors.surface2),
+      );
+    }
+    return CachedNetworkImage(
+      imageUrl: url,
+      httpHeaders: headers,
+      memCacheWidth: 420,
+      fit: BoxFit.cover,
+      alignment: const Alignment(0, -0.2),
+      placeholder: (_, _) => ColoredBox(color: AppColors.surface2),
+      errorWidget: (_, _, _) => ColoredBox(color: AppColors.surface2),
+    );
+  }
+
+  /// Kicks off the slash transition into [m]. The actual mode swap happens
+  /// mid-animation via the controller listener wired in [initState].
+  void _enterMode(ContentMode m) {
+    if (_slashing) return;
+    setState(() {
+      _slashing = true;
+      _slashSwapped = false;
+      _slashTarget = m;
+    });
+    _slashCtrl.forward(from: 0);
+  }
+
+  /// Full-screen logo-strike overlay: the mark springs in at centre behind a
+  /// scrim (peaking at the midpoint to hide the content swap), a red glow pulses
+  /// and a steel glint sweeps the blade at the strike. Absorbs taps for its
+  /// ~600ms so the switch can't be double-fired.
+  Widget _slashOverlay() {
+    const logoSize = 152.0;
+    return Positioned.fill(
+      child: AbsorbPointer(
+        child: AnimatedBuilder(
+          animation: _slashCtrl,
+          builder: (context, _) {
+            final t = _slashCtrl.value;
+            // Triangular pulse: 0 at the ends, 1 at the midpoint.
+            final scrim = (1 - (t * 2 - 1).abs()).clamp(0.0, 1.0);
+            // Spring in (easeOutBack overshoots ~1), then a slight scale-up on
+            // the way out as it fades.
+            final inP = (t / 0.45).clamp(0.0, 1.0);
+            final outP = ((t - 0.75) / 0.25).clamp(0.0, 1.0);
+            final scale =
+                0.62 + 0.38 * Curves.easeOutBack.transform(inP) + outP * 0.12;
+            final logoOpacity =
+                (t < 0.12
+                        ? t / 0.12
+                        : t > 0.8
+                        ? (1 - t) / 0.2
+                        : 1.0)
+                    .clamp(0.0, 1.0);
+            // Steel glint: a white streak that sweeps across the mark around the
+            // strike (t≈0.38–0.62, peaking with the swap).
+            final glintOn = t > 0.38 && t < 0.62;
+            final glintP = ((t - 0.38) / 0.24).clamp(0.0, 1.0);
+            final glintPulse = (1 - (glintP * 2 - 1).abs()).clamp(0.0, 1.0);
+
+            return Stack(
+              children: [
+                Positioned.fill(
+                  child: ColoredBox(
+                    color: AppColors.bg.withValues(alpha: scrim * 0.92),
+                  ),
+                ),
+                Center(
+                  child: Opacity(
+                    opacity: logoOpacity,
+                    child: Transform.scale(
+                      scale: scale,
+                      child: SizedBox(
+                        width: logoSize,
+                        height: logoSize,
+                        child: Stack(
+                          alignment: Alignment.center,
+                          children: [
+                            // Red energy glow behind the mark.
+                            SizedBox(
+                              width: logoSize * 0.8,
+                              height: logoSize * 0.8,
+                              child: DecoratedBox(
+                                decoration: BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  boxShadow: [
+                                    BoxShadow(
+                                      color: AppColors.accent.withValues(
+                                        alpha: 0.5 * scrim,
+                                      ),
+                                      blurRadius: 48,
+                                      spreadRadius: 4,
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                            Image.asset(
+                              'assets/icon/logo_mark.png',
+                              width: logoSize,
+                              height: logoSize,
+                            ),
+                            if (glintOn)
+                              ClipRRect(
+                                borderRadius: BorderRadius.circular(26),
+                                child: SizedBox(
+                                  width: logoSize,
+                                  height: logoSize,
+                                  child: Transform.translate(
+                                    offset: Offset(
+                                      (glintP * 2 - 1) * logoSize * 0.9,
+                                      0,
+                                    ),
+                                    child: Transform.rotate(
+                                      angle: -0.5,
+                                      child: Container(
+                                        width: 34,
+                                        height: logoSize * 2,
+                                        decoration: BoxDecoration(
+                                          gradient: LinearGradient(
+                                            colors: [
+                                              Colors.white.withValues(alpha: 0),
+                                              Colors.white.withValues(
+                                                alpha: 0.85 * glintPulse,
+                                              ),
+                                              Colors.white.withValues(alpha: 0),
+                                            ],
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (sl<AppMode>().isTv) return const HomeScreenTv();
+    // Continue Watching is a logged-in feature; hide the row when signed out.
+    final authState = context.watch<AuthCubit>().state;
+    final loggedIn = authState.isLoggedIn;
+    // Session lapsed (logged-in from cache only) → cloud sync is silently off.
+    final needsReconnect = loggedIn && authState.needsReconnect;
+
+    return BlocListener<ActiveSourceCubit, String>(
+      listenWhen: (prev, curr) => prev != curr,
+      listener: (context, _) {
+        if (!mounted) return;
+        _metaCache.clear();
+        _heroPrewarmed = false;
+        // reset:true clears the old source's rows so the switch is visible
+        // immediately (skeletons), even if the new source's home is slow.
+        context.read<HomeCubit>().load(reset: true);
+      },
+      child: Scaffold(
+        backgroundColor: AppColors.bg,
+        // Extend content behind the status bar; the floating header handles
+        // its own SafeArea(bottom: false).
+        body: Stack(
+          children: [
+            RefreshIndicator(
+              color: AppColors.accent,
+              onRefresh: () {
+                // Pull-to-refresh is the user saying "try again", so it also
+                // re-tests a session the startup check only assumed was dead
+                // (the "Reconnect to sync" banner). force: it must not sit out
+                // the cool-off when someone deliberately pulled.
+                if (sl.isRegistered<AuthCubit>()) {
+                  unawaited(sl<AuthCubit>().revalidateIfFlagged(force: true));
+                }
+                return context.read<HomeCubit>().load();
+              },
+              child: BlocBuilder<HomeCubit, HomeState>(
+                builder: (context, state) {
+                  final sections = state.sections ?? const <HomeSection>[];
+                  // Which sections render as rows (the phone drops a
+                  // non-repeating first section so the hero isn't duplicated
+                  // right below itself) is decided by the cubit's merge now —
+                  // providerRowSections in home_rows_composer.dart, moved
+                  // verbatim from here. This build only branches on whether a
+                  // load finished at all.
+                  final showSkeletons = state.loading && sections.isEmpty;
+                  // The load finished but the source returned no rows — almost
+                  // always a dead/blocked site (or a search-only source). Show a
+                  // clear message instead of a blank screen.
+                  final loadedEmpty =
+                      !state.loading &&
+                      state.sections != null &&
+                      state.sections!.isEmpty;
+                  // Manga/novel with nothing installed: the mode-switch fallback
+                  // sets a matching source when one exists, so a reading mode
+                  // still on a non-matching (usually stale anime) active id means
+                  // nothing's installed for it — show the install guide and drop
+                  // the leaking anime rows/hero. Cheap DI-free prefix check, so
+                  // it's safe to run every build (unlike categorizedSources()).
+                  // Anime's own zero-source case (skipped setup) has no source to
+                  // load and flows through `loadedEmpty` → HomeLoadedEmptyView.
+                  // Z Mode manga/novel rows come from AniList, not an installed
+                  // `mihon:`/`lnr:` source, so the active-source prefix check
+                  // would wrongly call a fetch that just succeeded "no sources".
+                  final activeId = context.read<ActiveSourceCubit>().state;
+                  final noSourceForMode = ZModePrefs.enabled
+                      ? false
+                      : switch (sl<ContentModeCubit>().state) {
+                          ContentMode.manga => !activeId.startsWith('mihon:'),
+                          ContentMode.novel => !activeId.startsWith('lnr:'),
+                          ContentMode.anime => false,
+                        };
+                  return CustomScrollView(
+                    slivers: [
+                      // ── Hero + floating header (first sliver) ─────────────────
+                      SliverToBoxAdapter(
+                        child: Builder(
+                          builder: (context) {
+                            final heroItems = state.heroItems;
+                            final hasHero = heroItems.isNotEmpty;
+                            if (hasHero) _prewarmHeroMeta(heroItems);
+
+                            if (hasHero && !noSourceForMode) {
+                              // Which banner is drawn is a Settings choice, and
+                              // it can change while Home is already built — so
+                              // listen rather than read once.
+                              return ValueListenableBuilder<String>(
+                                valueListenable: BannerStyle.current,
+                                builder: (context, bannerId, _) => Stack(
+                                  children: [
+                                    _featuredBanner(bannerId, heroItems),
+                                    // Floating header sits on top
+                                    Positioned(
+                                      top: 0,
+                                      left: 0,
+                                      right: 0,
+                                      child: _buildHeader(),
+                                    ),
+                                  ],
+                                ),
+                              );
+                            }
+
+                            // While loading or on error: plain header on bg colour.
+                            return ColoredBox(
+                              color: AppColors.bg,
+                              child: _buildHeader(),
+                            );
+                          },
+                        ),
+                      ),
+
+                      // ── Mode cards, and Schedule ──────────────────────────────
+                      // Unconditional: _modeCards drops the mode switchers
+                      // itself under Z Mode and keeps Schedule, which has no
+                      // other entry point since it left the dock.
+                      SliverToBoxAdapter(child: _modeCards()),
+
+                      // ── Reconnect banner (session lapsed → sync is off) ───────
+                      if (needsReconnect)
+                        SliverToBoxAdapter(child: _reconnectBanner()),
+
+                      // ── The arrangement ─────────────────────────────────────
+                      // state.rows is the merged view of this load: the local
+                      // Continue row, the tracker rows the user enabled, and the
+                      // provider sections, in the saved order (Settings →
+                      // Interface → Appearance → Home rows). ContinueSection renders wherever
+                      // the layout puts it — the same widgets as before, just
+                      // arranged. Before the first merge lands (rows null), the
+                      // ContinueSection keeps its old spot above the skeletons
+                      // so the loading screen is exactly today's.
+                      if (state.rows case final rows?)
+                        ...rows.map(
+                          (r) => _homeRowSliver(r, loggedIn: loggedIn),
+                        )
+                      else
+                        ContinueSection(
+                          loggedIn: loggedIn,
+                          onResume: _resume,
+                          onLongPress: _showContinueInfo,
+                          onSeeAll: _openHistory,
+                          onResumeReading: _resumeReading,
+                          onLongPressReading: _showContinueReadingInfo,
+                        ),
+
+                      // ── Skeletons while the first load runs / empty states ───
+                      // The provider rows themselves are part of state.rows
+                      // above; this branch only owns the loading placeholders
+                      // and the "nothing came back" views.
+                      if (showSkeletons && !noSourceForMode)
+                        ...List.generate(
+                          3,
+                          (_) => const SliverToBoxAdapter(child: RowSkeleton()),
+                        )
+                      else if (noSourceForMode || loadedEmpty)
+                        SliverFillRemaining(
+                          hasScrollBody: false,
+                          child: HomeLoadedEmptyView(
+                            offline: state.offline,
+                            mode: sl<ContentModeCubit>().state,
+                            // Name whatever ACTUALLY answered: in Z Mode the
+                            // rows come from AniList/MAL/TMDB/Simkl, not the
+                            // active source, so blaming the source was simply
+                            // pointing at the wrong thing. The router hands
+                            // back the right name in either mode.
+                            sourceName: _repo.displayName(_repo.sourceId),
+                            // A metadata catalogue, not an installed source —
+                            // the "switch source at the top" advice does not
+                            // apply to it.
+                            isMetadataProvider:
+                                _repo.sourceId == ZmodeIds.sourceId,
+                            rateLimitedSeconds: state.rateLimitedSeconds,
+                            onRetry: () =>
+                                context.read<HomeCubit>().load(reset: true),
+                            // No-source guide points at the Providers hub (all
+                            // ecosystems); the source-returned-nothing case
+                            // (_SourceUnavailable) keeps its retry.
+                            onInstallSources: () => Navigator.of(context).push(
+                              MaterialPageRoute<void>(
+                                builder: (_) => const ProvidersHubScreen(),
+                              ),
+                            ),
+                            // Cloudflare-blocked (Mihon) source: offer the visible
+                            // solve, then reload once the user closes the WebView.
+                            cloudflareUrl: state.cloudflareUrl,
+                            onSolveCloudflare: state.cloudflareUrl == null
+                                ? null
+                                : () async {
+                                    await MihonExtensionService.solveCloudflare(
+                                      state.cloudflareUrl!,
+                                    );
+                                    if (context.mounted) {
+                                      context.read<HomeCubit>().load(
+                                        reset: true,
+                                      );
+                                    }
+                                  },
+                          ),
+                        ),
+
+                      // ── Bottom padding ────────────────────────────────────────
+                      // Clear the floating dock, which overlays content (the
+                      // shell's extendBody reserves it no space of its own).
+                      SliverToBoxAdapter(
+                        child: SizedBox(
+                          height: MediaQuery.paddingOf(context).bottom,
+                        ),
+                      ),
+                    ],
+                  );
+                },
+              ),
+            ),
+            if (_slashing) _slashOverlay(),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Opens [SearchScreen] — the primary way into search now that it's off the
+/// dock. Shown regardless of Z Mode: [SearchScreen] itself already switches
+/// between the metadata catalogue and the active source, so the header icon
+/// that reaches it doesn't need to.
+class HomeSearchAction extends StatelessWidget {
+  const HomeSearchAction({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return IconButton(
+      icon: const DockIcon(
+        DockGlyph.search,
+        color: AppColors.textSecondary,
+        size: 22,
+      ),
+      tooltip: context.l10n.search,
+      onPressed: () => Navigator.of(
+        context,
+      ).push(MaterialPageRoute<void>(builder: (_) => const SearchScreen())),
+    );
+  }
+}
+
+/// The header's source switcher. Hidden while Z Mode is on — the active
+/// source doesn't affect anything on screen there (Home is metadata-driven)
+/// and the control would be misleading. Shown with Z Mode off, where Home is
+/// source-driven and this is how you change which one.
+///
+/// Reactive to [ZModePrefs.revision] (a [ValueListenableBuilder], not a
+/// listener on [_HomeViewState]) so flipping the toggle updates this
+/// immediately without needing the rest of Home to rebuild.
+///
+/// Extracted as its own widget — rather than inlined in [_HomeViewState]'s
+/// build — so this is testable without pumping the real [HomeScreen], whose
+/// `initState` fires a real network call.
+class HomeSourceSwitcherSlot extends StatelessWidget {
+  const HomeSourceSwitcherSlot({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<int>(
+      valueListenable: ZModePrefs.revision,
+      builder: (context, _, _) => !ZModePrefs.enabled
+          ? BlocBuilder<ActiveSourceCubit, String>(
+              builder: (context, id) => SourceSwitcher(
+                currentId: id,
+                onChanged: (newId) =>
+                    context.read<ActiveSourceCubit>().setSource(newId),
+                onInstallSources: () => Navigator.of(context).push(
+                  MaterialPageRoute<void>(
+                    builder: (_) =>
+                        const ZangetsuSourcesScreen(openToRepos: true),
+                  ),
+                ),
+              ),
+            )
+          : const SizedBox.shrink(),
+    );
+  }
+}
+
+/// Home's "provider returned no sections" branch. A reading mode with
+/// literally nothing installed for it gets a message that says so, with an
+/// action into the install flow — today's [_SourceUnavailable] ("couldn't
+/// load, try again") is flat wrong there, since nothing failed, there's just
+/// nothing set up. Anime mode (and a reading mode whose installed source
+/// failed to load) keeps [_SourceUnavailable] exactly as before.
+///
+/// Extracted as its own widget — rather than inlined in [_HomeViewState]'s
+/// build — so this decision is testable without pumping the real
+/// [HomeScreen], whose `initState` fires a real network call.
+class HomeLoadedEmptyView extends StatelessWidget {
+  const HomeLoadedEmptyView({
+    super.key,
+    required this.mode,
+    required this.sourceName,
+    required this.onRetry,
+    required this.onInstallSources,
+    this.cloudflareUrl,
+    this.onSolveCloudflare,
+    this.offline = false,
+    this.isMetadataProvider = false,
+    this.rateLimitedSeconds,
+  });
+
+  final ContentMode mode;
+  final String sourceName;
+
+  /// Whether [sourceName] is a metadata catalogue (AniList, TMDB…) rather than
+  /// an installed source. They fail the same way but the remedy differs, and
+  /// telling someone to "switch source at the top" when the catalogue is down
+  /// points at a control that has nothing to do with it.
+  final bool isMetadataProvider;
+
+  /// Seconds until it will answer again, when the failure was a rate limit.
+  final int? rateLimitedSeconds;
+  final VoidCallback onRetry;
+
+  /// Nothing reached the network. Takes priority over the no-sources guide:
+  /// offering to install extensions is useless advice when the problem is the
+  /// connection, and it is the wrong thing to blame.
+  final bool offline;
+  final VoidCallback onInstallSources;
+
+  /// Non-null when the active source is blocked by a Cloudflare challenge;
+  /// [onSolveCloudflare] opens the visible solve WebView and reloads after.
+  final String? cloudflareUrl;
+  final Future<void> Function()? onSolveCloudflare;
+
+  @override
+  Widget build(BuildContext context) {
+    // A Cloudflare block takes priority over the no-sources guide: the source
+    // IS installed, it's just gated behind a challenge the user can solve.
+    if (cloudflareUrl != null && onSolveCloudflare != null) {
+      return _SourceUnavailable(
+        sourceName: sourceName,
+        onRetry: onRetry,
+        onSolveCloudflare: onSolveCloudflare,
+      );
+    }
+    if (offline) {
+      return _SourceUnavailable(
+        sourceName: sourceName,
+        onRetry: onRetry,
+        offline: true,
+      );
+    }
+    // Metadata catalogue (Z Mode) browses AniList/TMDB/MAL — installed
+    // streaming extensions are only needed at play time, so an empty home
+    // here means the catalogue fetch failed, not "nothing installed". His
+    // guard, kept on top of this screen.
+    if (!ZModePrefs.enabled && !hasSourcesFor(mode)) {
+      return _NoSourcesGuide(mode: mode, onBrowse: onInstallSources);
+    }
+    return _SourceUnavailable(
+      sourceName: sourceName,
+      onRetry: onRetry,
+      offline: offline,
+      isMetadataProvider: isMetadataProvider,
+      rateLimitedSeconds: rateLimitedSeconds,
+    );
+  }
+}
+
+/// Friendly "nothing installed for this mode yet" state — a mode-aware icon in
+/// a soft accent circle, a warm one-liner, and a single rounded button into
+/// Providers. Replaces the bare [EmptyState] so an empty manga/novel/streaming
+/// home reads as "let's set this up" rather than an error.
+class _NoSourcesGuide extends StatelessWidget {
+  const _NoSourcesGuide({required this.mode, required this.onBrowse});
+
+  final ContentMode mode;
+  final VoidCallback onBrowse;
+
+  @override
+  Widget build(BuildContext context) {
+    final label = mode.label; // Streaming / Manga / Novel
+    final (icon, noun) = switch (mode) {
+      ContentMode.anime => (Icons.live_tv_rounded, 'shows'),
+      ContentMode.manga => (Icons.auto_stories_rounded, 'manga'),
+      ContentMode.novel => (Icons.menu_book_rounded, 'novels'),
+    };
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(40, 24, 40, 48),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 104,
+              height: 104,
+              decoration: BoxDecoration(
+                color: AppColors.accent.withValues(alpha: 0.12),
+                shape: BoxShape.circle,
+              ),
+              child: Icon(icon, size: 46, color: AppColors.accent),
+            ),
+            const SizedBox(height: 22),
+            Text(
+              'No $label sources yet',
+              textAlign: TextAlign.center,
+              style: AppText.headline.copyWith(fontSize: 20),
+            ),
+            const SizedBox(height: 10),
+            Text(
+              'Add a source from Providers and your $noun will show up here.',
+              textAlign: TextAlign.center,
+              style: AppText.body.copyWith(
+                color: AppColors.textSecondary,
+                height: 1.4,
+              ),
+            ),
+            const SizedBox(height: 26),
+            FilledButton.icon(
+              onPressed: onBrowse,
+              icon: const Icon(Icons.add_rounded, size: 20),
+              label: Text(context.l10n.browseSources),
+              style: FilledButton.styleFrom(
+                backgroundColor: AppColors.accent,
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 26,
+                  vertical: 13,
+                ),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(28),
+                ),
+                textStyle: AppText.button.copyWith(color: Colors.white),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Shown on Home when the active source finished loading but returned no rows —
+/// typically a dead/blocked site. Offers a retry and points to the source
+/// switcher. Continue Watching (app-side) still renders above this.
+class _SourceUnavailable extends StatelessWidget {
+  const _SourceUnavailable({
+    required this.sourceName,
+    required this.onRetry,
+    this.onSolveCloudflare,
+    this.offline = false,
+    this.isMetadataProvider = false,
+    this.rateLimitedSeconds,
+  });
+
+  final String sourceName;
+  final VoidCallback onRetry;
+
+  /// See [HomeLoadedEmptyView.isMetadataProvider].
+  final bool isMetadataProvider;
+
+  /// See [HomeLoadedEmptyView.rateLimitedSeconds].
+  final int? rateLimitedSeconds;
+
+  /// The request never left the device. Says so instead of blaming the source
+  /// — telling someone in a tunnel that their extension is down is how people
+  /// end up reinstalling working extensions.
+  final bool offline;
+
+  /// When set, this is a Cloudflare block (not a generic outage): show a shield
+  /// + a primary "Solve Cloudflare" action that opens the visible solve WebView.
+  final Future<void> Function()? onSolveCloudflare;
+
+  static const Color _cloudflareOrange = Color(0xFFF48120);
+
+  @override
+  Widget build(BuildContext context) {
+    final isCloudflare = onSolveCloudflare != null;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(36, 40, 36, 56),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Container(
+            width: 88,
+            height: 88,
+            decoration: BoxDecoration(
+              color: isCloudflare
+                  ? _cloudflareOrange.withValues(alpha: 0.14)
+                  : AppColors.surface,
+              shape: BoxShape.circle,
+            ),
+            child: Icon(
+              isCloudflare
+                  ? Icons.shield_rounded
+                  : offline
+                  ? Icons.wifi_off_rounded
+                  : Icons.cloud_off_rounded,
+              size: 40,
+              color: isCloudflare ? _cloudflareOrange : AppColors.textTertiary,
+            ),
+          ),
+          const SizedBox(height: 20),
+          Text(
+            isCloudflare
+                ? '$sourceName is protected by Cloudflare'
+                : offline
+                ? context.l10n.offlineTitle
+                : rateLimitedSeconds != null
+                ? context.l10n.providerNeedsBreather(sourceName)
+                : isMetadataProvider
+                ? context.l10n.providerHavingAMoment(sourceName)
+                : context.l10n.sourceNotAnswering(sourceName),
+            textAlign: TextAlign.center,
+            style: const TextStyle(
+              color: AppColors.textPrimary,
+              fontSize: 18,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          const SizedBox(height: 10),
+          Text(
+            isCloudflare
+                ? 'Complete the Cloudflare check once and this source will '
+                      'load normally from then on.'
+                : offline
+                ? "Nothing could reach the network. Check your connection "
+                      "and try again — $sourceName is probably fine."
+                : rateLimitedSeconds != null
+                ? context.l10n.providerNeedsBreatherBody(rateLimitedSeconds!)
+                : isMetadataProvider
+                ? context.l10n.providerHavingAMomentBody
+                : context.l10n.sourceNotAnsweringBody,
+            textAlign: TextAlign.center,
+            style: const TextStyle(
+              color: AppColors.textSecondary,
+              fontSize: 14,
+              height: 1.45,
+            ),
+          ),
+          const SizedBox(height: 24),
+          if (isCloudflare) ...[
+            ElevatedButton.icon(
+              onPressed: () => onSolveCloudflare!(),
+              icon: const Icon(Icons.shield_rounded, size: 20),
+              label: Text(context.l10n.solveCloudflare),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: _cloudflareOrange,
+                foregroundColor: Colors.white,
+                elevation: 0,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 30,
+                  vertical: 13,
+                ),
+                textStyle: const TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w600,
+                ),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(26),
+                ),
+              ),
+            ),
+            const SizedBox(height: 6),
+            TextButton.icon(
+              onPressed: onRetry,
+              icon: const Icon(Icons.refresh_rounded, size: 18),
+              label: Text(context.l10n.retry),
+              style: TextButton.styleFrom(
+                foregroundColor: AppColors.textSecondary,
+              ),
+            ),
+          ] else
+            ElevatedButton.icon(
+              onPressed: onRetry,
+              icon: const Icon(Icons.refresh_rounded, size: 20),
+              label: Text(context.l10n.retry),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: AppColors.accent,
+                foregroundColor: Colors.white,
+                elevation: 0,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 30,
+                  vertical: 13,
+                ),
+                textStyle: const TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w600,
+                ),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(26),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// The reader `_resumeReading` pushes for a resumed
+/// [ReadEntry]: [MangaReaderScreen] for [ProviderType.manga], otherwise
+/// [NovelReaderScreen] (novel, and [ReadEntry.type]'s legacy-row default).
+/// Pulled out as a plain top-level function so the routing decision is
+/// testable without pumping the whole [HomeScreen] (whose initState makes a
+/// real update-check network call and opens community/announcement Hive
+/// boxes).
+Widget readerFor(ReadEntry e, Episode chapter) {
+  if (e.type == ProviderType.manga) {
+    return MangaReaderScreen(
+      sourceId: e.sourceId,
+      showId: e.showId,
+      showTitle: e.title,
+      cover: e.cover,
+      chapters: [chapter],
+      startIndex: 0,
+      resolveChapters: true,
+    );
+  }
+  return NovelReaderScreen(
+    sourceId: e.sourceId,
+    showId: e.showId,
+    showTitle: e.title,
+    cover: e.cover,
+    chapters: [chapter],
+    startIndex: 0,
+    resolveChapters: true,
+  );
+}
+
+/// The "nothing is being recorded" badge, shown only while incognito is on.
+///
+/// Accent-tinted, not grey. It marks an ACTIVE mode, and in this app's colour
+/// language grey-on-grey is what a disabled control looks like — the opposite
+/// of what this means. It also has to hold its own beside the wordmark and
+/// four actions, which a low-contrast pill wedged against the logo did not.
+///
+/// Tap anywhere on it to leave incognito.
+class _IncognitoChip extends StatelessWidget {
+  const _IncognitoChip();
+
+  @override
+  Widget build(BuildContext context) => ValueListenableBuilder<bool>(
+    valueListenable: IncognitoMode.notifier,
+    builder: (context, on, _) {
+      if (!on) return const SizedBox.shrink();
+      final l10n = context.l10n;
+      return Padding(
+        // Its own breathing room. The old chip carried a right margin only, so
+        // it sat flush against the wordmark.
+        padding: const EdgeInsets.only(left: 10, right: 6),
+        child: Tooltip(
+          message: l10n.incognitoMode,
+          child: GestureDetector(
+            onTap: () => IncognitoMode.set(false),
+            behavior: HitTestBehavior.opaque,
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                color: AppColors.accentSoft,
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(
+                  color: AppColors.accent.withValues(alpha: 0.35),
+                ),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 6,
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.visibility_off_rounded,
+                      size: 14,
+                      color: AppColors.accent,
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      l10n.incognito,
+                      style: TextStyle(
+                        fontFamily: AppText.fontFamily,
+                        fontFamilyFallback: AppText.fontFamilyFallback,
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w700,
+                        letterSpacing: 0.2,
+                        color: AppColors.accent,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+    },
+  );
+}
