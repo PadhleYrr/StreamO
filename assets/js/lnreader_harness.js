@@ -1,0 +1,271 @@
+// LNReader harness: an async fetch bridge + a require() shim so a real
+// LNReader plugin (CommonJS) runs unmodified in QuickJS. Loaded AFTER the
+// cheerio bundle (which sets globalThis.__cheerio / __htmlparser2).
+//
+// The JS<->Dart message channel (sendMessage/onMessage) only works on a real
+// device, not on the host QuickJS FFI runtime — so fetch goes through an
+// outbox the Dart driver polls with __drainOutbox() and answers with
+// __resolveFetch(id, json). See LnReaderRuntime.call() for the driver loop.
+
+globalThis.__pendingFetch = {};
+globalThis.__fetchSeq = 0;
+globalThis.__outbox = [];
+globalThis.__drainOutbox = function () {
+  var o = globalThis.__outbox;
+  globalThis.__outbox = [];
+  return JSON.stringify(o);
+};
+globalThis.__resolveFetch = function (id, json) {
+  var p = globalThis.__pendingFetch[id];
+  if (!p) return;
+  delete globalThis.__pendingFetch[id];
+  try { p.resolve(JSON.parse(json)); } catch (e) { p.reject(e); }
+};
+globalThis.__rejectFetch = function (id, msg) {
+  var p = globalThis.__pendingFetch[id];
+  if (!p) return;
+  delete globalThis.__pendingFetch[id];
+  p.reject(new Error(msg));
+};
+// Minimal FormData — QuickJS ships none. Madara-template novel plugins (WBNovel
+// & co.) do `new FormData()` in parseNovel to POST the chapter list to
+// wp-admin/admin-ajax.php; without it they throw "'FormData' is not defined"
+// the moment you OPEN a novel (the list browses fine, the novel won't read).
+// We just hold the appended fields; __rawFetch serialises them below.
+function __FormData() { this.__fd = []; }
+__FormData.prototype.append = function (k, v) { this.__fd.push([String(k), String(v)]); };
+__FormData.prototype.set = function (k, v) {
+  for (var i = 0; i < this.__fd.length; i++) {
+    if (this.__fd[i][0] === String(k)) { this.__fd[i][1] = String(v); return; }
+  }
+  this.append(k, v);
+};
+__FormData.prototype.get = function (k) {
+  for (var i = 0; i < this.__fd.length; i++) if (this.__fd[i][0] === String(k)) return this.__fd[i][1];
+  return null;
+};
+__FormData.prototype.has = function (k) { return this.get(k) !== null; };
+__FormData.prototype.delete = function (k) {
+  this.__fd = this.__fd.filter(function (e) { return e[0] !== String(k); });
+};
+globalThis.FormData = __FormData;
+
+// A couple of plugins (ixdzs8, rainofsnow) call the bare global fetch()
+// instead of importing @libs/fetch. QuickJS has no fetch, so they'd throw
+// mid-call; point it at the same bridge.
+if (!globalThis.fetch) globalThis.fetch = function (url, init) { return fetchApi(url, init); };
+
+// Minimal Headers — QuickJS ships none either (the runtime is built with
+// xhr: false, which skips flutter_js's fetch polyfill). The mtlnovel family
+// builds its request headers with `new Headers()` on every call, and readfrom
+// does it in its constructor, so without this they throw "Headers is not
+// defined" before a single request. Names match case-insensitively, but the
+// spelling the plugin used is what goes out, so a plugin's 'User-Agent'
+// replaces the default one instead of riding next to it.
+function __Headers(init) {
+  this.__h = {};
+  if (!init) return;
+  var self = this;
+  if (init instanceof __Headers) {
+    for (var n in init.__h) this.__h[n] = [init.__h[n][0], init.__h[n][1]];
+  } else if (Array.isArray(init)) {
+    init.forEach(function (e) { self.append(e[0], e[1]); });
+  } else {
+    for (var k in init) {
+      if (Object.prototype.hasOwnProperty.call(init, k)) this.append(k, init[k]);
+    }
+  }
+}
+__Headers.prototype.append = function (k, v) {
+  var n = String(k).toLowerCase();
+  var e = this.__h[n];
+  this.__h[n] = e ? [e[0], e[1] + ', ' + String(v)] : [String(k), String(v)];
+};
+__Headers.prototype.set = function (k, v) {
+  this.__h[String(k).toLowerCase()] = [String(k), String(v)];
+};
+__Headers.prototype.get = function (k) {
+  var e = this.__h[String(k).toLowerCase()];
+  return e ? e[1] : null;
+};
+__Headers.prototype.has = function (k) {
+  return Object.prototype.hasOwnProperty.call(this.__h, String(k).toLowerCase());
+};
+__Headers.prototype.delete = function (k) { delete this.__h[String(k).toLowerCase()]; };
+__Headers.prototype.forEach = function (cb, thisArg) {
+  for (var n in this.__h) cb.call(thisArg, this.__h[n][1], n, this);
+};
+globalThis.Headers = __Headers;
+
+function __rawFetch(url, init) {
+  init = init || {};
+  // A Headers object would cross the JSON outbox as {} and the request would
+  // go out without any of them — flatten it to the plain map Dart reads.
+  if (init.headers instanceof __Headers) {
+    var flat = {};
+    for (var hn in init.headers.__h) flat[init.headers.__h[hn][0]] = init.headers.__h[hn][1];
+    var copy = {};
+    for (var ik in init) copy[ik] = init[ik];
+    copy.headers = flat;
+    init = copy;
+  }
+  // A FormData body can't cross the JSON outbox — serialise it to
+  // x-www-form-urlencoded (WordPress admin-ajax reads $_POST identically to a
+  // multipart post for these plain string fields).
+  if (init.body instanceof __FormData) {
+    var parts = [];
+    var fd = init.body.__fd;
+    for (var i = 0; i < fd.length; i++) {
+      parts.push(encodeURIComponent(fd[i][0]) + '=' + encodeURIComponent(fd[i][1]));
+    }
+    var headers = {};
+    var src = init.headers || {};
+    for (var h in src) headers[h] = src[h];
+    if (!headers['Content-Type'] && !headers['content-type']) {
+      headers['Content-Type'] = 'application/x-www-form-urlencoded';
+    }
+    init = { method: init.method || 'POST', headers: headers, body: parts.join('&') };
+  }
+  return new Promise(function (resolve, reject) {
+    var id = ++globalThis.__fetchSeq;
+    globalThis.__pendingFetch[id] = { resolve: resolve, reject: reject };
+    globalThis.__outbox.push({ id: id, url: String(url), init: init });
+  });
+}
+// Response headers, for the seven plugins that read one.
+function __headers(raw) {
+  return new __Headers(raw);
+}
+
+function fetchApi(url, init) {
+  return __rawFetch(url, init).then(function (r) {
+    return {
+      ok: r.status >= 200 && r.status < 300,
+      status: r.status,
+      url: r.url || String(url),
+      // Header names are case-insensitive per HTTP, and plugins spell them
+      // inconsistently — one source reads 'X-WP-TotalPages', another
+      // 'X-Wp-Totalpages' for the same header. Match on lowercase or half of
+      // them would still read null.
+      headers: __headers(r.headers),
+      text: function () { return Promise.resolve(r.body); },
+      json: function () { return Promise.resolve(JSON.parse(r.body)); },
+    };
+  });
+}
+
+// LNReader's fetchText: the body as a string, or '' when the request fails or
+// the status isn't 2xx — that is the contract kakuyomu, lnori, linovelib and
+// the other plugins that call it are written against. The optional encoding
+// argument is ignored because the body reaches us already decoded by Dart.
+function fetchText(url, init) {
+  return fetchApi(url, init).then(
+    function (r) { return r.ok ? r.text() : ''; },
+    function () { return ''; }
+  );
+}
+
+// ── @libs + node-module shims LNReader plugins require() ─────────────────────
+
+// Defined once and handed out under every name LNReader exposes them by:
+// the older '@libs/novelStatus' + '@libs/defaultCover', and the newer
+// '@/types/constants' that re-exports both. Newer plugins (Novel Fire,
+// Novel Phoenix) import the latter, and an unknown module name throws at
+// LOAD time — before a single request — which surfaces as the misleading
+// "source isn't responding".
+var __NOVEL_STATUS = {
+  Unknown: 'Unknown', Ongoing: 'Ongoing', Completed: 'Completed',
+  Licensed: 'Licensed', PublishingFinished: 'Publishing Finished',
+  Cancelled: 'Cancelled', OnHiatus: 'On Hiatus',
+  STUB: 'STUB', Inactive: 'Inactive',
+};
+var __DEFAULT_COVER = 'https://placehold.co/300x400';
+
+// A storage object with LNReader's shape. In-memory only and NOT persisted
+// across runs — enough for plugins that cache an id mid-session, not enough
+// for anything that expects it to survive a restart.
+function __memStore() {
+  var data = {};
+  return {
+    get: function (k) { return data[k]; },
+    set: function (k, v) { data[k] = v; },
+    delete: function (k) { delete data[k]; },
+    clearAll: function () { data = {}; },
+    getAllKeys: function () { return Object.keys(data); },
+  };
+}
+
+function __require(name) {
+  switch (name) {
+    case 'cheerio': return globalThis.__cheerio;
+    case 'htmlparser2': return globalThis.__htmlparser2;
+    // dayjs (pre-extended with customParseFormat/relativeTime/utc in the bundle).
+    // Madara-template plugins (e.g. WBNovel) require('dayjs') at load time; without
+    // it they throw 'unknown module: dayjs' before any fetch → "isn't responding".
+    case 'dayjs': return globalThis.__dayjs;
+    case '@libs/fetch': return { fetchApi: fetchApi, fetchText: fetchText, fetchFile: fetchApi };
+    case '@libs/novelStatus': return { NovelStatus: __NOVEL_STATUS };
+    case '@libs/isAbsoluteUrl': return { isUrlAbsolute: function (u) { return /^https?:\/\//.test(u); } };
+    case '@libs/defaultCover': return { defaultCover: __DEFAULT_COVER };
+    // Newer path that re-exports both of the above.
+    case '@/types/constants':
+      return { NovelStatus: __NOVEL_STATUS, defaultCover: __DEFAULT_COVER };
+    // AES-GCM, from the same @noble/ciphers the real LNReader uses (bundled
+    // as __aesGcm). WTR-LAB decrypts its chapter payloads with it.
+    case '@libs/aes': return { gcm: globalThis.__aesGcm };
+    // All three are no-op stores (nothing persists), but they must at least
+    // carry the get/set shape: RLIB calls localStorage.get() at LOAD time and
+    // died on a bare {}.
+    case '@libs/storage': return {
+      storage: __memStore(), localStorage: __memStore(), sessionStorage: __memStore(),
+    };
+    case '@libs/filterInputs': return { FilterTypes: {} };
+    default: throw new Error('unknown module: ' + name);
+  }
+}
+
+globalThis.__lnplugins = globalThis.__lnplugins || {};
+
+// Loads a CommonJS plugin source, stores the instance in __lnplugins[id],
+// returns its `name` (or throws if it has no default export).
+globalThis.__loadPlugin = function (id, src) {
+  var module = { exports: {} };
+  var fn = new Function('module', 'exports', 'require', src);
+  fn(module, module.exports, __require);
+  var plugin = module.exports.default;
+  if (!plugin) throw new Error('NO_DEFAULT_EXPORT');
+  globalThis.__lnplugins[id] = plugin;
+  return plugin.name || id;
+};
+
+// Invokes plugin[method](...args) and resolves to a JSON string of the
+// result (JSON.stringify(null) for undefined, so the Dart side always gets
+// valid JSON to decode).
+globalThis.__callPlugin = function (pluginId, method, argsJson) {
+  var plugin = globalThis.__lnplugins[pluginId];
+  if (!plugin) return Promise.reject(new Error('unknown plugin: ' + pluginId));
+  var fn = plugin[method];
+  if (typeof fn !== 'function') return Promise.reject(new Error('unknown method: ' + method));
+  var args = JSON.parse(argsJson);
+  return Promise.resolve(fn.apply(plugin, args)).then(function (r) {
+    return JSON.stringify(r === undefined ? null : r);
+  });
+};
+
+// Evicts a loaded plugin so a later __loadPlugin() with different source
+// isn't shadowed by the old instance.
+globalThis.__unloadPlugin = function (id) {
+  if (globalThis.__lnplugins) delete globalThis.__lnplugins[id];
+};
+
+// Plugin metadata for the Dart side (default filters, site, etc).
+globalThis.__pluginInfo = function (pluginId) {
+  var plugin = globalThis.__lnplugins[pluginId];
+  if (!plugin) throw new Error('unknown plugin: ' + pluginId);
+  return JSON.stringify({
+    name: plugin.name,
+    site: plugin.site,
+    version: plugin.version,
+    filters: plugin.filters,
+  });
+};
