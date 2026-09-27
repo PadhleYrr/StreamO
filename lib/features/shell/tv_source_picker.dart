@@ -1,0 +1,290 @@
+import 'dart:async';
+
+import 'package:flutter/material.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
+
+import '../../core/di/injector.dart';
+import '../../core/ui/source_icon_tile.dart';
+import '../../core/platform/apple_tv.dart';
+import '../../core/provider/provider_manager.dart';
+import '../../core/provider/provider_registry.dart';
+import '../../core/state/active_source_cubit.dart';
+import '../../core/theme/app_colors.dart';
+import '../../core/theme/app_text.dart';
+import '../../core/tv/tv_list_focusable.dart';
+import '../../core/ui/source_switcher.dart';
+
+/// Full-screen D-pad-navigable source picker for TV.
+///
+/// Opened via [showDialog] from [RootShellTv]. On OK the active source is
+/// updated via [ActiveSourceCubit] and the dialog closes. BACK closes without
+/// changing the source (the Dialog barrier handles dismissal).
+///
+/// Data comes from [categorizedSources()] — same bucket function the phone
+/// uses, so newly-installed providers appear here automatically.
+/// The list is grouped (Anime / Movies & Series / NSFW), mirrors the phone's
+/// "All" tab layout, with each source row wrapped in [TvListFocusable].
+class TvSourcePicker extends StatelessWidget {
+  const TvSourcePicker({
+    super.key,
+    required this.currentId,
+    this.onPick,
+    this.onAutoResolve,
+    this.autoSelected = false,
+  });
+
+  final String currentId;
+
+  /// When set, choosing a row calls this and closes the dialog without
+  /// changing [ActiveSourceCubit] — used by Z Mode's per-title source selector.
+  final ValueChanged<String>? onPick;
+
+  /// When set, an "Auto Resolve" row is shown above the source list — Z
+  /// Mode's per-title selector only. Picking it sweeps every candidate for
+  /// this title instead of asking one fixed source.
+  final VoidCallback? onAutoResolve;
+
+  /// True when Auto Resolve is the active pick — highlights that row's check
+  /// mark instead of any source row's.
+  final bool autoSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    final buckets = categorizedSources();
+    final rows = <_PickerRow>[];
+
+    void addSection(
+        String header,
+        List<({String id, String label, String? repo, String? icon})> sources) {
+      if (sources.isEmpty) return;
+      rows.add(_PickerRow.header(header));
+      for (final s in sources) {
+        rows.add(_PickerRow.source(s.id, s.label, s.repo, s.icon));
+      }
+    }
+
+    addSection('Anime', buckets.anime);
+    addSection('Movies & Series', buckets.movies);
+    addSection('NSFW', buckets.nsfw);
+
+    if (rows.isEmpty) {
+      rows.add(_PickerRow.header('No enabled sources'));
+    }
+
+    // Index of the currently-active source row, used for autofocus so D-pad
+    // focus lands on the current selection when the picker opens.
+    final activeIndex = rows.indexWhere((r) => r.sourceId == currentId);
+
+    return Dialog(
+      backgroundColor: AppColors.surface,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      insetPadding:
+          const EdgeInsets.symmetric(horizontal: 80, vertical: 48),
+      child: SizedBox(
+        width: 520,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // ── Header ────────────────────────────────────────────────────
+            Padding(
+              padding: const EdgeInsets.fromLTRB(24, 20, 24, 12),
+              child: Text(
+                'Select Source',
+                style: AppText.title.copyWith(color: AppColors.textPrimary),
+              ),
+            ),
+            const Divider(height: 1, color: AppColors.hairline),
+            if (onAutoResolve != null) ...[
+              TvListFocusable(
+                autofocus: autoSelected,
+                semanticLabel: 'Auto Resolve',
+                onTap: () {
+                  onAutoResolve!();
+                  Navigator.of(context).pop();
+                },
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 24, vertical: 14),
+                  child: Row(
+                    children: [
+                      Icon(Icons.auto_awesome_rounded,
+                          color: AppColors.accent, size: 20),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text('Auto Resolve', style: AppText.headline),
+                            Padding(
+                              padding: const EdgeInsets.only(top: 2),
+                              child: Text(
+                                'Try every installed source until one matches',
+                                style: AppText.body.copyWith(
+                                  fontSize: 11.5,
+                                  height: 1.0,
+                                  color: AppColors.textTertiary,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      if (autoSelected)
+                        Icon(Icons.check,
+                            color: AppColors.accent, size: 20),
+                    ],
+                  ),
+                ),
+              ),
+              const Divider(height: 1, color: AppColors.hairline),
+            ],
+            // ── Grouped source list ───────────────────────────────────────
+            Flexible(
+              child: ListView.builder(
+                shrinkWrap: true,
+                itemCount: rows.length,
+                itemBuilder: (context, index) {
+                  final row = rows[index];
+
+                  // Section header — not focusable
+                  if (row.isHeader) {
+                    return Padding(
+                      padding: const EdgeInsets.fromLTRB(24, 14, 24, 6),
+                      child: Text(
+                        row.label.toUpperCase(),
+                        style: AppText.overline
+                            .copyWith(color: AppColors.textTertiary),
+                      ),
+                    );
+                  }
+
+                  final isActive = !autoSelected && row.sourceId == currentId;
+
+                  return TvListFocusable(
+                    // The currently-active row gets autofocus so focus lands
+                    // on it when the picker opens, not on the first item.
+                    autofocus: !autoSelected && index == activeIndex,
+                    semanticLabel: row.label,
+                    onTap: () {
+                      final id = row.sourceId!;
+                      if (onPick != null) {
+                        onPick!(id);
+                        Navigator.of(context).pop();
+                        return;
+                      }
+                      unawaited(_selectSource(context, id));
+                    },
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 24, vertical: 14),
+                      child: Row(
+                        children: [
+                          Padding(
+                            padding: const EdgeInsets.only(right: 14),
+                            child: SourceIconTile(
+                              size: 38,
+                              name: sourceRowName(row.label),
+                              icon: row.icon,
+                            ),
+                          ),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Text(row.label, style: AppText.headline),
+                                if (row.repo != null &&
+                                    row.repo!.isNotEmpty)
+                                  Padding(
+                                    padding: const EdgeInsets.only(top: 2),
+                                    child: Text(
+                                      row.repo!,
+                                      style: AppText.body.copyWith(
+                                        fontSize: 11.5,
+                                        height: 1.0,
+                                        color: AppColors.textTertiary,
+                                      ),
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          ),
+                          // Check mark on the active source row
+                          if (isActive)
+                            Icon(Icons.check,
+                                color: AppColors.accent, size: 20),
+                        ],
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+            const SizedBox(height: 12),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+Future<void> _selectSource(BuildContext context, String sourceId) async {
+  if (isAppleTv) {
+    final ok = await sl<ProviderRegistry>()
+        .ensureRuntimeLoaded(sourceId)
+        .catchError((_) => false);
+    if (!context.mounted) return;
+    if (!ok || sl<ProviderManager>().get(sourceId) == null) {
+      Navigator.of(context).pop();
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Could not load that source on Apple TV'),
+        ),
+      );
+      return;
+    }
+  }
+  if (!context.mounted) return;
+  context.read<ActiveSourceCubit>().setSource(sourceId);
+  Navigator.of(context).pop();
+}
+
+/// Internal model for a row in the picker list.
+/// Either a section [header] (not focusable) or a [source] entry.
+class _PickerRow {
+  const _PickerRow._({
+    required this.label,
+    required this.isHeader,
+    this.sourceId,
+    this.repo,
+    this.icon,
+  });
+
+  factory _PickerRow.header(String label) =>
+      _PickerRow._(label: label, isHeader: true);
+
+  factory _PickerRow.source(
+    String id,
+    String label,
+    String? repo,
+    String? icon,
+  ) => _PickerRow._(
+    label: label,
+    isHeader: false,
+    sourceId: id,
+    repo: repo,
+    icon: icon,
+  );
+
+  final String label;
+  final bool isHeader;
+
+  /// Non-null for source rows, null for headers.
+  final String? sourceId;
+
+  /// The source's logo, when its catalogue or repo index named one.
+  final String? icon;
+  final String? repo;
+}
