@@ -1,0 +1,3446 @@
+import 'dart:async';
+import 'dart:io';
+
+import 'package:dio/dio.dart';
+import 'package:equatable/equatable.dart';
+import 'package:gal/gal.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart'
+    show rootBundle, PlatformException;
+import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:media_kit/media_kit.dart';
+import 'package:media_kit_video/media_kit_video.dart';
+import '../../core/platform/app_paths.dart';
+import 'package:path_provider/path_provider.dart';
+
+import '../../core/app_mode.dart';
+import '../../core/di/injector.dart';
+import '../../core/discord/discord_presence.dart';
+import '../../core/discord/discord_rpc.dart';
+import '../../core/metadata/episode_metadata_service.dart';
+import '../../core/tracker/tracker_hub.dart';
+import '../../core/models/episode.dart';
+import '../../core/models/provider_info.dart';
+import '../../core/models/video_source.dart';
+import '../../core/playback/hls.dart';
+import '../../core/playback/playback_prefs.dart';
+import '../../core/playback/source_health_store.dart';
+import '../../core/playback/filler_service.dart';
+import '../../core/playback/skip_service.dart';
+import '../../core/playback/subtitle_language.dart';
+import '../../core/torrent/torrent_prefs.dart';
+import '../../core/torrent/torrent_service.dart';
+import '../../core/torrent/torrent_util.dart';
+import '../../core/playback/resume_store.dart';
+import '../../core/playback/source_selection.dart';
+import '../../core/playback/title_prefs.dart';
+import '../../core/playback/watch_history.dart';
+import '../../core/playback/subtitle_download_service.dart';
+import '../../core/playback/subtitle_translate_service.dart';
+import '../../core/repository/catalogue_repository.dart';
+import '../../core/repository/source_repository.dart';
+import '../../core/zmode/playback_resolver.dart';
+import '../../core/zmode/source_matcher.dart';
+import '../../core/zmode/zmode_ids.dart';
+import '../watch_together/model/room_state.dart';
+import 'color_profiles.dart';
+import 'shader_presets.dart';
+import 'subtitle_font_service.dart';
+import 'subtitle_style.dart' show libassOutline;
+
+/// The mpv video output (renderer) to create the player with, from the user's
+/// Video renderer setting.
+///
+/// 'auto' is the default and reproduces the expression this replaced exactly —
+/// gpu-next only while Anime4K is on, otherwise null so media_kit picks its own
+/// default (gpu). So an install that never touches the setting behaves as
+/// before. TV returns null either way; it plays through ExoPlayer, not mpv.
+///
+/// mpv can't switch `vo` on a live player, so this is read once per open — a
+/// change only takes effect the next time the player is opened.
+String? _resolveVideoOutput() => resolveVideoOutput(
+  isTv: sl<AppMode>().isTv,
+  choice: sl<PlaybackPrefs>().videoOutput,
+  shaderStyle: sl<PlaybackPrefs>().videoShaderStyle,
+);
+
+/// The decoder to hand media_kit at VideoController creation — Apple only.
+///
+/// media_kit applies its OWN default when this is null, and on Apple that
+/// default lands AFTER [_configureMpv]'s write and replaces it, so the decoder
+/// the user picked never reaches mpv. Passing it here makes our value the one
+/// that gets applied.
+///
+/// Null everywhere else ON PURPOSE. Android's media_kit default is `auto-safe`
+/// — and `no` when it detects an emulator, which is what keeps video working on
+/// emulators. Overriding that would take the emulator fallback away, so Android
+/// keeps exactly the behaviour it ships with today.
+String? _configHwdec() => currentDecoderPlatform == DecoderPlatform.apple
+    ? sl<PlaybackPrefs>().hwdecValue
+    : null;
+
+/// Immutable view-state for the player screen: exactly the fields the UI
+/// rebuilds on. These used to drive `notifyListeners()` on the old
+/// `ChangeNotifier`; they are now emitted by [PlayerCubit].
+///
+/// Live playback values (position/playing/buffering/duration) are NOT here —
+/// the screen still binds those directly off `player.stream.*` so the engine
+/// behaviour is untouched.
+class PlayerState extends Equatable {
+  const PlayerState({
+    this.loadingSources = false,
+    this.error,
+    this.sources = const [],
+    this.active,
+    this.qualities = const [],
+    this.activeQuality,
+    this.currentIndex = 0,
+    this.tracks = const Tracks(),
+    this.torrentPhase,
+  });
+
+  /// True while sources for the current episode are being resolved.
+  final bool loadingSources;
+
+  /// Non-null when sources couldn't be resolved/played (drives the retry UI).
+  final String? error;
+
+  /// Resolved sources for the current episode.
+  final List<VideoSource> sources;
+
+  /// The source currently opened in the engine.
+  final VideoSource? active;
+
+  /// HLS-master quality variants (empty unless a multi-variant master exists).
+  final List<HlsVariant> qualities;
+
+  /// Selected HLS variant; null = Auto (the adaptive master).
+  final HlsVariant? activeQuality;
+
+  /// Index into the episode list of the currently-open episode.
+  final int currentIndex;
+
+  /// Available audio/sub/video tracks for the open media (driven by
+  /// `player.stream.tracks`).
+  final Tracks tracks;
+
+  /// Non-null while a torrent source is being prepared — the human status to
+  /// show as a buffering overlay ("Finding peers…", "Buffering 12%"). Null for
+  /// every non-torrent source, so normal playback is unaffected.
+  final String? torrentPhase;
+
+  PlayerState copyWith({
+    bool? loadingSources,
+    String? Function()? error,
+    List<VideoSource>? sources,
+    VideoSource? Function()? active,
+    List<HlsVariant>? qualities,
+    HlsVariant? Function()? activeQuality,
+    int? currentIndex,
+    Tracks? tracks,
+    String? Function()? torrentPhase,
+  }) => PlayerState(
+    loadingSources: loadingSources ?? this.loadingSources,
+    error: error != null ? error() : this.error,
+    sources: sources ?? this.sources,
+    active: active != null ? active() : this.active,
+    qualities: qualities ?? this.qualities,
+    activeQuality: activeQuality != null ? activeQuality() : this.activeQuality,
+    currentIndex: currentIndex ?? this.currentIndex,
+    tracks: tracks ?? this.tracks,
+    torrentPhase: torrentPhase != null ? torrentPhase() : this.torrentPhase,
+  );
+
+  @override
+  List<Object?> get props => [
+    loadingSources,
+    error,
+    sources,
+    active,
+    qualities,
+    activeQuality,
+    currentIndex,
+    tracks,
+    torrentPhase,
+  ];
+}
+
+/// Owns a media_kit [Player] for one watch session: opens a source with its
+/// headers + subtitles, persists resume position, advances on completion, and
+/// falls through to the next source if one fails to start (covers dead/DRM
+/// sources).
+class PlayerCubit extends Cubit<PlayerState> {
+  PlayerCubit({
+    required this.sourceId,
+    required this.episodes,
+    required this.resume,
+    required Future<List<VideoSource>> Function(String episodeUrl)
+    resolveSources,
+    Future<({List<VideoSource> sources, bool done})> Function(String episodeUrl)?
+    pollSources,
+    required Dio dio,
+    this.history,
+    this.showTitle,
+    this.cover,
+    this.coverHeaders,
+    this.showUrl,
+    this.category,
+    this.malId,
+    this.scrobbleTitle,
+    this.tmdbId,
+    this.tmdbIsTv = false,
+    this.imdbId,
+    this.peek = false,
+    this.availableCategories = const [],
+    this.initialResume = Duration.zero,
+    this.initialSource,
+    this.onDrmSource,
+  }) : _resolveSources = resolveSources,
+       _pollSources = pollSources,
+       _dio = dio,
+       _activeCategory = category ?? 'sub',
+       super(const PlayerState());
+
+  final String sourceId;
+  // Mutable: switching Sub/Dub on a provider that separates the two by episode
+  // DATA (not a /sub//dub/ URL segment) re-fetches the other category's episode
+  // list and swaps it in (see [switchCategory]).
+  List<Episode> episodes;
+  final ResumeStore resume;
+  final Future<List<VideoSource>> Function(String episodeUrl) _resolveSources;
+
+  /// Reads the links that have arrived since [_resolveSources] returned.
+  /// Optional — null keeps the previous behaviour exactly (one batch, no poll).
+  ///
+  /// The fast resolve returns on the first usable link so playback starts
+  /// quickly, and the rest keep resolving natively instead of being cancelled.
+  /// This picks those up so the Sources sheet ends up complete without the
+  /// player having waited for them. `done` reports that no more are coming.
+  final Future<({List<VideoSource> sources, bool done})> Function(
+    String episodeUrl,
+  )?
+  _pollSources;
+  final Dio _dio;
+
+  // Optional show-context for writing the Continue Watching history feed.
+  final WatchHistory? history;
+  final String? showTitle;
+  final String? cover;
+  final Map<String, String>? coverHeaders;
+  final String? showUrl;
+
+  /// MyAnimeList id for the show (anime), when known. Drives AniList
+  /// auto-scrobble: each episode is pushed once it crosses 92%.
+  final int? malId;
+
+  /// Anime title used to resolve the AniList entry when [malId] is absent (old
+  /// provider / AllAnime). Non-null only for anime — gates scrobbling.
+  final String? scrobbleTitle;
+
+  /// TMDB id (movies/series) for Simkl tracking; [tmdbIsTv] selects namespace.
+  final int? tmdbId;
+  final bool tmdbIsTv;
+
+  /// Opened as a look-ahead (or look-back) rather than as the current place:
+  /// nothing is persisted. Guards [_persist], which is the one funnel for the
+  /// resume mark, the Continue Watching entry AND the tracker scrobble, plus
+  /// [_markWatching] so a peek can't flip the title to "watching" either.
+  final bool peek;
+
+  /// IMDb id (movies/series) for Simkl tracking when no TMDB id is exposed.
+  final String? imdbId;
+
+  /// Episode indices already scrobbled this session (fire once per episode).
+  final Set<int> _scrobbled = {};
+
+  /// Called instead of opening a source in mpv when that source is DRM-encrypted
+  /// (clearkey CENC/DASH). mpv can't decrypt DRM, so the host screen hands off to
+  /// the ExoPlayer-backed [DrmPlayerScreen]. Null on screens with no handoff
+  /// (e.g. watch-together), where a DRM source just fails as before.
+  final void Function(VideoSource drm)? onDrmSource;
+
+  /// The category (sub/dub) the session launched in. The LIVE category (which
+  /// the user can flip mid-session) is [_activeCategory] — `category` is just
+  /// the launch value.
+  final String? category;
+
+  /// Sub/Dub categories this title offers (e.g. `['sub','dub']`). When length
+  /// <= 1 the player treats the source as single-category (no Version switch).
+  /// AllAnime sub/dub are DIFFERENT streams — switching re-resolves the OTHER
+  /// category's URL for the current episode (see [_episodeUrl]).
+  final List<String> availableCategories;
+
+  /// Fallback resume position from the launch site — the saved position of the
+  /// Continue Watching entry the user tapped. Applied only on the first open
+  /// and only when the [ResumeStore] lookup MISSES, which happens when a
+  /// provider hands back a different opaque episode `data` id than the one we
+  /// saved (so the per-episode key no longer matches and we'd start from 0
+  /// despite knowing exactly where the user left off). Zeroed after use so
+  /// later source/quality switches keep the live position instead.
+  Duration initialResume;
+
+  /// A mirror the user picked on the episode list, to open instead of the
+  /// adaptive default. Cleared after the first open, so later episodes and
+  /// source switches behave normally.
+  ///
+  /// Held as the source itself rather than a saved label. The label round-trip
+  /// isn't reliable here: the player re-resolves after the pick, the fast path
+  /// returns as soon as it has one usable link, and a mirror that was in the
+  /// picker can be missing from that second list. The exact match then fails
+  /// and [_preferredSource]'s language fallback quietly opens a different
+  /// server — picking vidplay and landing on vidstream.
+  VideoSource? initialSource;
+
+  /// Watch Together: `none` for all normal playback (the hooks below are inert).
+  RoomRole roomRole = RoomRole.none;
+
+  /// Host-mode only: notified on local play/pause/seek/episode so the room can
+  /// broadcast. Null (and never set) outside a room — zero effect on normal use.
+  void Function(String event, Duration pos)? onLocalPlayback;
+
+  /// The currently-playing category. Re-resolving sources rewrites the
+  /// episode URL's `/sub/` ↔ `/dub/` segment to this. Persisted per-title.
+  String _activeCategory;
+
+  final Player player = Player(
+    configuration: PlayerConfiguration(
+      // Render subtitles via mpv/libass (real ASS styling — fonts, positions,
+      // karaoke, signs) when the user opts in. media_kit then draws subs into
+      // the video texture and hides its Flutter overlay. The Android font is
+      // libass's fallback (system fonts aren't visible to libass on Android);
+      // _setupSubtitleFonts / applySubtitleStyle refine sub-fonts-dir/sub-font
+      // after open. Off → default Player() behaviour (Flutter text overlay).
+      libass: sl<PlaybackPrefs>().styledSubtitles,
+      libassAndroidFont: 'assets/fonts/NotoSans-Regular.ttf',
+      libassAndroidFontName: 'Noto Sans',
+    ),
+  );
+  late final VideoController videoController = VideoController(
+    player,
+    configuration: VideoControllerConfiguration(
+      // Pin hardware decoding (media_kit's default, made explicit) — smoother
+      // high-res playback + less battery/heat. media_kit auto-falls back to
+      // software decode if the device can't hardware-decode a codec.
+      enableHardwareAcceleration: true,
+      // Apple only — see [_configHwdec]. Null on Android, which keeps
+      // media_kit's own default (and its emulator fallback) exactly as before.
+      hwdec: _configHwdec(),
+      // Attach the Android render surface only once the video's dimensions are
+      // known, so it isn't created then resized on the first frame — kills the
+      // black-frame/resize hitch at playback start.
+      androidAttachSurfaceAfterVideoParameters: true,
+      // Render video through the older SurfaceTexture path instead of the newer
+      // SurfaceProducer (the media_kit default). SurfaceProducer paces frames on
+      // Flutter's own vsync loop, which pins the panel at the UI's max refresh
+      // (120Hz) all through playback — the "fps lock" regression vs 1.8.0, which
+      // predated SurfaceProducer. SurfaceTexture is producer-paced (mpv's real
+      // frame timing), so the panel follows the video's fps again like 1.8.0.
+      enableAndroidSurfaceProducer: false,
+      // Route video enhancement (GLSL upscaling) through mpv's gpu-next renderer,
+      // which maps to gpu-api=vulkan,opengl — far more efficient for shaders than
+      // the default gpu (OpenGL) path, so upscaling stays smooth. ONLY when
+      // enhancement is on (opt-in), so default playback is byte-identical. This
+      // is creation-time (mpv can't switch vo live), so it's read here per open.
+      vo: _resolveVideoOutput(),
+      // TV-ONLY: cap the video OUTPUT to 720p. On old TVs the frame is still
+      // hardware-decoded, but the weak GPU chokes compositing a full 1080p/4K
+      // texture every frame → visible playback lag. Capping the render size is
+      // media_kit's documented performance lever ("substantial performance
+      // improvements if a small width & height is specified"). Phones are
+      // untouched — null keeps full-resolution output as before.
+      width: sl<AppMode>().isTv ? 1280 : null,
+      height: sl<AppMode>().isTv ? 720 : null,
+    ),
+  );
+
+  /// Bumped whenever the subtitle style changes (or a source opens). The player
+  /// screen listens to rebuild the Video's [SubtitleViewConfiguration] — media_kit
+  /// renders text subs via a Flutter overlay, so styling lives there, NOT in
+  /// mpv's sub-* properties.
+  final ValueNotifier<int> subtitleStyleRev = ValueNotifier<int>(0);
+
+  /// Brief user-facing status (e.g. "Switching server…") the player screen
+  /// shows as a transient toast. Auto-clears after a couple of seconds.
+  final ValueNotifier<String?> toast = ValueNotifier<String?>(null);
+  Timer? _toastTimer;
+  void _toast(String msg, {Duration duration = const Duration(seconds: 2)}) {
+    toast.value = msg;
+    _toastTimer?.cancel();
+    _toastTimer = Timer(duration, () => toast.value = null);
+  }
+
+  /// One-shot mpv tuning, started on first access and awaited before every
+  /// [_open]. Must complete BEFORE `player.open` or its demuxer options (e.g.
+  /// the HLS fake-extension relaxation) don't apply to the file being opened.
+  late final Future<void> _mpvConfigured = _configureMpv();
+
+  VideoSource?
+  _hlsMaster; // the HLS master among `sources` that the quality menu expands
+
+  final List<StreamSubscription> _subs = [];
+  Duration _lastPos = Duration.zero;
+  Duration _lastDur = Duration.zero;
+  bool _playing = true;
+  // The resume position we still need to reach. Set when a resume mark is
+  // applied on open and cleared once playback actually reaches it. While set, a
+  // re-open (e.g. the default-quality switch that fires right after resume, when
+  // _lastPos has only crept to ~1s) must keep targeting it instead of dropping
+  // back to the couple of seconds buffered so far — otherwise resume is lost.
+  Duration _pendingResume = Duration.zero;
+  // Glitch guard: the last ACCEPTED position + its wall-clock, so we can reject
+  // a spurious forward jump (some remote MP4s emit a garbage position mid-seek;
+  // saving it corrupts the mark and makes the title un-resumable). Plus the time
+  // of the last USER seek, which is a legitimate jump we must not reject.
+  Duration _goodPos = Duration.zero;
+  int _goodPosMs = 0;
+  int _userSeekMs = 0;
+  int _lastResumeSeekMs = 0; // throttle for the resume re-seek (anti-thrash)
+  int _lastHistoryMs = 0; // throttle: last wall-clock ms we wrote progress
+  int _gen = 0; // bumped per open; async continuations bail if superseded
+  final Set<String> _tried = {}; // source URLs already attempted this episode
+
+  /// How many times this episode has given up on a SOURCE (not a mirror) and
+  /// swept for another. Each hop is a real scrape, so it is bounded: a library
+  /// where nothing plays should say so rather than walk thirty sources one
+  /// dead link at a time. Reset per episode.
+  int _sourceHops = 0;
+  static const int _maxSourceHops = 3;
+  bool _recovering = false; // debounce: one error-recovery at a time
+  // True once the current source has actually produced playback (position
+  // advanced). libmpv emits transient "connection"/"failed to open" warnings
+  // mid-stream (HLS segment blips, a failed subtitle track) even while video +
+  // audio play fine — once a source is playing we must NOT treat those as a
+  // reason to cycle sources (which spuriously showed "No source could be
+  // played" over working playback and broke the watch-progress scrobble).
+  bool _startedThisSource = false;
+
+  /// True once ANY source has actually produced picture in this player
+  /// session, unlike [_startedThisSource] which resets on every source switch.
+  ///
+  /// Read by [PlayerScreen] to tell the two failures apart: nothing ever
+  /// played (the episode is a dead end — hand the viewer back to Detail with
+  /// an answer) versus playback died partway (they are watching something;
+  /// keep them here with the in-place error and Retry).
+  bool _everStarted = false;
+  bool get everStarted => _everStarted;
+
+  // Stall watchdog: a STARTED source that dies/stalls mid-playback (dead host,
+  // pulled segment) buffers forever — _onPlaybackError won't cycle it (it bails
+  // once started). When buffering persists with no position progress we fail
+  // over to the next untried mirror at the same position.
+  /// Alternate audio tracks parsed out of the master we trimmed, so the player
+  /// can attach one on demand instead of mpv probing every one up front.
+  List<HlsAudioRendition> _audioRenditions = const [];
+
+  /// The one rendition written into the trimmed master — mpv already lists it,
+  /// so it must not also appear as an attachable track.
+  String? _keptAudioUri;
+
+  /// Fetches [s]'s master playlist and, when it names 3+ alternate audio
+  /// tracks, writes a copy carrying just the wanted one. Returns the local
+  /// path, or null to open [s] exactly as before (fewer tracks, fetch failed,
+  /// not a master — every path that isn't a clear win).
+  Future<String?> _trimMasterAudio(VideoSource s) async {
+    try {
+      final resp = await _dio.getUri<String>(
+        Uri.parse(s.url),
+        options: Options(
+          responseType: ResponseType.plain,
+          headers: s.headers,
+          receiveTimeout: const Duration(seconds: 8),
+          validateStatus: (c) => c != null && c < 500,
+        ),
+      );
+      final body = resp.data ?? '';
+      if (!body.trimLeft().startsWith('#EXTM3U')) return null;
+      final auds = parseHlsAudioRenditions(body, s.url);
+      if (auds.length < 3) return null;
+      _audioRenditions = auds;
+      // Keep the language this title was last watched in, so the common case
+      // needs no second fetch. Otherwise the playlist's own DEFAULT, which is
+      // what every other player starts on.
+      final url = showUrl;
+      final want = (url != null && url.isNotEmpty)
+          ? sl<TitlePrefsStore>().audioTrack(sourceId, url)?.toLowerCase()
+          : null;
+      HlsAudioRendition? pick;
+      if (want != null && want.isNotEmpty) {
+        final w = _wantedAudio(want);
+        for (final byName in [true, false]) {
+          for (final a in auds) {
+            final hit = byName
+                ? w.title.isNotEmpty && a.name.toLowerCase() == w.title
+                : w.lang.isNotEmpty && a.lang.toLowerCase() == w.lang;
+            if (hit) {
+              pick = a;
+              break;
+            }
+          }
+          if (pick != null) break;
+        }
+      }
+      pick ??= auds.firstWhere((a) => a.isDefault, orElse: () => auds.first);
+      final text = buildTrimmedMaster(body, s.url, pick.uri);
+      if (text == null) return null;
+      _keptAudioUri = pick.uri;
+      final dir = await getTemporaryDirectory();
+      final f = File('${dir.path}/zg_master_${s.url.hashCode}.m3u8');
+      await f.writeAsString(text);
+      debugPrint(
+        '[audio] ${auds.length} tracks in master, opening with '
+        '${pick.lang.isEmpty ? pick.name : pick.lang} only',
+      );
+      return f.path;
+    } catch (e) {
+      debugPrint('[audio] master trim skipped, opening as-is: $e');
+      return null;
+    }
+  }
+
+  Timer? _stallTimer;
+  Duration _stallAnchorPos = Duration.zero;
+  // Streams served by a local proxy (127.0.0.1 — Aniyomi's Cloudflare video
+  // proxy) buffer on seek while the proxy re-fetches segments through the source
+  // client; that's expected, not a dead source, so the stall watchdog is skipped
+  // for them (mirrors the torrent exemption handled via _activeTorrentId).
+  bool _isProxiedStream = false;
+  // Start watchdog for a DIRECT Aniyomi source: a Cloudflare-walled stream fails
+  // to start without emitting a clean mpv error (it just hangs), so the normal
+  // error-based failover never fires. If a direct Aniyomi source hasn't started
+  // within ~10s we fail over — pickDefault then auto-selects the higher-ranked
+  // "· proxy" version of the same quality. Aniyomi-only + direct-only, so
+  // CloudStream / JS / torrent sources are completely unaffected.
+  Timer? _startTimer;
+  // Fired once per session: mark the anime CURRENT on AniList as soon as
+  // playback starts (so "started watching" shows immediately, not only after
+  // an episode crosses the 92% scrobble threshold).
+  bool _markedWatching = false;
+  bool _defaultRateApplied = false; // default speed applied once per session
+  bool _libassNoticeShown = false; // libass "disable if no subs" hint shown once
+  Timer? _discordPauseTimer;
+  bool _discordPaused = false;
+
+  Episode get currentEpisode => episodes[state.currentIndex];
+
+  /// Stable per-show key for resume (the show URL, falling back to sourceId) so
+  /// episodes with the same id across different shows don't collide.
+  String get _showKey => showUrl ?? sourceId;
+
+  /// The episode URL to resolve sources from, rewritten to the active
+  /// category. Sub/Dub are separate AllAnime streams encoded in the URL
+  /// (`allanime://<id>/sub/<n>` vs `.../dub/<n>`), so switching language means
+  /// resolving the OTHER category's URL. Only rewrites when the title offers
+  /// more than one category AND the URL carries a `/sub/` or `/dub/` segment
+  /// (NetMirror etc. have no such segment → unchanged).
+  String _episodeUrl(Episode ep) {
+    if (availableCategories.length > 1 &&
+        RegExp(r'/(sub|dub)/').hasMatch(ep.url)) {
+      return ep.url.replaceFirst(RegExp(r'/(sub|dub)/'), '/$_activeCategory/');
+    }
+    return ep.url;
+  }
+
+  // ── Sub/Dub (category) switching — the player owns this now (not Detail) ──
+
+  /// Categories this title offers (drives the player's "Version" section).
+  List<String> get categories => availableCategories;
+
+  /// The currently-active category ('sub'/'dub').
+  String get activeCategory => _activeCategory;
+
+  /// Switch the whole session to [cat] (sub ↔ dub). No-op when unchanged or
+  /// not offered. Re-resolves the CURRENT episode in the new language while
+  /// preserving the live position and current index, persists the per-title
+  /// choice, and keeps the rest of the session (incl. playNext) + history in
+  /// [cat].
+  Future<void> switchCategory(String cat) async {
+    if (cat == _activeCategory || !availableCategories.contains(cat)) return;
+    _activeCategory = cat;
+    await sl<TitlePrefsStore>().setCategory(sourceId, showUrl ?? '', cat);
+
+    // Re-resolve the current episode in the new language — like openEpisode but
+    // keeping currentIndex and the live position.
+    final gen = ++_gen;
+    final keepPos = _lastPos;
+    _tried.clear();
+    _sourceHops = 0; // a different cut is a fresh set of sources
+    _recovering = false;
+    emit(
+      state.copyWith(
+        error: () => null,
+        loadingSources: true,
+        sources: const [],
+        active: () => null,
+      ),
+    );
+    try {
+      // Resolve the episode URL for the new language. For providers that encode
+      // sub/dub in the URL (e.g. AllAnime `.../sub/1`) the rewrite below is
+      // enough. Providers that keep SEPARATE episode lists per language (e.g.
+      // CloudStream AniKoto — different opaque `data` per episode) leave the URL
+      // unchanged; for those, re-fetch the other category's episode list and use
+      // the matching episode's data, otherwise dub would just replay the sub.
+      var epUrl = _episodeUrl(currentEpisode);
+      if (epUrl == currentEpisode.url &&
+          (showUrl?.isNotEmpty ?? false)) {
+        final catEps = await sl<CatalogueRepository>()
+            .episodes(showUrl!, sourceId: sourceId, category: cat);
+        if (gen != _gen) return;
+        if (state.currentIndex < catEps.length) {
+          episodes = catEps;
+          epUrl = catEps[state.currentIndex].url;
+        }
+      }
+      final resolved = await _resolveNoted(epUrl);
+      if (gen != _gen) return;
+      emit(state.copyWith(sources: resolved, loadingSources: false));
+      _buildQualityMenu(gen);
+      // prefer: the cut we just switched TO. Without it this takes the
+      // default (sub), so asking for dub on a source that returns BOTH cuts in
+      // one list hands back a sub stream. Harmless where a list carries one
+      // cut — that kind simply has no matches and the whole pool is used, as
+      // before — but the Aniyomi path now produces exactly such mixed lists.
+      final pick = pickDefault(
+        resolved,
+        prefer: cat == 'dub' ? AudioKind.dub : AudioKind.sub,
+        preferQuality: _preferredQuality(),
+      );
+      if (pick == null) {
+        emit(
+          state.copyWith(error: () => 'No playable sources for this episode.'),
+        );
+        return;
+      }
+      await _open(pick, seekTo: keepPos, gen: gen);
+      _applyDefaultQuality();
+      // Same collection after a Sub/Dub switch — it resolves a different
+      // episode URL, so its sheet would otherwise be short of servers too.
+      unawaited(_pollForMoreSources(epUrl));
+    } catch (e) {
+      if (gen != _gen) return;
+      emit(
+        state.copyWith(
+          loadingSources: false,
+          error: () => 'Could not load sources: $e',
+        ),
+      );
+    }
+  }
+
+  /// Picks up the mirrors that finished resolving after playback started, and
+  /// adds them to the Sources list.
+  ///
+  /// Strictly additive and side-effect free: it never touches [state.active],
+  /// never re-picks a default and never reopens anything, so it cannot disturb
+  /// what is playing. Existing entries are kept as the SAME objects — the sheet
+  /// marks the playing row by value equality against `state.active`, and
+  /// rebuilding those could drop the tick off it.
+  ///
+  /// Staleness is judged by EPISODE rather than a generation counter: this runs
+  /// for seconds while `_gen` legitimately advances for unrelated reasons (a
+  /// re-open, a quality switch), and keying on that threw away good results.
+  /// An episode or Sub/Dub switch changes the URL, which does stop it.
+  Future<void> _pollForMoreSources(String epUrl) async {
+    final poll = _pollSources;
+    if (poll == null) return;
+    // Backs off: most providers are done within ~2s, so this is a handful of
+    // cheap reads, not a busy loop. Gives up after the last delay regardless.
+    const delays = [
+      Duration(milliseconds: 900),
+      Duration(seconds: 1),
+      Duration(seconds: 2),
+      Duration(seconds: 3),
+      Duration(seconds: 5),
+    ];
+    for (final d in delays) {
+      await Future<void>.delayed(d);
+      if (isClosed) return;
+      // Still the same episode on screen?
+      if (_episodeUrl(currentEpisode) != epUrl) return;
+      final existing = state.sources;
+      if (existing.isEmpty) return; // reset mid-flight; nothing to add to
+      final result = await poll(epUrl);
+      if (isClosed || _episodeUrl(currentEpisode) != epUrl) return;
+      final seen = existing.map((s) => s.url).toSet();
+      final extra = result.sources.where((s) => seen.add(s.url)).toList();
+      if (extra.isNotEmpty) {
+        emit(state.copyWith(sources: [...state.sources, ...extra]));
+      }
+      if (result.done) return; // nothing more is coming
+    }
+  }
+
+  /// mpv HTTP tuning so remote MP4s (e.g. 4khdhub file hosts) seek/resume
+  /// reliably: force-seekable treats them as seekable even when the host omits
+  /// Accept-Ranges, and the reconnect options recover the connection that many
+  /// hosts drop on a seek (which otherwise restarts playback at 0). HLS already
+  /// seeks fine; this is what lets the MP4 mirrors behave like they do in
+  /// ExoPlayer-based apps.
+  Future<void> _configureMpv() async {
+    final p = player.platform;
+    if (p is NativePlayer) {
+      try {
+        await p.setProperty('force-seekable', 'yes');
+        await p.setProperty(
+          'stream-lavf-o',
+          'reconnect=1,reconnect_streamed=1,'
+              'reconnect_on_network_error=1,reconnect_delay_max=5',
+        );
+        // HLS workarounds for anti-leech CDNs (AnimeSalt/AnimixStream, …):
+        //  • extension_picky=0 + allowed_extensions=ALL — segments are disguised
+        //    with non-media extensions (.js/.css/.woff); FFmpeg 7 otherwise
+        //    rejects them by URL extension (segment bytes are still validated).
+        //  • http_persistent=0 — these CDNs break FFmpeg's HLS keepalive
+        //    ("keepalive request failed … Invalid argument"), which corrupts the
+        //    sub-playlist/segment fetches ("parse_playlist error Invalid data").
+        //    Forcing a fresh connection per request fixes playback.
+        //  • analyzeduration=2000000 (2s) — cap FFmpeg's pre-play stream probe
+        //    so the first frame appears sooner. 2s is ample to detect audio+
+        //    video on normal streams; raise it if a source ever loses a track.
+        await p.setProperty(
+          'demuxer-lavf-o',
+          'extension_picky=0,allowed_extensions=ALL,http_persistent=0,'
+              'analyzeduration=2000000',
+        );
+        // ── Anti-buffering: prefetch a LARGE read-ahead. ──────────────────
+        // mpv's default read-ahead is ~1s, so any CDN/network dip — made worse
+        // by http_persistent=0's per-segment reconnects — stalls playback
+        // instantly. Buffering ~30–60s ahead absorbs those dips. Playback still
+        // starts as soon as there's enough to begin, then keeps filling ahead,
+        // so this doesn't slow startup; ~128 MiB forward buffer is fine on phones.
+        // Buffer size + length come from the user's preset (Settings → Cache);
+        // the 'default' preset returns exactly these numbers (60s / 128MiB /
+        // 48MiB), so untouched installs are unchanged. 'low' shrinks them for
+        // low-RAM/TV, 'high' enlarges them.
+        final bufPrefs = sl<PlaybackPrefs>();
+        await p.setProperty('cache', 'yes');
+        await p.setProperty('cache-secs', '${bufPrefs.bufferSecs}');
+        await p.setProperty('demuxer-readahead-secs', '${bufPrefs.bufferSecs}');
+        await p.setProperty('demuxer-max-bytes', bufPrefs.bufferMaxBytes);
+        await p.setProperty('demuxer-max-back-bytes', bufPrefs.bufferMaxBackBytes);
+        // ── A/V stays in sync after a mid-stream stall. ───────────────────────
+        // Symptom this fixes: a movie/episode freezes mid-playback (host throttle
+        // or a brief dip — not a visible "buffering"), and on recovery the audio
+        // runs AHEAD of the picture. Cause: Android's DIRECT mediacodec decoder
+        // freezes its last frame on the output surface during the hiccup while
+        // the audio track keeps draining, so audio ends up seconds ahead and
+        // mpv's default A/V sync (~0.1s/frame) can't claw it back. COPY mode
+        // routes frames through mpv's own pipeline, timed against the audio
+        // clock, so it drops/resyncs cleanly after a stall — the robustness
+        // ExoPlayer/CloudStream get from decoder fallback + shared-clock
+        // renderers. Still hardware-decoded; mpv falls back to software per-codec
+        // if a device can't hw-decode it.
+        // Decoder is user-selectable (Settings → Playback → Video decoder).
+        // Default 'hw' → 'mediacodec-copy' (unchanged); 'sw' → software decode
+        // for streams the hardware decoder chokes on.
+        await p.setProperty('hwdec', sl<PlaybackPrefs>().hwdecValue);
+        // Lighten the SOFTWARE (libavcodec) decode path so streams that fall
+        // back to CPU — odd scraped codecs, malformed HLS, or the 'Software'
+        // decoder setting — stutter less. Inert while hardware-decoding (the
+        // usual case), so it only helps the streams that actually struggle:
+        // multithread across cores, skip the loop filter on non-key frames
+        // (big CPU saving, near-invisible), and allow fast decode shortcuts.
+        await p.setProperty('vd-lavc-threads', '4');
+        await p.setProperty('vd-lavc-skiploopfilter', 'nonkey');
+        await p.setProperty('vd-lavc-fast', 'yes');
+        // On a cache underrun, pause audio+video together and wait until a little
+        // is rebuffered before resuming, so they restart in lock-step instead of
+        // audio-ahead (mirrors ExoPlayer's buffer-for-playback-after-rebuffer).
+        await p.setProperty('cache-pause', 'yes');
+        await p.setProperty('cache-pause-wait', '2');
+        // ── In-app volume + boost. The gain uses mpv's NATIVE `volume` property
+        // (softvol) with volume-max raised to 200 — a real up-to-2× software
+        // gain, exactly like Aniyomi. NOT an af filter: media_kit's Android
+        // ffmpeg build lacks the `volume` libavfilter, so `af=lavfi=[volume=…]`
+        // fails to init and KILLS all audio (the "no sound" bug). ────────────
+        await p.setProperty('volume-max', '200');
+        await p.setProperty('volume', sl<PlaybackPrefs>().volumeBoost.toString());
+        await p.setProperty('af', _audioFilterChain());
+        // Keep voices natural (not chipmunk) when playing above 1× speed.
+        await p.setProperty('audio-pitch-correction', 'yes');
+        // Real-time GLSL upscaling (Video enhancement). 'off' → clears shaders.
+        await _applyShader(p);
+        // Named colour profile (brightness/contrast/…). 'natural' → neutral.
+        await _applyColorProfile(p);
+      } catch (_) {}
+      // Make the bundled subtitle fonts available to mpv/libass (which can't
+      // read Flutter's asset bundle). Fire-and-forget so it never delays the
+      // first open; the font picker just works once it's done.
+      unawaited(_setupSubtitleFonts(p));
+    }
+  }
+
+  /// Apply the saved Anime4K enhancement (upscaling shaders + render tuning) to
+  /// mpv (best-effort). Off resets everything to mpv defaults.
+  Future<void> _applyShader(NativePlayer p) async {
+    try {
+      final prefs = sl<PlaybackPrefs>();
+      final style = prefs.videoShaderStyle;
+      final tier = prefs.videoShaderTier;
+      await p.setProperty(
+        'glsl-shaders',
+        await ShaderPresets.mpvValue(tier, style),
+      );
+      await _applyRenderQuality(p, on: style != 'off', high: tier == 'high');
+    } catch (_) {}
+  }
+
+  /// Render-quality mpv tuning that rides on the Anime4K tier. Enabling deband
+  /// smooths colour banding in gradients (cheap, big win for anime); the High
+  /// tier also switches to high-quality scaling (spline36/mitchell). Off resets
+  /// to mpv's defaults (deband off, bilinear), so it matches stock playback.
+  Future<void> _applyRenderQuality(
+    NativePlayer p, {
+    required bool on,
+    required bool high,
+  }) async {
+    await p.setProperty('deband', on ? 'yes' : 'no');
+    if (on) {
+      await p.setProperty('deband-iterations', '2');
+      await p.setProperty('deband-threshold', '48');
+    }
+    final hq = on && high;
+    await p.setProperty('scale', hq ? 'spline36' : 'bilinear');
+    await p.setProperty('cscale', hq ? 'spline36' : 'bilinear');
+    await p.setProperty('dscale', hq ? 'mitchell' : 'bilinear');
+  }
+
+  /// Change the Anime4K style (off/a/b/c) live and persist it. Note: the
+  /// gpu-next renderer is set at player creation, so enabling from 'off'
+  /// mid-playback runs the shader on the current renderer until the next open —
+  /// the shader itself applies immediately either way.
+  Future<void> setShaderStyle(String style) async {
+    await sl<PlaybackPrefs>().setVideoShaderStyle(style);
+    final p = player.platform;
+    if (p is NativePlayer) await _applyShader(p);
+    _toast('Anime4K Enhancement: ${ShaderPresets.styleById(style).label}');
+  }
+
+  /// Change the Anime4K GPU tier (mid/high) live and re-apply the current style.
+  Future<void> setShaderTier(String tier) async {
+    await sl<PlaybackPrefs>().setVideoShaderTier(tier);
+    final p = player.platform;
+    if (p is NativePlayer) await _applyShader(p);
+  }
+
+  /// Apply the saved colour-adjustment values to mpv's equalizer (best-effort).
+  Future<void> _applyColorProfile(NativePlayer p) async {
+    try {
+      final prefs = sl<PlaybackPrefs>();
+      await p.setProperty('brightness', '${prefs.colorBrightness}');
+      await p.setProperty('contrast', '${prefs.colorContrast}');
+      await p.setProperty('saturation', '${prefs.colorSaturation}');
+      await p.setProperty('gamma', '${prefs.colorGamma}');
+      await p.setProperty('hue', '${prefs.colorHue}');
+    } catch (_) {}
+  }
+
+  /// Live preview of one colour value while a slider is dragged — sets the mpv
+  /// property WITHOUT persisting (fast, no Hive write per frame).
+  Future<void> previewColor(String mpvProp, int value) async {
+    final p = player.platform;
+    if (p is NativePlayer) {
+      try {
+        await p.setProperty(mpvProp, '$value');
+      } catch (_) {}
+    }
+  }
+
+  /// Commit one colour value: persist the pref + apply it.
+  Future<void> setColor(String mpvProp, int value) async {
+    final prefs = sl<PlaybackPrefs>();
+    switch (mpvProp) {
+      case 'brightness':
+        await prefs.setColorBrightness(value);
+      case 'contrast':
+        await prefs.setColorContrast(value);
+      case 'saturation':
+        await prefs.setColorSaturation(value);
+      case 'gamma':
+        await prefs.setColorGamma(value);
+      case 'hue':
+        await prefs.setColorHue(value);
+    }
+    await previewColor(mpvProp, value);
+  }
+
+  /// Apply a quick preset — sets all five values at once.
+  Future<void> applyColorPreset(ColorProfile c) async {
+    final prefs = sl<PlaybackPrefs>();
+    await prefs.setColorBrightness(c.brightness);
+    await prefs.setColorContrast(c.contrast);
+    await prefs.setColorSaturation(c.saturation);
+    await prefs.setColorGamma(c.gamma);
+    await prefs.setColorHue(c.hue);
+    final p = player.platform;
+    if (p is NativePlayer) await _applyColorProfile(p);
+  }
+
+  /// Reset all colour values to neutral (0).
+  Future<void> resetColor() =>
+      applyColorPreset(ColorProfiles.byId('natural'));
+
+  // Extract-once guard (static: shared across player instances this session).
+  static bool _subFontsExtracted = false;
+
+  /// Copy the app's bundled .ttf subtitle fonts to a real on-disk folder and
+  /// point mpv/libass at it via `sub-fonts-dir`, so `sub-font` (the Subtitle
+  /// style picker) can actually resolve them. Best-effort, never throws.
+  Future<void> _setupSubtitleFonts(NativePlayer p) async {
+    try {
+      final dir = await writableAppSubdir('sub_fonts');
+      if (!_subFontsExtracted) {
+        // Only Inter (UI) + Noto Sans (libass fallback) ship in the APK; the
+        // other subtitle fonts are download-on-demand (SubtitleFontService).
+        const fontAssets = <String>[
+          'assets/fonts/Inter.ttf',
+          'assets/fonts/NotoSans-Regular.ttf',
+        ];
+        for (final a in fontAssets) {
+          final out = File('${dir.path}/${a.split('/').last}');
+          if (!out.existsSync()) {
+            try {
+              final data = await rootBundle.load(a);
+              await out.writeAsBytes(data.buffer.asUint8List(), flush: true);
+            } catch (_) {}
+          }
+        }
+        // Register any already-downloaded fonts so the Flutter overlay can use
+        // them right away, and pull the selected one if it isn't cached yet.
+        unawaited(SubtitleFontService.instance.registerCached());
+        final sel = sl<PlaybackPrefs>().subtitleFont;
+        if (sel.isNotEmpty) unawaited(SubtitleFontService.instance.ensure(sel));
+        _subFontsExtracted = true;
+      }
+      // 'auto' → on Android (no fontconfig) libass uses the embedded provider,
+      // which scans sub-fonts-dir; the family name in sub-font then matches.
+      await p.setProperty('sub-fonts-dir', dir.path);
+      await p.setProperty('sub-font-provider', 'auto');
+    } catch (_) {}
+  }
+
+  void init(int index) {
+    // Start mpv tuning now; [_open] awaits it before opening so the options
+    // (HLS fake-extension relaxation, reconnect, …) are in effect for the file.
+    unawaited(_mpvConfigured);
+    _ensureFiller(); // background filler lookup for auto-skip (anime only)
+    unawaited(_enrichEpisodeTitles());
+    emit(state.copyWith(tracks: player.state.tracks));
+    _subs.add(
+      player.stream.tracks.listen((t) {
+        emit(state.copyWith(tracks: t));
+        // Tracks just arrived — restore remembered audio/subtitle. When the
+        // stream's track list loads AFTER we've applied an external soft sub,
+        // mpv can drift off it (auto-select another track / none), silently
+        // overriding the preferred language. If the currently-selected sub is
+        // no longer the one we chose, re-arm so _tryApplySubPref re-applies it.
+        // Guarded on drift (not on every track change) so re-applying a URI sub
+        // — which media_kit does via a fresh `sub-add` — can't loop.
+        if (_wantedSubId != null &&
+            player.state.track.subtitle.id != _wantedSubId) {
+          _subApplied = false;
+        }
+        _tryApplyAudioPref();
+        _tryApplySubPref();
+      }),
+    );
+    _subs.add(
+      player.stream.playing.listen((v) {
+        _playing = v;
+        if (v) {
+          _discordPaused = false;
+          _discordPauseTimer?.cancel();
+          _pushDiscordWatching();
+          return;
+        }
+        // Seek/buffer briefly reports not-playing. Only freeze Discord after
+        // a real pause holds.
+        _discordPauseTimer?.cancel();
+        _discordPauseTimer = Timer(const Duration(milliseconds: 600), () {
+          if (!_playing) {
+            _discordPaused = true;
+            _pushDiscordWatching();
+          }
+        });
+      }),
+    );
+    _subs.add(
+      player.stream.position.listen((p) {
+        final jumped = (p - _lastPos).abs() > const Duration(seconds: 3);
+        _lastPos = p;
+        // Keep the resume target as a FLOOR for re-opens until we're safely past
+        // it (NOT the instant it's touched — a re-open firing right then would
+        // otherwise lose the floor and snap back to ~0). 15s past = stable.
+        if (_pendingResume > Duration.zero &&
+            p > _pendingResume + const Duration(seconds: 15)) {
+          _pendingResume = Duration.zero;
+        }
+        // Force the resume seek to actually STICK. Some remote MP4 hosts briefly
+        // report the resume position (mpv's `start` property) then reset to 0
+        // and play from the beginning — the seek-on-open silently failed, and a
+        // one-shot re-seek can be fooled by that transient reading. So while a
+        // resume is still pending and we're playing well short of it, re-issue
+        // the seek, paced so each range request has time to land (never
+        // thrashing). Cleared automatically once playback gets past the target.
+        if (_pendingResume > Duration.zero &&
+            _lastDur > Duration.zero &&
+            _pendingResume < _lastDur &&
+            p + const Duration(seconds: 15) < _pendingResume) {
+          final nowS = DateTime.now().millisecondsSinceEpoch;
+          if (nowS - _lastResumeSeekMs > 2500) {
+            _lastResumeSeekMs = nowS;
+            player.seek(_pendingResume);
+          }
+        }
+        // Opt-in auto-skip of the opening / ending. Sits here (not in the player
+        // UI) so it still fires with the controls hidden or the screen off.
+        _maybeAutoSkip(p);
+
+        if (p > Duration.zero) {
+          _startedThisSource = true; // source is playing
+          _everStarted = true; // ...and something has played at least once
+          _startTimer?.cancel();
+          _startTimer = null;
+          if (!_markedWatching) {
+            _markedWatching = true;
+            _markWatching(); // "started watching" → CURRENT on AniList now
+          }
+        }
+
+        // Throttled progress capture so Continue Watching fills mid-episode
+        // (without waiting for an episode switch / dispose). Cheap: at most one
+        // write every ~5s. NOT gated on duration — downloaded HLS (concatenated
+        // TS) often reports no duration, and we still want resume to work.
+        final now = DateTime.now().millisecondsSinceEpoch;
+        if (jumped) _pushDiscordWatching();
+
+        if (now - _lastHistoryMs >= 5000) {
+          _lastHistoryMs = now;
+          _persist();
+        }
+
+        // Seamless binge: once we pass ~85% of the episode, resolve the NEXT
+        // episode's stream in the background so advancing is instant. Fires at
+        // most once per current episode (re-armed when the index changes).
+        final idx = state.currentIndex;
+        if (_prefetchedNextForIndex != idx &&
+            idx + 1 < episodes.length &&
+            _lastDur > Duration.zero &&
+            p >= _lastDur * 0.85) {
+          _prefetchedNextForIndex = idx;
+          final nextUrl = _episodeUrl(episodes[idx + 1]);
+          if (sourceId == ZmodeIds.sourceId) {
+            // Z Mode used to skip this entirely, because SourceRepository's
+            // own prefetch throws for the zm pseudo source — so every episode
+            // of a binge paid the full resolve again (7.3s median across 139
+            // plays, 20s at p90). The catalogue resolves it the same way Play
+            // will, and the winning source is already known here: we are
+            // playing from it. Fire-and-forget; a failure just means the next
+            // Play does the work itself, exactly as it did before.
+            sl<CatalogueRepository>()
+                .sources(nextUrl, sourceId: sourceId, fast: true)
+                .catchError((_) => <VideoSource>[]);
+          } else {
+            sl<SourceRepository>().prefetch(nextUrl, sourceId: sourceId);
+          }
+        }
+      }),
+    );
+    _subs.add(
+      player.stream.duration.listen((d) {
+        _lastDur = d;
+        if (d > Duration.zero) _pushDiscordWatching();
+        // The duration arriving is mpv's "ready" signal (its STATE_READY): only
+        // now is the stream reliably seekable. A remote MP4 reports duration
+        // only after its moov atom loads, and any seek issued before that is
+        // clamped to 0 — the "always resumes from 0" bug. So apply the pending
+        // resume HERE, the moment seeking is possible. (This is how CloudStream
+        // does it — re-seek to the saved position on STATE_READY.)
+        if (_pendingResume > Duration.zero && d > Duration.zero) {
+          if (_pendingResume >= d) {
+            // Mark is at/after the end (corrupted/too-large) — can't resume
+            // there; drop it so playback + saving proceed normally.
+            _pendingResume = Duration.zero;
+          } else if (_lastPos < _pendingResume) {
+            player.seek(_pendingResume);
+          }
+        }
+        // Re-assert the subtitle preference ONCE at STATE_READY. A soft sub
+        // applied during the racy open can end up SELECTED but not rendering
+        // (mpv added it before the stream finished loading). Re-applying here —
+        // the point where a manual pick reliably renders — forces a fresh
+        // `sub-add` so the preferred language actually shows. The duplicate mpv
+        // track this creates is hidden from the picker (see mediaSubtitleTracks).
+        if (d > Duration.zero && !_subReadyReapplied && _wantedSubId != null) {
+          _subReadyReapplied = true;
+          _subApplied = false;
+          _tryApplySubPref();
+        }
+        // Auto-translate the subtitle once the episode is ready (opt-in).
+        if (d > Duration.zero) _maybeAutoTranslate();
+        // Fetch accurate OP/ED skip times once the episode length is known.
+        if (d > Duration.zero && _skipsForIndex != state.currentIndex) {
+          _skipsForIndex = state.currentIndex;
+          _fetchSkips(state.currentIndex, d);
+        }
+      }),
+    );
+    // Completion is handled by the player screen (it shows the "Up next"
+    // countdown card and then advances), so the controller doesn't auto-advance
+    // here — avoids double-advancing. We DO use it to force an AniList scrobble
+    // (covers HLS streams that report no duration, so the 92% check never fires).
+    _subs.add(
+      player.stream.completed.listen((done) {
+        if (done) _maybeScrobble(force: true);
+      }),
+    );
+    _subs.add(player.stream.error.listen((e) => _onPlaybackError(e)));
+    _subs.add(
+      player.stream.buffering.listen((buffering) {
+        // A torrent local stream buffers while pieces download — that's normal,
+        // not a dead source. Arming the stall watchdog would restart the torrent
+        // from scratch and churn native memory (force close). Skip it for torrents.
+        if (buffering &&
+            _startedThisSource &&
+            !_recovering &&
+            _activeTorrentId == null &&
+            !_isProxiedStream) {
+          // Started source stalled — arm a watchdog. If we're still stuck and the
+          // position hasn't advanced ~18s later, the stream is likely dead → fail
+          // over.
+          _stallAnchorPos = _lastPos;
+          _stallTimer?.cancel();
+          _stallTimer = Timer(const Duration(seconds: 18), _failoverFromStall);
+        } else {
+          _stallTimer?.cancel();
+          _stallTimer = null;
+        }
+      }),
+    );
+    openEpisode(index);
+  }
+
+  // ── Public playback helpers (used by the Netflix-style overlay) ───────────
+
+  /// The latest position seen from the mpv stream. Used by the cast handoff to
+  /// start the Cast receiver at the exact position local playback left off.
+  Duration get currentPosition => _lastPos;
+
+  /// Chromecast (and similar) progress while local mpv is paused. Updates
+  /// resume / Continue Watching on the same path as the position stream.
+  void syncExternalProgress(Duration position, Duration duration) {
+    if (position <= Duration.zero) return;
+    if (duration > Duration.zero) _lastDur = duration;
+    final jumped = (position - _lastPos).abs() > const Duration(seconds: 3);
+    if (jumped) _markUserSeek(position);
+    _lastPos = position;
+    if (position > Duration.zero) {
+      _startedThisSource = true;
+      _everStarted = true;
+      if (!_markedWatching) {
+        _markedWatching = true;
+        _markWatching();
+      }
+    }
+    if (jumped) _pushDiscordWatching();
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (now - _lastHistoryMs >= 5000) {
+      _lastHistoryMs = now;
+      unawaited(_persist());
+    }
+  }
+
+  void setRate(double r) => player.setRate(r);
+
+  /// Current video-decoder mode ('hw'|'hw+'|'sw'|'auto') — drives the in-player
+  /// decoder button label.
+  String get decoderMode => sl<PlaybackPrefs>().videoDecoder;
+
+  /// Switch the video decoder AT RUNTIME: mpv re-initialises its decoder in
+  /// place, so a stuttering / green / black stream can be fixed WITHOUT leaving
+  /// the video. Also persisted as the new default for future opens.
+  Future<void> setDecoder(String mode) async {
+    await sl<PlaybackPrefs>().setVideoDecoder(mode);
+    final p = player.platform;
+    if (p is NativePlayer) {
+      try {
+        await p.setProperty('hwdec', sl<PlaybackPrefs>().hwdecValue);
+      } catch (_) {}
+    }
+  }
+
+  /// Apply a USER-chosen playback speed and persist it — per-title (this
+  /// movie/series) AND globally (so new titles start at the same preference).
+  /// Best-effort; mirrors [_rememberQuality].
+  void setRateRemembered(double r) {
+    player.setRate(r);
+    final url = showUrl;
+    if (url != null && url.isNotEmpty) {
+      sl<TitlePrefsStore>().setSpeed(sourceId, url, r);
+    }
+    sl<PlaybackPrefs>().setDefaultSpeed(r);
+  }
+
+  /// True when the local user is a viewer in a Watch Together room (not the
+  /// host). When this is the case, local transport actions are suppressed so
+  /// the viewer cannot desync from the host's authoritative playback state.
+  bool get _isRoomViewer => roomRole == RoomRole.client;
+
+  void togglePlay() {
+    if (_isRoomViewer) return;
+    final willPlay = !player.state.playing;
+    player.playOrPause();
+    if (roomRole == RoomRole.host) {
+      onLocalPlayback?.call(willPlay ? 'play' : 'pause', _lastPos);
+    }
+  }
+  void seekTo(Duration d) {
+    if (_isRoomViewer) return;
+    _pendingResume = Duration.zero; // user took control → drop the resume floor
+    _markUserSeek(d);
+    player.seek(d);
+    if (roomRole == RoomRole.host) onLocalPlayback?.call('seek', d);
+  }
+
+  /// Seek by [delta] (signed), clamped into 0..duration.
+  void seekBy(Duration delta) {
+    if (_isRoomViewer) return;
+    _pendingResume = Duration.zero; // user took control → drop the resume floor
+    final target = _lastPos + delta;
+    final dur = _lastDur;
+    final clamped = target < Duration.zero
+        ? Duration.zero
+        : (dur > Duration.zero && target > dur ? dur : target);
+    _markUserSeek(clamped);
+    player.seek(clamped);
+    if (roomRole == RoomRole.host) onLocalPlayback?.call('seek', clamped);
+  }
+
+  /// Record a deliberate user seek to [target]. Besides flagging the jump as
+  /// legitimate, it moves the glitch-guard baseline ([_goodPos]) to the seek
+  /// target — otherwise a large but valid seek (e.g. scrubbing 9 min ahead)
+  /// looks like a garbage forward jump to [_persist] and gets rejected, so the
+  /// new position is never saved and resume snaps back to where you were before
+  /// the seek.
+  void _markUserSeek(Duration target) {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    _userSeekMs = now;
+    _goodPos = target;
+    _goodPosMs = now;
+  }
+
+  List<AudioKind> get audioKinds => availableKinds(state.sources);
+  AudioKind? get activeKind => state.active?.kind;
+
+  // ── Scrub-preview source (Netflix-style thumbnails) ───────────────────────
+  /// The media URL a second, hidden player opens to generate scrub previews.
+  String? get previewUri => state.active?.url;
+
+  /// HTTP headers needed to fetch [previewUri] (auth/referer for some mirrors).
+  Map<String, String>? get previewHeaders => state.active?.headers;
+
+  /// Whether the active media is a local/offline file (vs. an http stream).
+  /// Local previews are instant and free; online ones cost a little data.
+  bool get isLocalMedia {
+    final u = state.active?.url;
+    return u != null && !u.startsWith('http');
+  }
+
+  /// Switch to the best source of the given audio [k] (Sub/Dub), preserving
+  /// the live position.
+  Future<void> switchAudio(AudioKind k) async {
+    final s = pickDefault(
+      state.sources,
+      prefer: k,
+      preferQuality: _preferredQuality(),
+    );
+    if (s != null) await switchSource(s);
+  }
+
+  // ── Embedded/soft track selection (CloudStream-style picker) ──────────────
+  // Tracks populate after a media opens (driven by player.stream.tracks).
+
+  /// Embedded audio tracks for the open media (excludes the synthetic
+  /// auto/no entries media_kit always reports).
+  List<AudioTrack> get mediaAudioTracks {
+    final loaded =
+        state.tracks.audio.where((t) => t.id != 'auto' && t.id != 'no').toList();
+    if (_audioRenditions.isEmpty) return loaded;
+    // The languages we kept OUT of the master aren't tracks until they're
+    // picked, so list them as uri tracks. Choosing one attaches that single
+    // stream (mpv `audio-add`) instead of reopening — the same load-on-demand
+    // ExoPlayer does, which is why we can skip 17 of these at open time.
+    final have = loaded.map((t) => t.id).toSet();
+    return [
+      ...loaded,
+      for (final r in _audioRenditions)
+        if (r.uri != _keptAudioUri && !have.contains(r.uri))
+          AudioTrack.uri(r.uri, title: r.name, language: r.lang),
+    ];
+  }
+
+  /// The second line under an audio track: how many channels, and the codec.
+  ///
+  /// Two sources for it, because of the trade this player makes. mpv fills
+  /// [AudioTrack.channels] and [AudioTrack.codec] only for streams it has
+  /// actually opened, and we deliberately hand it one rendition and attach the
+  /// rest on demand — that is what took a start from 38s to 5s. So for a
+  /// rendition nobody has picked yet, fall back to the CHANNELS attribute the
+  /// master playlist already told us, which costs no fetch.
+  ///
+  /// Null when neither knows, so the row just shows its name.
+  String? audioDetail(AudioTrack t) {
+    final parts = <String>[
+      ?_channelLabel(
+        t.channelscount ?? _channelCount(t.channels) ?? _renditionCount(t.id),
+      ),
+      ?t.codec?.toUpperCase(),
+    ];
+    return parts.isEmpty ? null : parts.join(' · ');
+  }
+
+  /// The channel count the master playlist declared for [id], for a rendition
+  /// mpv has not opened and so knows nothing about.
+  int? _renditionCount(String id) {
+    for (final r in _audioRenditions) {
+      if (r.uri == id) return _channelCount(r.channels);
+    }
+    return null;
+  }
+
+  /// A channel count out of whatever text we were handed.
+  ///
+  /// mpv answers `demux-channels` with a layout name when it knows one and
+  /// with "unknown2" / "unknown6" when it only knows how many there are — so
+  /// the digits are the reliable part, and printing the raw value put
+  /// "unknown6" on screen. A playlist's CHANNELS is a bare count already.
+  static int? _channelCount(String? raw) {
+    final v = raw?.trim().toLowerCase();
+    if (v == null || v.isEmpty) return null;
+    if (v.startsWith('mono')) return 1;
+    if (v.startsWith('stereo')) return 2;
+    // "5.1" and "7.1" are counts written as a layout; take the leading number
+    // of full-range channels and add the low-frequency one.
+    final surround = RegExp(r'^(\d+)\.(\d+)').firstMatch(v);
+    if (surround != null) {
+      return int.parse(surround.group(1)!) + int.parse(surround.group(2)!);
+    }
+    final digits = RegExp(r'(\d+)').firstMatch(v);
+    return digits == null ? null : int.tryParse(digits.group(1)!);
+  }
+
+  static String? _channelLabel(int? count) => switch (count) {
+    null || 0 => null,
+    1 => 'Mono',
+    2 => 'Stereo',
+    6 => '5.1',
+    8 => '7.1',
+    _ => '$count ch',
+  };
+
+  /// The video renditions mpv found inside the open media, best first.
+  ///
+  /// This is the fallback for streams our own HLS-master parsing can't read —
+  /// notably DASH (`.mpd`), which has no `#EXT-X-STREAM-INF` lines at all, so
+  /// [state.qualities] comes back empty and the Quality button hides itself.
+  /// mpv demuxes the manifest anyway and reports each rendition as a track, so
+  /// asking the player what it found covers whatever it can play, not just the
+  /// one format we taught ourselves to parse.
+  ///
+  /// Only consulted when the HLS list is empty — a stream that already yields
+  /// variants keeps the existing path, including its `hls-bitrate` pinning.
+  List<VideoTrack> get mediaVideoTracks {
+    final seen = <int>{};
+    final out = <VideoTrack>[];
+    for (final t in state.tracks.video) {
+      if (t.id == 'auto' || t.id == 'no') continue;
+      final h = t.h ?? 0;
+      if (h <= 0) continue; // no resolution to label it with
+      if (!seen.add(h)) continue; // one entry per rung
+      out.add(t);
+    }
+    out.sort((a, b) => (b.h ?? 0).compareTo(a.h ?? 0));
+    return out;
+  }
+
+  /// Switch to one of [mediaVideoTracks]. Unlike [selectQuality] this doesn't
+  /// reopen anything — mpv swaps the rendition in place.
+  Future<void> selectVideoTrack(VideoTrack t) async {
+    _selectedVideoTrack = t;
+    try {
+      await player.setVideoTrack(t);
+    } catch (e) {
+      debugPrint('[quality] setVideoTrack failed: $e');
+    }
+  }
+
+  VideoTrack? _selectedVideoTrack;
+
+  /// The rendition currently on screen — what the Quality sheet should tick.
+  ///
+  /// Not just the user's last pick: before they've chosen anything mpv has
+  /// already auto-selected a rung, and with nothing ticked the sheet looked
+  /// like nothing was selected at all. Ask the player first, and fall back to
+  /// the frame size it reports, since an auto-selected track comes back as the
+  /// synthetic id 'auto' that matches nothing in the list.
+  VideoTrack? get selectedVideoTrack {
+    final tracks = mediaVideoTracks;
+    if (tracks.isEmpty) return null;
+    final current = player.state.track.video.id;
+    for (final t in tracks) {
+      if (t.id == current) return t;
+    }
+    final h = player.state.height;
+    if (h != null && h > 0) {
+      for (final t in tracks) {
+        if (t.h == h) return t;
+      }
+    }
+    return _selectedVideoTrack;
+  }
+
+  /// Embedded subtitle tracks for the open media (excludes auto/no). Also
+  /// excludes externally `sub-add`ed tracks — a source soft-sub applied via
+  /// SubtitleTrack.uri shows up in mpv's track list with its URL as the id,
+  /// which would duplicate the entry already listed under source subtitles
+  /// (and pile up on every re-apply). Those are surfaced via [softSubs] instead.
+  List<SubtitleTrack> get mediaSubtitleTracks => state.tracks.subtitle
+      .where((t) =>
+          t.id != 'auto' &&
+          t.id != 'no' &&
+          !t.id.startsWith('http') &&
+          !t.id.startsWith('/'))
+      .toList();
+
+  /// Currently-selected audio track (id == 'auto'/'no' for the synthetic ones).
+  AudioTrack get activeAudioTrack => player.state.track.audio;
+
+  /// Currently-selected subtitle track (id == 'no' when subs are off).
+  SubtitleTrack get activeSubtitleTrack => player.state.track.subtitle;
+
+  /// How a remembered audio track is written down: `language|title`.
+  ///
+  /// It used to be the language alone, which cannot tell two tracks apart
+  /// when they share one — a file with "English TrueHD Atmos 7.1" and
+  /// "English Dolby Digital 5.1" saved "en" for both, and reopening it
+  /// restored whichever came first rather than the one that was picked.
+  ///
+  /// Both halves are kept because each fails differently. The title
+  /// identifies the exact track but is a release's own wording, so the next
+  /// episode may not carry it; the language always matches something but not
+  /// necessarily the right thing. Written together, the reader can try the
+  /// precise one and fall back to the loose one.
+  ///
+  /// A key with no bar in it is one of the old language-only ones, and still
+  /// reads correctly — see [_wantedAudio].
+  static String audioPrefKey(String? language, String? title, String id) {
+    final lang = language?.trim() ?? '';
+    final name = title?.trim() ?? '';
+    return (lang.isEmpty && name.isEmpty) ? id : '$lang|$name';
+  }
+
+  /// The two halves of [audioPrefKey], lowercased, for matching.
+  static ({String lang, String title}) _wantedAudio(String stored) {
+    final bar = stored.indexOf('|');
+    if (bar < 0) return (lang: stored.toLowerCase(), title: '');
+    return (
+      lang: stored.substring(0, bar).trim().toLowerCase(),
+      title: stored.substring(bar + 1).trim().toLowerCase(),
+    );
+  }
+
+  void setAudioTrack(AudioTrack t) {
+    player.setAudioTrack(t);
+    final url = showUrl;
+    final pref = audioPrefKey(t.language, t.title, t.id);
+    if (url != null && url.isNotEmpty && pref.isNotEmpty) {
+      sl<TitlePrefsStore>().setAudioTrack(sourceId, url, pref);
+    }
+  }
+
+  bool _audioApplied = false; // remembered audio track restored this episode
+
+  /// Restore the title's remembered embedded audio track once per episode
+  /// (multi-audio files). Retried from the tracks stream as tracks load.
+  void _tryApplyAudioPref() {
+    if (_audioApplied) return;
+    final url = showUrl;
+    if (url == null) return;
+    final pref = sl<TitlePrefsStore>().audioTrack(sourceId, url);
+    if (pref == null) {
+      _audioApplied = true;
+      return;
+    }
+    final want = _wantedAudio(pref);
+    // The exact track first. Only if this release does not carry that title
+    // does the language decide, which is all the old keys ever had.
+    for (final byTitle in [true, false]) {
+      for (final t in mediaAudioTracks) {
+        final hit = byTitle
+            ? want.title.isNotEmpty &&
+                  (t.title ?? '').trim().toLowerCase() == want.title
+            : want.lang.isNotEmpty &&
+                  (t.language ?? '').trim().toLowerCase() == want.lang;
+        if (hit) {
+          player.setAudioTrack(t);
+          _audioApplied = true;
+          return;
+        }
+      }
+    }
+    // Not loaded yet — retry on the next tracks update.
+  }
+
+  void setSubtitle(SubtitleTrack t) {
+    player.setSubtitleTrack(t);
+    _wantedSubId = t.id;
+    // Remember globally by language when we can resolve one; a track we can't
+    // classify is a one-off pick that must not set a bad global default.
+    final lang = languageOfSource(t.language ?? t.title ?? '');
+    if (lang != null) sl<PlaybackPrefs>().setSubtitlePreference(lang.iso1);
+  }
+
+  void subtitlesOff() {
+    player.setSubtitleTrack(SubtitleTrack.no());
+    _wantedSubId = 'no';
+    sl<PlaybackPrefs>().setSubtitlePreference('off');
+  }
+
+  /// Whether styled (libass) subtitle rendering is on — read fresh from prefs
+  /// so the in-player Audio & subs toggle reflects the current value.
+  bool get styledSubtitlesOn => sl<PlaybackPrefs>().styledSubtitles;
+
+  /// Flip styled (libass) subtitles from the in-player sheet. libass is baked
+  /// into the Player at construction, so this applies from the next reopen, not
+  /// live — the toast says so, so it's never a silent no-op.
+  Future<void> toggleStyledSubtitles() async {
+    final next = !sl<PlaybackPrefs>().styledSubtitles;
+    await sl<PlaybackPrefs>().setStyledSubtitles(next);
+    _toast(
+      next
+          ? 'Styled subtitles (libass): On — reopen this episode to apply'
+          : 'Styled subtitles (libass): Off — reopen this episode to apply',
+      duration: const Duration(seconds: 4),
+    );
+  }
+
+  /// External "soft" subtitles advertised by the active source.
+  List<Subtitle> get softSubs => state.active?.subtitles ?? const [];
+
+  /// Load one of the source's soft-subs by URL.
+  Future<void> setSoftSub(Subtitle s) async {
+    await _setRemoteSub(s.url, title: s.label ?? s.lang, language: s.lang);
+    final lang = languageOfSource(s.lang) ?? languageOfSource(s.label ?? '');
+    if (lang != null) sl<PlaybackPrefs>().setSubtitlePreference(lang.iso1);
+  }
+
+  /// Load an external subtitle file from disk (picked via file_picker).
+  Future<void> setSubtitleFromFile(String path) async {
+    await player.setSubtitleTrack(SubtitleTrack.uri(path));
+    _wantedSubId = path;
+  }
+
+  /// url → local temp path for a downloaded soft-sub, so re-applying the same
+  /// sub (the tracks-stream re-arm) doesn't re-download it. Cleared per episode.
+  final Map<String, String> _localSubCache = {};
+
+  /// Load an EXTERNAL subtitle [url], fetching it ourselves rather than letting
+  /// mpv do it.
+  ///
+  /// mpv's own fetch carries none of the source's headers — no Referer, no
+  /// User-Agent, no clearance cookie — so a sub host that checks any of them
+  /// answers 403/404 and the track never appears. That is the
+  /// `Can not open external file` in the reports, and it is silent: playback
+  /// carries on with no subtitles and nothing says why.
+  ///
+  /// So download it in Dart WITH [VideoSource.headers], write a temp file, and
+  /// hand mpv the local path. This used to happen only when styled subtitles
+  /// (libass) were on — but that setting is about RENDERING and is off by
+  /// default, so the common case was the broken one. Fetching and styling are
+  /// unrelated; the track is identical either way.
+  ///
+  /// Best-effort throughout: an empty body or any error falls back to the plain
+  /// remote uri, which is exactly what it did before, and never throws.
+  ///
+  /// Owns `_wantedSubId` (the LOCAL path when downloaded, else the url) so the
+  /// sub-preference watcher matches the applied track's id and can't stomp it —
+  /// the same pitfall the translate path handles.
+  Future<void> _setRemoteSub(
+    String url, {
+    String? title,
+    String? language,
+  }) async {
+    Future<void> loadRemote() async {
+      await player.setSubtitleTrack(
+        SubtitleTrack.uri(url, title: title, language: language),
+      );
+      _wantedSubId = url;
+    }
+
+    try {
+      var local = _localSubCache[url];
+      if (local == null || !File(local).existsSync()) {
+        final resp = await _dio.get<List<int>>(
+          url,
+          options: Options(
+            responseType: ResponseType.bytes,
+            headers: state.active?.headers,
+            validateStatus: (_) => true,
+          ),
+        );
+        final bytes = resp.data;
+        if (bytes == null || bytes.isEmpty) {
+          await loadRemote(); // fetch failed → best-effort remote
+          return;
+        }
+        final dir = await getTemporaryDirectory();
+        // Keep the real extension so mpv picks the matching subtitle reader.
+        final out = File('${dir.path}/softsub_${url.hashCode}${_subExt(url)}');
+        await out.writeAsBytes(bytes, flush: true);
+        local = out.path;
+        _localSubCache[url] = local;
+      }
+      await player.setSubtitleTrack(
+        SubtitleTrack.uri(local, title: title, language: language),
+      );
+      _wantedSubId = local;
+    } catch (_) {
+      await loadRemote(); // any error → best-effort remote, never disturb playback
+    }
+  }
+
+  /// Subtitle file extension from a URL (default .srt), so the temp file keeps
+  /// .ass/.vtt/.ssa and mpv selects the matching subtitle demuxer.
+  String _subExt(String url) {
+    final path = Uri.tryParse(url)?.path.toLowerCase() ?? '';
+    for (final e in const ['.ass', '.ssa', '.vtt', '.srt', '.sub']) {
+      if (path.endsWith(e)) return e;
+    }
+    return '.srt';
+  }
+
+  /// True when the active subtitle is an external one we can fetch + translate
+  /// (a source soft-sub or a loaded file — not an embedded/off/translated track).
+  bool get canTranslateSub {
+    final id = _wantedSubId;
+    if (id == null || id == 'no') return false;
+    if (id.contains('/translated_')) return false; // already a translation
+    return softSubs.any((s) => s.url == id) || File(id).existsSync();
+  }
+
+  /// Translate a subtitle to [targetIso] (ISO-639-1) and load the result as a
+  /// new track. Uses the active external subtitle; if none is selected, falls
+  /// back to the first source soft-sub (selecting it first). Best-effort; toasts
+  /// progress + result, and never disturbs the original subtitle on failure.
+  Future<void> translateCurrentSub(String targetIso) async {
+    final id = _wantedSubId;
+    String content;
+    try {
+      if (id != null && File(id).existsSync()) {
+        content = await File(id).readAsString();
+      } else {
+        // The active soft-sub, else the first available one.
+        Subtitle? target;
+        for (final s in softSubs) {
+          if (s.url == id) {
+            target = s;
+            break;
+          }
+        }
+        target ??= softSubs.isNotEmpty ? softSubs.first : null;
+        if (target == null) {
+          _toast('No external subtitle to translate');
+          return;
+        }
+        if (target.url != id) await setSoftSub(target); // select it first
+        final resp = await _dio.get<String>(
+          target.url,
+          options: Options(
+            responseType: ResponseType.plain,
+            headers: state.active?.headers,
+            validateStatus: (_) => true,
+          ),
+        );
+        content = resp.data ?? '';
+      }
+    } catch (_) {
+      _toast('Couldn\'t load the subtitle');
+      return;
+    }
+    if (content.trim().isEmpty) {
+      _toast('Subtitle is empty');
+      return;
+    }
+    _toast('Translating subtitles…');
+    try {
+      var lastPct = -1;
+      final srt = await SubtitleTranslateService.instance.translate(
+        content,
+        targetIso,
+        onProgress: (p) {
+          final pct = (p * 100).round();
+          if (pct != lastPct) {
+            lastPct = pct;
+            _toast('Translating subtitles… $pct%');
+          }
+        },
+      );
+      // Write to a real file and load by path: mpv reports a uri sub's id AS its
+      // path, so `_wantedSubId` matches it and the sub-preference watcher won't
+      // stomp it back to the original (a data: sub's id never matched). File subs
+      // also render more reliably on Android than in-memory data.
+      final dir = await getTemporaryDirectory();
+      final out = File(
+        '${dir.path}/translated_${targetIso}_${state.currentIndex}.srt',
+      );
+      await out.writeAsString(srt, flush: true);
+      await player.setSubtitleTrack(
+        SubtitleTrack.uri(out.path, title: 'Translated', language: targetIso),
+      );
+      _wantedSubId = out.path;
+      _subApplied = true;
+      _toast('Subtitles translated');
+    } catch (_) {
+      _toast('Couldn\'t translate subtitles');
+    }
+  }
+
+  bool _subApplied = false; // remembered-subtitle restored for this episode
+  bool _autoSubDlTried = false; // keyless auto-download fired at most once/episode
+  String? _wantedSubId; // id/url of the subtitle we intend to keep selected
+  bool _subReadyReapplied = false; // re-asserted the sub pref once at STATE_READY
+  bool _autoTranslateTried = false; // auto-translate fired at most once/episode
+
+  /// If auto-translate is on and a target language is set, translate the current
+  /// subtitle to it once per episode — unless the source already has a sub in
+  /// that language (then the normal preference picks it, no translation needed).
+  void _maybeAutoTranslate() {
+    if (_autoTranslateTried) return;
+    final prefs = sl<PlaybackPrefs>();
+    if (!prefs.autoTranslateSubtitles) return;
+    final target = prefs.translateSubtitleTo;
+    if (target.isEmpty) return;
+    if (softSubs.isEmpty && !canTranslateSub) return;
+    // Skip when the source already offers the target language.
+    final targetLang = languageByPref(target);
+    if (targetLang != null) {
+      for (final s in softSubs) {
+        if (matchesSourceLang(s.lang, targetLang) ||
+            matchesSourceLang(s.label ?? '', targetLang)) {
+          return;
+        }
+      }
+    }
+    _autoTranslateTried = true;
+    unawaited(translateCurrentSub(target));
+  }
+
+  /// Restore the title's remembered subtitle once per episode. 'off' turns subs
+  /// off; otherwise match a soft-sub or embedded track by language/label.
+  /// Embedded tracks load after open, so this is retried from the tracks stream
+  /// until a match is found (or there's nothing to restore).
+  void _tryApplySubPref() {
+    if (_subApplied) return;
+    final prefRaw = sl<PlaybackPrefs>().subtitlePreference;
+
+    // 'off' → subtitles off on every video.
+    if (prefRaw == 'off') {
+      player.setSubtitleTrack(SubtitleTrack.no());
+      _wantedSubId = 'no';
+      _subApplied = true;
+      return;
+    }
+    // '' (Auto) → don't force anything.
+    if (prefRaw.isEmpty) {
+      _wantedSubId = null;
+      _subApplied = true;
+      return;
+    }
+    // A language code → source subtitle first, then embedded, then download.
+    final prefLang = languageByPref(prefRaw);
+    if (prefLang == null) {
+      _subApplied = true;
+      return;
+    }
+    final soft = pickPreferredSub(softSubs, prefLang);
+    if (soft != null) {
+      unawaited(
+        _setRemoteSub(
+          soft.url,
+          title: soft.label ?? soft.lang,
+          language: soft.lang,
+        ),
+      );
+      _subApplied = true;
+      return;
+    }
+    for (final t in mediaSubtitleTracks) {
+      final tLang = t.language ?? '';
+      final tTitle = t.title ?? '';
+      if (matchesSourceLang(tLang, prefLang) || matchesSourceLang(tTitle, prefLang)) {
+        player.setSubtitleTrack(t);
+        _wantedSubId = t.id;
+        _subApplied = true;
+        return;
+      }
+    }
+    // No source/embedded match — embedded tracks may still be loading; leave
+    // _subApplied false so the tracks-stream retry re-checks. Fire the keyless
+    // auto-download at most once per episode.
+    final titleForSub = showTitle ?? scrobbleTitle;
+    if (!_autoSubDlTried &&
+        sl<PlaybackPrefs>().autoDownloadSubtitles &&
+        (imdbId?.isNotEmpty == true ||
+            tmdbId != null ||
+            (titleForSub?.isNotEmpty == true))) {
+      _autoSubDlTried = true;
+      _fetchAndApplySubtitle(prefLang, title: titleForSub);
+    }
+  }
+
+  /// Re-run the global subtitle preference against the current video (used by
+  /// the in-player / Settings picker so a change applies immediately).
+  void reapplyPreferredSubtitle() {
+    _subApplied = false;
+    _autoSubDlTried = false;
+    _tryApplySubPref();
+  }
+
+  /// Keyless auto-download fallback. Calls [SubtitleDownloadService.find] with
+  /// the title's imdb/tmdb id (or show title for id-less content) and the
+  /// user's preferred language. On success, loads the first result directly
+  /// from its remote URL via [SubtitleTrack.uri] — no temp-file step needed.
+  /// Fully fire-and-forget: any error is silently swallowed so playback is
+  /// never disrupted.
+  void _fetchAndApplySubtitle(Language lang, {String? title}) {
+    final epNum = currentEpisode.number?.toInt();
+    // Capture gen so stale completions after an episode change are discarded.
+    final capturedGen = _gen;
+    unawaited(
+      Future(() async {
+        try {
+          final subs = await SubtitleDownloadService().find(
+            imdbId: imdbId,
+            tmdbId: tmdbId,
+            isTv: tmdbIsTv,
+            // The Episode model carries no season, so assume season 1 for TV —
+            // correct for single-season shows and season-relative episode lists;
+            // a mismatch just yields no result (never a wrong-episode sub).
+            season: tmdbIsTv ? 1 : null,
+            episode: tmdbIsTv ? epNum : null,
+            title: title,
+            iso2: lang.iso2,
+            iso1: lang.iso1,
+          );
+          // Discard if the user moved to a different episode or a track was
+          // already matched by the time the response arrived.
+          if (capturedGen != _gen || _subApplied || subs.isEmpty) return;
+          await _setRemoteSub(
+            subs.first.url,
+            title: lang.name,
+            language: lang.iso2,
+          );
+          _subApplied = true;
+        } catch (_) {
+          // Silently ignored — playback continues without subtitles.
+        }
+      }),
+    );
+  }
+
+  // Online subtitle search/download is wired in the player UI via
+  // SubtitleSearchService (OpenSubtitles); results apply through
+  // setSubtitleFromFile. Full subtitle styling + delay/sync are handled above.
+
+  /// The message for a sweep that ended with nothing playable.
+  ///
+  /// [settled] is what to say when every source genuinely answered. When some
+  /// of them did NOT — timed out, cooling off, waiting on a Cloudflare check —
+  /// that verdict isn't ours to give: the episode may well be there on a
+  /// source we never really asked. So say what happened instead, on the second
+  /// line the error view already renders under the headline.
+  static String _sweepError(String settled, List<SweepOutcome> outcomes) {
+    final why = sweepFailureDetail(outcomes);
+    if (why == null) return settled;
+    return "Couldn't check every source\n$why";
+  }
+
+  /// Resolves sources for [index] and starts the best one.
+  /// [fromRoom] bypasses the viewer lock so the room can move viewers to the
+  /// host's episode; all other callers leave it false so viewer taps stay blocked.
+  ///
+  /// [resetSourceCooldowns] is true for episode taps / Retry (try every source
+  /// again). Auto next-episode leaves it false so a source that just timed out
+  /// is not paid for again mid-binge.
+  Future<void> openEpisode(
+    int index, {
+    bool fromRoom = false,
+    bool resetSourceCooldowns = true,
+  }) async {
+    if (_isRoomViewer && !fromRoom) return;
+    final gen = ++_gen;
+    await _persist(flush: true);
+    // Only drop the pending resume when actually switching episodes — a
+    // same-episode re-open (recovery/failover) must keep targeting it.
+    if (index != state.currentIndex) _pendingResume = Duration.zero;
+    _tried.clear();
+    _sourceHops = 0;
+    _recovering = false;
+    _skips = const []; // clear previous episode's skip markers
+    _skipsForIndex = -1; // refetched when the new duration arrives
+    _autoSkipped.clear(); // new episode → its OP/ED may auto-skip again
+    _prefetchedNextForIndex = -1; // re-arm next-episode prefetch for the new ep
+    _subApplied = false; // restore the remembered subtitle for the new episode
+    _autoSubDlTried = false; // re-arm keyless auto-download for the new episode
+    _wantedSubId = null; // clear the intended-sub tracking for the new episode
+    _localSubCache.clear(); // drop the previous episode's downloaded soft-subs
+    _subReadyReapplied = false; // re-arm the STATE_READY sub re-assert
+    _autoTranslateTried = false; // re-arm auto-translate for the new episode
+    _audioApplied = false; // restore the remembered audio track too
+    emit(
+      state.copyWith(
+        currentIndex: index,
+        error: () => null,
+        loadingSources: true,
+        sources: const [],
+        active: () => null,
+      ),
+    );
+    if (resetSourceCooldowns &&
+        sl.isRegistered<PlaybackResolver>() &&
+        (showUrl != null && ZmodeIds.isZ(showUrl!))) {
+      sl<PlaybackResolver>().invalidateWinner(_episodeUrl(currentEpisode));
+    }
+    try {
+      final resolved = await _resolveNoted(_episodeUrl(currentEpisode));
+      if (gen != _gen) return; // superseded by a newer open
+      emit(state.copyWith(sources: resolved, loadingSources: false));
+      _buildQualityMenu(
+        gen,
+      ); // populate Auto/1080p/720p from the HLS master, if any
+      // A mirror picked on the episode list wins outright, and is consumed
+      // here so it only applies to the episode it was chosen for. Matched by
+      // url against this resolve, falling back to the picked source itself
+      // when the re-resolve hasn't produced it yet — the whole point is that
+      // the two lists don't always agree.
+      final chosen = initialSource;
+      initialSource = null;
+      final fromPick = chosen == null
+          ? null
+          : resolved.firstWhere(
+              (s) => s.url == chosen.url,
+              orElse: () => chosen,
+            );
+      // Otherwise the source remembered for this title (e.g. Hindi), else the
+      // adaptive default.
+      // Let the audio cut narrow the default ONLY when the title actually
+      // offers a choice between cuts. Aniyomi labels each video's cut but
+      // exposes no toggle — the counts that drive it are CloudStream-only — so
+      // narrowing to "sub" here quietly hid every dub server behind a switch
+      // that does not exist. AudioKind.unknown matches nothing in a labelled
+      // list, so pickDefault falls through to the whole pool: the best stream
+      // of every server, which is what a source with no cut choice always did.
+      final narrowTo = availableCategories.length > 1
+          ? (_activeCategory == 'dub' ? AudioKind.dub : AudioKind.sub)
+          : AudioKind.unknown;
+      final pick =
+          fromPick ??
+          _preferredSource(resolved) ??
+          pickDefault(
+            resolved,
+            prefer: narrowTo,
+            preferQuality: _preferredQuality(),
+          );
+      if (pick == null) {
+        emit(
+          state.copyWith(error: () => 'No playable sources for this episode.'),
+        );
+        return;
+      }
+      await _open(pick, gen: gen);
+      _applyDefaultQuality();
+      // Playback is running — collect the mirrors that resolved after the fast
+      // return, so the Sources sheet ends up complete. Started here rather than
+      // alongside the open above so it can't compete with the stream starting.
+      unawaited(_pollForMoreSources(_episodeUrl(currentEpisode)));
+      if (roomRole == RoomRole.host) onLocalPlayback?.call('episode', Duration.zero);
+    } on NoSourceMatch catch (e) {
+      // No BuildContext down here to call context.l10n — this mirrors
+      // AppLocalizationsEn.noSourceHasThisYet verbatim.
+      if (gen != _gen) return;
+      emit(
+        state.copyWith(
+          loadingSources: false,
+          error: () => _sweepError('No source has this yet', e.outcomes),
+        ),
+      );
+    } on EpisodeNotAvailable catch (e) {
+      // Auto Resolve swept every installed source and none could serve this
+      // episode. Worth saying which of the two it was: nothing has the show at
+      // all, or something has it but not this episode — those send the viewer
+      // somewhere different.
+      if (gen != _gen) return;
+      emit(
+        state.copyWith(
+          loadingSources: false,
+          error: () => _sweepError(
+            e.hadTitleMatch
+                ? "Episode ${e.episode} isn't available on any source yet"
+                : 'No source has this yet',
+            e.outcomes,
+          ),
+        ),
+      );
+    } on EpisodeNotOnSource catch (e) {
+      // The show matched fine — this one episode just isn't on that source.
+      // Its own toString() carries the canonical (a raw storage key), so
+      // build the message by hand instead of interpolating $e.
+      if (gen != _gen) return;
+      emit(
+        state.copyWith(
+          loadingSources: false,
+          error: () => "Episode ${e.episode} isn't on this source yet",
+        ),
+      );
+    } catch (e) {
+      if (gen != _gen) return;
+      emit(
+        state.copyWith(
+          loadingSources: false,
+          error: () => 'Could not load sources: $e',
+        ),
+      );
+    }
+  }
+
+  /// Applies the user's [PlaybackPrefs.defaultQuality] over the adaptive default
+  /// that [_open] just started. Defensive: a no-op when nothing matches (never
+  /// throws), so 'auto' or an unavailable target keeps the current default.
+  ///
+  /// 'highest' selects the top HLS variant if any exist, else the top per-source
+  /// quality. '1080p'/'720p'/'480p' select the matching HLS variant or source
+  /// quality by label, falling back to the current default when absent.
+  void _applyDefaultQuality() {
+    // Per-title remembered quality wins over the global default.
+    final pref = _preferredQuality();
+    if (pref == 'auto') return;
+
+    // HLS variants only. Those are renditions of the stream that's already
+    // playing, so applying one keeps the same file, server and audio. A
+    // provider that ships one stream per quality is handled where the source
+    // is CHOSEN instead ([pickDefault]'s preferQuality) — swapping streams
+    // mid-playback would land on a different file entirely.
+    final variants = state.qualities; // already sorted high→low
+    if (variants.isEmpty) return;
+
+    if (pref == 'highest') {
+      selectQuality(variants.first);
+      return;
+    }
+
+    for (final v in variants) {
+      if (v.quality == pref) {
+        selectQuality(v);
+        return;
+      }
+    }
+
+    // The preferred resolution isn't offered → nearest available (e.g. 1080p
+    // wanted but only 4K/720p → closest, higher on a tie).
+    final wanted = resolutionPx(pref);
+    if (wanted == null) return;
+    final nearVar = _nearestByRes(variants, (v) => v.quality, wanted);
+    if (nearVar != null) selectQuality(nearVar);
+  }
+
+  /// The resolution preference for the current title: its remembered pick if it
+  /// has one, else the global default.
+  String _preferredQuality() {
+    final url = showUrl;
+    return (url != null && url.isNotEmpty
+            ? sl<TitlePrefsStore>().quality(sourceId, url)
+            : null) ??
+        sl<PlaybackPrefs>().defaultQuality;
+  }
+
+  /// The item whose label-resolution is closest to [wanted]. Inputs are sorted
+  /// high→low, so a strict `<` keeps the HIGHER option on a tie.
+  static T? _nearestByRes<T>(
+    List<T> items,
+    String? Function(T) labelOf,
+    int wanted,
+  ) {
+    T? best;
+    var bestDiff = 1 << 30;
+    for (final it in items) {
+      final px = resolutionPx(labelOf(it));
+      if (px == null) continue;
+      final d = (px - wanted).abs();
+      if (d < bestDiff) {
+        bestDiff = d;
+        best = it;
+      }
+    }
+    return best;
+  }
+
+  /// Switch to a specific source (sub/dub or quality change), preserving position.
+  Future<void> switchSource(VideoSource s) => _open(s, seekTo: _lastPos);
+
+  /// User explicitly picked a source from the Sources sheet — remember it for
+  /// this title (by label) so the same one is preferred next time, then switch.
+  Future<void> selectSource(VideoSource s) async {
+    final url = showUrl;
+    final label = s.label?.trim();
+    if (url != null && url.isNotEmpty && label != null && label.isNotEmpty) {
+      await sl<TitlePrefsStore>().setSourceLabel(sourceId, url, label);
+    }
+    await switchSource(s);
+  }
+
+  // Language tokens used to re-match a remembered source across re-resolves
+  // (URLs/sizes change, but the language usually persists in the label).
+  static const List<String> _langTokens = [
+    'hindi', 'english', 'tamil', 'telugu', 'malayalam', 'kannada', 'bengali',
+    'marathi', 'punjabi', 'japanese', 'korean', 'dual', 'multi', 'org',
+  ];
+
+  static String? _langOf(String label) {
+    final l = label.toLowerCase();
+    for (final t in _langTokens) {
+      if (l.contains(t)) return t;
+    }
+    return null;
+  }
+
+  /// The resolved source matching the title's remembered pick: exact label
+  /// first, else same language token. Null when nothing was remembered/matched.
+  VideoSource? _preferredSource(List<VideoSource> sources) {
+    final url = showUrl;
+    if (url == null) return null;
+    final saved = sl<TitlePrefsStore>().sourceLabel(sourceId, url);
+    if (saved == null) return null;
+    for (final s in sources) {
+      if ((s.label ?? '').trim() == saved) return s; // exact
+    }
+    final lang = _langOf(saved);
+    if (lang != null) {
+      for (final s in sources) {
+        if (_langOf(s.label ?? '') == lang) return s; // same language
+      }
+    }
+    return null;
+  }
+
+  /// Builds the quality menu from the first HLS master among `state.sources`
+  /// (independent of which source plays by default). Fire-and-forget; the menu
+  /// appears once the master is fetched + parsed. Resets prior quality state.
+  void _buildQualityMenu(int gen) {
+    emit(state.copyWith(qualities: const [], activeQuality: () => null));
+    _hlsMaster = null;
+
+    // `container` is only as good as the plugin that set it: MovieBox and
+    // friends serve a real HLS master but never set the m3u8 flag, so trusting
+    // the tag alone meant giving up before even looking and the Quality button
+    // hid itself. CloudStream doesn't notice because ExoPlayer sniffs the
+    // stream rather than reading the plugin's paperwork.
+    //
+    // So try three rungs, cheapest first, and stop at the first that yields a
+    // ladder: the tag, then the url, then an actual look at the bytes.
+    bool playable(VideoSource s) =>
+        s.container != SourceContainer.torrent &&
+        (s.drmKid == null || s.drmKid!.isEmpty);
+
+    VideoSource? tagged;
+    VideoSource? byUrl;
+    for (final s in state.sources) {
+      if (!playable(s)) continue;
+      if (tagged == null && s.container == SourceContainer.hls) tagged = s;
+      if (byUrl == null && looksLikeHlsUrl(s.url)) byUrl = s;
+    }
+    // Last resort: whatever is actually playing. Sniffed, so a non-playlist
+    // costs one ranged request and is dropped.
+    final active = state.active;
+    final guess = (active != null && playable(active))
+        ? active
+        : state.sources.where(playable).firstOrNull;
+
+    final candidate = tagged ?? byUrl ?? guess;
+    if (candidate == null) return;
+    _hlsMaster = candidate;
+    // Only the last rung is a guess; the first two are known playlists and
+    // keep issuing exactly the request they always did.
+    final sniff = tagged == null && byUrl == null;
+    // Once per episode open. Kept because this line (plus the status below)
+    // is what identified a DASH stream being fed to an HLS-only parser —
+    // reading the code twice had produced two wrong answers.
+    debugPrint(
+      '[quality] candidate=${candidate.label ?? candidate.url} '
+      'container=${candidate.container.name} sniff=$sniff',
+    );
+    fetchHlsVariants(
+      candidate.url,
+      candidate.headers,
+      _dio,
+      sniff: sniff,
+    ).then((vs) {
+      debugPrint('[quality] variants=${vs.length} '
+          '${vs.map((v) => v.quality).join(",")}');
+      if (gen == _gen && vs.length > 1) {
+        emit(state.copyWith(qualities: vs));
+        // Variants arrive async (after the initial open), so re-apply the
+        // default-quality pref now that the HLS ladder is known.
+        _applyDefaultQuality();
+      } else if (vs.length <= 1) {
+        // Not a ladder after all — don't leave a non-HLS source pinned as the
+        // master, or selectQuality would reopen the wrong thing.
+        if (gen == _gen && sniff) _hlsMaster = null;
+      }
+    });
+  }
+
+  /// Switch the HLS resolution. [v] == null → Auto (highest); otherwise the
+  /// chosen variant. Keeps the MASTER playlist open and pins the rung via mpv's
+  /// `hls-bitrate` rather than opening the bare variant URL — some masters
+  /// (e.g. AnimeSalt) carry audio in separate renditions, so a bare video
+  /// variant would play silently. Resumes at the live position.
+  Future<void> selectQuality(HlsVariant? v) async {
+    final master = _hlsMaster;
+    if (master == null) return;
+    // Target the variant by bitrate; 'max' for Auto (or when BANDWIDTH is
+    // missing, since we can't pin precisely without it).
+    final target = (v == null || v.bandwidth <= 0) ? 'max' : '${v.bandwidth}';
+    final p = player.platform;
+    if (p is NativePlayer) {
+      try {
+        await p.setProperty('hls-bitrate', target);
+      } catch (_) {}
+    }
+    await _open(
+      VideoSource(
+        url: master.url, // always the master — preserves the audio renditions
+        quality: v?.quality ?? 'auto',
+        container: SourceContainer.hls,
+        headers: master.headers,
+        kind: master.kind,
+        audioLang: master.audioLang,
+        subtitles: master.subtitles,
+      ),
+      seekTo: _lastPos,
+    );
+    emit(state.copyWith(activeQuality: () => v));
+  }
+
+  /// Persist a manual quality pick — per-title (this movie/series) AND globally
+  /// (so new titles start at the same preference). Best-effort.
+  void _rememberQuality(String label) {
+    final url = showUrl;
+    if (url != null && url.isNotEmpty) {
+      sl<TitlePrefsStore>().setQuality(sourceId, url, label);
+    }
+    sl<PlaybackPrefs>().setDefaultQuality(label);
+  }
+
+  /// User explicitly chose an HLS variant in the Quality sheet (null = Auto):
+  /// remember it, then apply. (Programmatic [selectQuality] does NOT persist, so
+  /// applying a 'highest'/fallback pick can't overwrite the user's stored label.)
+  Future<void> chooseQuality(HlsVariant? v) async {
+    _rememberQuality(v?.quality ?? 'auto');
+    await selectQuality(v);
+  }
+
+  // Quality means renditions of the stream that's playing — the HLS ladder
+  // above, or the tracks mpv found inside it ([mediaVideoTracks]). It used to
+  // ALSO list the distinct quality labels across every resolved source, but
+  // those are separate files on separate servers: picking one swapped the
+  // stream, its audio and its subtitles for whichever mirror happened to carry
+  // that label. Choosing between mirrors is what the Sources sheet is for.
+
+  // Active torrent stream (Phase 1: one at a time). Null for normal playback.
+  String? _activeTorrentId;
+  StreamSubscription<TorrentProgress>? _torrentSub;
+
+  /// Streams a torrent [s] into a local http url, driving [PlayerState.torrentPhase]
+  /// as a buffering overlay. Returns a playable local-url source, or null if it
+  /// couldn't (a clean error is emitted, no throw). Stops any previous torrent.
+  Future<VideoSource?> _resolveTorrent(VideoSource s, int g) async {
+    await _stopTorrent();
+    emit(state.copyWith(torrentPhase: () => 'Finding peers…', error: () => null));
+    _torrentSub = sl<TorrentService>().events().listen((p) {
+      if (g != _gen) return;
+      final txt = switch (p.state) {
+        TorrentState.finding => 'Finding peers…',
+        TorrentState.buffering =>
+          'Buffering ${(p.bufferPct * 100).clamp(0, 100).toStringAsFixed(0)}%'
+              '${p.peers > 0 ? ' · ${p.peers} peers' : ''}',
+        TorrentState.ready => 'Starting…',
+        TorrentState.error => 'Finding peers…',
+      };
+      emit(state.copyWith(torrentPhase: () => txt));
+    });
+    try {
+      final t = await sl<TorrentService>().startStream(
+        s.url,
+        allowMobileData: sl<TorrentPrefs>().allowMobileData,
+      );
+      await _torrentSub?.cancel();
+      _torrentSub = null;
+      if (g != _gen) {
+        await _stopTorrent();
+        return null;
+      }
+      _activeTorrentId = t.id;
+      emit(state.copyWith(torrentPhase: () => null));
+      // A local progressive stream — treat as a plain file (mp4 tuning, no
+      // headers); keep the original quality/label/subs.
+      return VideoSource(
+        url: t.localUrl,
+        quality: s.quality,
+        label: s.label,
+        container: SourceContainer.mp4,
+        kind: s.kind,
+        audioLang: s.audioLang,
+        subtitles: s.subtitles,
+      );
+    } catch (e) {
+      await _torrentSub?.cancel();
+      _torrentSub = null;
+      if (g != _gen) return null;
+      final msg = (e is PlatformException && e.code == 'wifi_only')
+          ? 'Torrents are set to Wi-Fi only. Turn on mobile data for torrents '
+              'in Settings › Torrents.'
+          : "Couldn't stream this torrent — no peers or it timed out. "
+              'Try another source.';
+      emit(state.copyWith(
+        torrentPhase: () => null,
+        loadingSources: false,
+        error: () => msg,
+      ));
+      return null;
+    }
+  }
+
+  /// Stops the active torrent (if any) and cleans up its listener.
+  Future<void> _stopTorrent() async {
+    final id = _activeTorrentId;
+    _activeTorrentId = null;
+    await _torrentSub?.cancel();
+    _torrentSub = null;
+    if (id != null) {
+      try {
+        await sl<TorrentService>().stop(id);
+      } catch (_) {}
+    }
+  }
+
+  Future<void> _open(
+    VideoSource s, {
+    Duration? seekTo,
+    int? gen,
+    // When set, mpv plays this URL instead of [s.url] while [s] stays the active
+    // source (so the picker highlight is unchanged). Used to transparently swap
+    // a Cloudflare-blocked Aniyomi stream onto its hidden proxy fallback.
+    String? playUrlOverride,
+  }) async {
+    final g = gen ?? ++_gen;
+    // DRM (clearkey CENC/DASH) can't play in mpv — hand off to the native
+    // ExoPlayer player, which does clearkey natively. The handoff launches that
+    // player + closes this screen; if no handoff is wired, fall through (it'll
+    // just fail to start, exactly as before this feature).
+    if (s.isDrm && onDrmSource != null) {
+      onDrmSource!(s);
+      return;
+    }
+    // Torrent sources stream through the native engine into a local http url,
+    // which then opens exactly like any progressive file. This branch is the
+    // ONLY torrent-specific code in the open path; direct urls skip it entirely.
+    if (isTorrentUrl(s.url)) {
+      final resolved = await _resolveTorrent(s, g);
+      if (g != _gen || resolved == null) return; // superseded or failed (error emitted)
+      s = resolved;
+    }
+    _startTimer?.cancel();
+    _startedThisSource = false; // reset; set true once this source plays
+    emit(state.copyWith(active: () => s, error: () => null));
+    // When auto-resume is off, ignore the saved resume mark and start from the
+    // explicit seek (a mid-session source/quality switch) or the very start.
+    // In a Watch Together room the room position is authoritative, not the
+    // user's personal mark.
+    final autoResume = sl<PlaybackPrefs>().autoResume && roomRole == RoomRole.none;
+    final mark =
+        autoResume ? resume.get(sourceId, _showKey, currentEpisode.id) : null;
+    var resumeAt =
+        (mark != null && !mark.finished) ? mark.position : Duration.zero;
+    // Fallback when the per-episode ResumeStore key didn't match (the provider
+    // regenerated the episode's opaque data id between sessions): resume from
+    // the position the Continue Watching entry itself recorded. First open only
+    // — consume it so a later source/quality switch keeps the live position.
+    if (autoResume && resumeAt <= Duration.zero && initialResume > Duration.zero) {
+      resumeAt = initialResume;
+    }
+    initialResume = Duration.zero;
+    // A fresh resume-open (no explicit seekTo) arms the pending-resume target so
+    // a re-open that fires before we've reached it can't pull us back.
+    if ((seekTo == null || seekTo <= Duration.zero) && resumeAt > Duration.zero) {
+      _pendingResume = resumeAt;
+    }
+    // A source/quality switch passes seekTo: _lastPos to keep the position. But
+    // right after a resume-open _lastPos is still ~0, so an early default-quality
+    // switch would re-open near 0 and wipe the resume. Keep targeting the pending
+    // resume until we've actually reached it; otherwise honor seekTo / the mark.
+    final base = (seekTo != null && seekTo > Duration.zero) ? seekTo : resumeAt;
+    final start = _pendingResume > base ? _pendingResume : base;
+    // Ensure mpv tuning (incl. the HLS fake-extension relaxation) is applied
+    // before opening — otherwise the first file opens without it (black screen
+    // on AnimeSalt/AnimixStream-style streams).
+    await _mpvConfigured;
+    // HLS needs the fake-extension relaxation + per-segment reconnect
+    // (http_persistent=0) for anti-leech CDNs. But forcing http_persistent=0 on
+    // a progressive MP4 makes file-hosts throttle/drop it mid-stream (a fresh
+    // TCP per read) — the "movie freezes in the middle" report. So apply that
+    // string only to HLS; let MP4 use persistent connections (mpv's default).
+    var playUrl = playUrlOverride ?? s.url;
+    // Netflix-style masters name ~18 alternate audio tracks. FFmpeg opens all
+    // of them and pulls segments from each before it will show a frame (~31s
+    // measured on CNC). Hand mpv one audio track and attach the rest on demand,
+    // which is what ExoPlayer does natively. Any failure keeps the original url.
+    _audioRenditions = const [];
+    _keptAudioUri = null;
+    var trimmedLocal = false;
+    if (playUrlOverride == null && s.container == SourceContainer.hls) {
+      final trimmed = await _trimMasterAudio(s);
+      if (trimmed != null) {
+        playUrl = trimmed;
+        trimmedLocal = true;
+      }
+    }
+    final plat = player.platform;
+    if (plat is NativePlayer) {
+      final isHls = s.container == SourceContainer.hls;
+      // Opening a LOCAL playlist makes FFmpeg clamp nested protocols to
+      // 'file,crypto,data', so the https renditions inside it are refused
+      // ("Protocol 'https' not on whitelist"). Re-allow them for that case only.
+      // mpv splits this option on commas, so a value that CONTAINS commas has
+      // to use its %n% length escape or the whole string is rejected (-4).
+      const protos = 'file,crypto,data,http,https,tcp,tls';
+      final whitelist = ',protocol_whitelist=%${protos.length}%$protos';
+      await plat.setProperty(
+        'demuxer-lavf-o',
+        (isHls
+                ? 'extension_picky=0,allowed_extensions=ALL,http_persistent=0,'
+                      'analyzeduration=2000000'
+                : 'extension_picky=0,allowed_extensions=ALL,'
+                      'analyzeduration=2000000') +
+            (trimmedLocal ? whitelist : ''),
+      );
+      // Progressive MP4 file hosts often drop the connection right after a
+      // range-request seek (resume / scrub), which stalls playback at the seek
+      // point. Let libavformat reconnect and continue — what ExoPlayer (and so
+      // CloudStream) does natively. HLS reconnects per-segment already.
+      if (!isHls) {
+        await plat.setProperty(
+          'stream-lavf-o',
+          'reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,'
+              'reconnect_delay_max=30',
+        );
+      }
+      // Set mpv's `start` BEFORE loadfile so it opens AT the resume position (a
+      // range request to that offset), the way CloudStream sets the start
+      // position at prepare time. media_kit's own Media.start is applied late —
+      // in its playlist-pos callback, AFTER the file already began decoding at
+      // 0 — so slow remote MP4s (file hosts) ignore it and land back at 0. We
+      // set it ourselves before open, and to '0' otherwise (the property is
+      // sticky across files, so it must be reset every open).
+      await plat.setProperty(
+        'start',
+        start > Duration.zero
+            ? (start.inMilliseconds / 1000).toStringAsFixed(3)
+            : '0',
+      );
+    }
+    _isProxiedStream = playUrl.startsWith('http://127.0.0.1');
+    // A direct Aniyomi stream can hang on Cloudflare without a clean mpv error —
+    // arm a start watchdog to swap to its hidden proxy fallback if it never
+    // starts. Aniyomi-only + direct-only, so other sources are untouched.
+    _startTimer?.cancel();
+    if (playUrlOverride == null &&
+        sourceId.startsWith('ani:') &&
+        !_isProxiedStream &&
+        s.proxyUrl != null) {
+      _startTimer = Timer(const Duration(seconds: 10), () {
+        if (!_startedThisSource) {
+          _open(s, seekTo: _lastPos, playUrlOverride: s.proxyUrl);
+        }
+      });
+    }
+    await player.open(
+      Media(playUrl, httpHeaders: s.headers),
+    );
+    if (g != _gen) return; // superseded mid-open
+    // Discord Rich Presence: announce the episode now playing.
+    _pushDiscordWatching();
+    // Some streams ignore Media.start (the seek-on-open doesn't take), so the
+    // user lands back at 0. Verify a moment later and re-seek if needed.
+    if (start > Duration.zero) {
+      _verifyResume(start, g);
+      _resumeWatchdog(g);
+    }
+    // Styled subtitles (libass) can silently fail to render on some sources (a
+    // missing font glyph, an unfetchable sub) — tell the user how to recover,
+    // once per player session, only when the mode is actually on.
+    if (!_libassNoticeShown && sl<PlaybackPrefs>().styledSubtitles) {
+      _libassNoticeShown = true;
+      _toast(
+        "If subtitles don't show, turn off Styled subtitles (libass) in "
+        'Settings and reopen.',
+        duration: const Duration(seconds: 4),
+      );
+    }
+    // Apply the preferred speed ONCE, now that a media is actually loaded
+    // (setting it before any open doesn't stick). Mid-session overlay changes
+    // are never clobbered afterwards.
+    if (!_defaultRateApplied) {
+      _defaultRateApplied = true;
+      final url = showUrl;
+      final perTitle = (url != null && url.isNotEmpty)
+          ? sl<TitlePrefsStore>().speed(sourceId, url)
+          : null;
+      player.setRate(perTitle ?? sl<PlaybackPrefs>().defaultSpeed);
+    }
+    // Seed the source's default subtitle ONLY in Auto mode. With a specific
+    // language / Off preference, _tryApplySubPref is the sole authority —
+    // seeding a default here would race and CLOBBER the preferred pick (proven:
+    // the seed's setSubtitleTrack lands after the preferred one and mpv shows
+    // the seed). For Auto, the seed gives the user the source's default sub.
+    if (s.subtitles.isNotEmpty &&
+        sl<PlaybackPrefs>().subtitlePreference.isEmpty) {
+      final sub = s.subtitles.firstWhere(
+        (x) => x.isDefault,
+        orElse: () => s.subtitles.first,
+      );
+      await _setRemoteSub(
+        sub.url,
+        title: sub.label ?? sub.lang,
+        language: sub.lang,
+      );
+    }
+    _reapplySync(); // restore sub/audio delay (mpv clears it on a new file)
+    applySubtitleStyle(); // restore subtitle size/colour/background
+    _tryApplySubPref(); // apply the global subtitle preference (off / lang / auto)
+  }
+
+  /// Stop playback, swallowing anything the platform throws.
+  ///
+  /// Only called on the paths that have already given up, where a failure to
+  /// stop must not replace the error the user is about to read.
+  Future<void> _stopQuietly() async {
+    try {
+      await player.stop();
+    } catch (_) {
+      /* already gone */
+    }
+  }
+
+  /// Try the next source after the current one fails (dead/DRM/unsupported),
+  /// preserving the live position and the audio kind.
+  Future<void> _onPlaybackError(String e) async {
+    debugPrint('[player] error: $e');
+    // A torrent local stream buffers/blips while pieces download — that's normal,
+    // not a dead source. Never fail over: it would restart the torrent from
+    // scratch (re-fetch metadata, wipe the cache) and churn native SessionManagers
+    // until the app force-closes. mpv recovers on its own once the pieces land.
+    if (_activeTorrentId != null) return;
+    final lower = e.toLowerCase();
+    // If THIS source is already playing (position advanced), the error is a
+    // transient/secondary one (HLS segment blip, failed sub track) — ignore it.
+    // Only a source that NEVER started is worth cycling away from.
+    if (_startedThisSource) return;
+    if (_recovering) return;
+    // Anything else is fatal unless it is on the list below.
+    //
+    // This used to be the other way round: fail over only on four hardcoded
+    // English phrases from libmpv, ignore everything else. Any wording those
+    // four did not cover — a new mpv message, a codec complaint, an http error
+    // phrased differently — was read as harmless, so a source that had never
+    // played a single frame was never cycled away from and the screen simply
+    // sat there. An unknown error on a stream that never started is not a
+    // reason to do nothing; it is the definition of one worth leaving.
+    //
+    // The list is the genuinely harmless ones, and they are all about the
+    // things AROUND the video rather than the video: an output device that
+    // isn't there (the iOS Simulator has none), a subtitle track that failed
+    // on its own, libass not finding a font. None of those mean the stream is
+    // unplayable, and cycling sources would not fix any of them.
+    const harmless = [
+      'audio device',
+      'audio output',
+      'subtitle',
+      'sub file',
+      'fontconfig',
+      'libass',
+      'ffmpeg-fallback',
+    ];
+    if (harmless.any(lower.contains)) return;
+    // A direct Aniyomi stream that failed on Cloudflare → swap to its hidden
+    // proxy fallback (same quality) rather than cycling through other qualities.
+    final act = state.active;
+    if (sourceId.startsWith('ani:') && !_isProxiedStream && act?.proxyUrl != null) {
+      await _open(act!, seekTo: _lastPos, playUrlOverride: act.proxyUrl);
+      return;
+    }
+    _recovering = true;
+    // close() bumps _gen precisely so continuations like this one bail instead
+    // of firing into a disposed player. This was the one that never checked:
+    // _tryNextSource awaits a whole re-resolve (seconds, in the logs), which is
+    // plenty of time to back out, and the emit below then threw "Cannot emit
+    // new states after calling close" — straight into Crashlytics.
+    final gen = _gen;
+    final failed = state.active;
+    if (failed != null) _tried.add(failed.url);
+    // Never re-try a source we've already attempted this episode (prevents the
+    // A→B→A thrash cascade).
+    final remaining = state.sources
+        .where((s) => !_tried.contains(s.url))
+        .toList();
+    final next = pickDefault(
+      remaining,
+      prefer: failed?.kind ?? AudioKind.sub,
+      preferQuality: _preferredQuality(),
+    );
+    if (next != null) {
+      // Say so, the same way a stall failover already does. Silence here
+      // looked identical to a frozen screen at the exact moment the player
+      // was working hardest.
+      _toast("That one didn't cut. Trying another source.");
+      await _open(next, seekTo: _lastPos);
+      _applyDefaultQuality(); // honor the quality pref on the fallback source too
+    } else if (!await _tryNextSource()) {
+      // Guarded, not returned: _recovering still has to drop, or a player that
+      // outlives this (a newer open on the same cubit) can never recover again.
+      if (gen == _gen) {
+        // Stop the player before saying so.
+        //
+        // Left running, it fetches the NEXT piece of the stream that just
+        // failed, fails on that too, and re-enters this whole path — about
+        // once a second, for as long as the screen is open. A device log of
+        // this shows 31 identical errors in 44 seconds behind a message that
+        // had already given up. From the outside that is a frozen app: the
+        // dialog is right there, and underneath the player is still grinding.
+        //
+        // Safe by construction: everything above has already established that
+        // this source never produced a frame, that there is nothing left to
+        // fail over to, and the user is about to be told so. "Try again"
+        // re-opens the episode from scratch, which works on a stopped player.
+        await _stopQuietly();
+        emit(state.copyWith(error: () => _deadEndMessage()));
+      }
+    }
+    _recovering = false;
+  }
+
+  /// Every mirror this SOURCE offered is dead. Ask the next source.
+  ///
+  /// `state.sources` only ever holds one source's links, so running out of
+  /// them used to end playback outright — "every source failed (tried 1)" with
+  /// twenty more sources sitting untouched, which is exactly what a dead CDN
+  /// link looks like from here. The source resolved fine; its links just don't
+  /// open.
+  ///
+  /// Only for Z Mode urls, where a resolver owns the source choice. A session
+  /// launched against one specific source has no next source to go to.
+  ///
+  /// Returns true when something new is playing.
+  Future<bool> _tryNextSource() async {
+    final url = showUrl;
+    if (url == null ||
+        !ZmodeIds.isZ(url) ||
+        !sl.isRegistered<PlaybackResolver>()) {
+      return false;
+    }
+    // A source the viewer pinned to this title by hand is a choice, not a
+    // candidate. Hopping off it meant pinning AniKoto, watching its one link
+    // fail, and having Netflix start instead with nothing said — the pin
+    // looked ignored. The resolver already refuses to substitute for a pin
+    // during its sweep; this is the same rule for the dead-link path, which
+    // is where it actually bit.
+    final canonical = ZmodeIds.parseShow(url);
+    if (canonical != null && sl.isRegistered<SourceMatcher>()) {
+      final pinned = sl<SourceMatcher>().pinnedSource(canonical);
+      if (pinned != null) {
+        debugPrint(
+          '[player] source failover · $pinned is pinned by hand — not '
+          'substituting another source',
+        );
+        return false;
+      }
+    }
+    // Bounded. Each hop is a real scrape, and a library where nothing plays
+    // should say so rather than walk thirty sources one dead link at a time.
+    if (_sourceHops >= _maxSourceHops) {
+      debugPrint('[player] source failover · stopping after $_sourceHops hops');
+      return false;
+    }
+    final epUrl = _episodeUrl(currentEpisode);
+    final gen = _gen;
+    final resolver = sl<PlaybackResolver>();
+    // The RESOLVED source, not [sourceId] — a Z Mode session's own id is
+    // 'zm', and excluding that matches no candidate at all, so the next sweep
+    // cheerfully returns the same dead source. Read before marking: marking
+    // drops the winner this reads.
+    final winner = resolver.resolvedSourceId(epUrl, category: _activeCategory);
+    if (winner == null) return false;
+    _sourceHops++;
+    resolver.markSourceUnplayable(epUrl, winner, category: _activeCategory);
+    _toast('That one didn\'t cut. Trying another source.');
+    try {
+      final resolved = await _resolveNoted(epUrl);
+      if (gen != _gen) return true; // superseded; leaving is not a dead end
+      final fresh = resolved.where((s) => !_tried.contains(s.url)).toList();
+      if (fresh.isEmpty) return false;
+      emit(state.copyWith(sources: resolved, error: () => null));
+      final pick = _preferredSource(fresh) ?? pickDefault(
+        fresh,
+        preferQuality: _preferredQuality(),
+      );
+      if (pick == null) return false;
+      await _open(pick, seekTo: _lastPos);
+      if (gen != _gen) return true;
+      _buildQualityMenu(gen);
+      _applyDefaultQuality();
+      return true;
+    } catch (e) {
+      // A sweep that finds nothing throws (EpisodeNotAvailable / NoSourceMatch)
+      // — that is a dead end, not a crash.
+      debugPrint('[player] source failover · no next source: $e');
+      return false;
+    }
+  }
+
+  /// [_resolveSources], plus a note on whether this source could produce any
+  /// playable link for this title.
+  ///
+  /// This is the ONLY signal that catches the common way a source rots: search
+  /// and the episode list keep working — the site is up, the pages parse — but
+  /// the embed host moved and nothing playable comes out. Health recorded from
+  /// search alone calls such a source perfectly healthy forever.
+  ///
+  /// Advisory only. It feeds the health screen; it never affects search order,
+  /// never skips a source, and never removes anything.
+  Future<List<VideoSource>> _resolveNoted(String epUrl) async {
+    try {
+      final out = await _resolveSources(epUrl);
+      _notePlayback(ok: out.isNotEmpty);
+      return out;
+    } catch (_) {
+      _notePlayback(ok: false);
+      rethrow;
+    }
+  }
+
+  void _notePlayback({required bool ok}) {
+    final url = showUrl;
+    // Z-Mode resolves across many sources behind one pseudo id, so an outcome
+    // there says nothing about any particular source — attributing it would
+    // convict whichever source happened to be asked last.
+    if (url == null || url.isEmpty || ZmodeIds.isZ(url)) return;
+    if (!sl.isRegistered<SourceHealthStore>()) return;
+    // Keyed by TITLE: retrying one broken title must count once, not once per
+    // attempt. Fire-and-forget — playback must never wait on bookkeeping.
+    unawaited(
+      sl<SourceHealthStore>()
+          .recordPlayback(sourceId, url, ok: ok)
+          .catchError((_) {}),
+    );
+  }
+
+  /// Headline plus the plain fact, on the second line the error view styles
+  /// separately. The joke never replaces the information: a viewer has to be
+  /// able to tell a dead host from no connection.
+  String _deadEndMessage() {
+    final url = showUrl;
+    final sources = url != null &&
+            ZmodeIds.isZ(url) &&
+            sl.isRegistered<PlaybackResolver>()
+        // The source playing now is not in the excluded set yet.
+        ? sl<PlaybackResolver>().unplayableCount(
+              _episodeUrl(currentEpisode),
+              category: _activeCategory,
+            ) +
+            1
+        : 1;
+    final links = _tried.length;
+    return 'Nothing left to cut.\n'
+        '${sources == 1 ? "1 source" : "$sources sources"} answered, but '
+        '${links == 1 ? "its link" : "all $links links"} failed to open. '
+        'Tap Try again, or pick a different source.';
+  }
+
+  /// A started source stalled for too long (dead host / pulled segment).
+  /// Switch to the next untried mirror at the same position, transparently.
+  Future<void> _failoverFromStall() async {
+    // Bail if playback recovered (position moved past the stall anchor) or
+    // we're no longer buffering — it was just a slow network dip, not a death.
+    if (!player.state.buffering) return;
+    if (_lastPos > _stallAnchorPos + const Duration(seconds: 1)) return;
+    if (_recovering) return;
+    _recovering = true;
+    final dead = state.active;
+    if (dead != null) _tried.add(dead.url);
+    final remaining = state.sources
+        .where((s) => !_tried.contains(s.url))
+        .toList();
+    final next = pickDefault(
+      remaining,
+      prefer: dead?.kind ?? AudioKind.sub,
+      preferQuality: _preferredQuality(),
+    );
+    if (next != null) {
+      _toast('Switching server…');
+      await _open(next, seekTo: _lastPos);
+      _applyDefaultQuality();
+    } else {
+      // Every mirror stalled — the cached resolution is likely dead/expired, so
+      // drop it so the user's "retry" re-scrapes fresh links instead of replaying
+      // the same stalled cache.
+      sl<SourceRepository>().invalidateSources(
+        _episodeUrl(currentEpisode),
+        sourceId: sourceId,
+      );
+      // A source whose every mirror stalls is as unplayable as one whose links
+      // 404 — same fallthrough to the next source rather than ending here.
+      if (!await _tryNextSource()) {
+        // Same reason as the dead end above: a stalled player left running
+        // keeps retrying behind the message.
+        await _stopQuietly();
+        emit(
+          state.copyWith(
+            error: () =>
+                'Nothing left to cut.\n'
+                'Every server stalled. Tap Try again, or pick a '
+                'different source.',
+          ),
+        );
+      }
+    }
+    _recovering = false;
+  }
+
+  /// Re-seek shortly after open if the stream ignored Media.start (position is
+  /// still near 0 instead of the resume target). Retries a couple of times to
+  /// catch slow-loading sources.
+  /// Heal a corrupted/unreachable resume mark: if a resume-open never produces
+  /// real playback (position stuck near 0 well after open — e.g. the mark points
+  /// past a stalling deep-seek), abandon the resume, restart from 0, and reset
+  /// the bad mark so the title plays instead of freezing forever.
+  Future<void> _resumeWatchdog(int g) async {
+    await Future.delayed(const Duration(seconds: 15));
+    if (g != _gen) return;
+    final before = _lastPos;
+    await Future.delayed(const Duration(seconds: 4));
+    if (g != _gen) return;
+    // Position hasn't advanced in 4s → playback is frozen (the resume seek
+    // stalled on a deep / corrupted-mark target the host can't serve). Abandon
+    // the resume, restart from 0, and reset the bad mark so the title plays.
+    if ((_lastPos - before).abs() < const Duration(milliseconds: 600)) {
+      _pendingResume = Duration.zero;
+      await player.seek(Duration.zero);
+      await resume.save(
+        sourceId,
+        _showKey,
+        currentEpisode.id,
+        Duration.zero,
+        _lastDur,
+      );
+    }
+  }
+
+  Future<void> _verifyResume(Duration target, int g) async {
+    // A seek issued while the stream is still buffering at position 0 is
+    // silently dropped, so a fixed 3-try window often expires before slow
+    // sources (remote MP4s) start producing frames — and the user lands at 0.
+    // Poll for up to ~12s and only seek ONCE the player is actually playing
+    // (a real position or a known duration), retrying until it sticks.
+    for (var attempt = 0; attempt < 20; attempt++) {
+      await Future.delayed(const Duration(milliseconds: 750));
+      if (g != _gen) return; // a newer open superseded this
+      final pos = player.state.position;
+      if ((pos - target).abs() <= const Duration(seconds: 8)) return; // reached
+      // Seeking needs a KNOWN duration: remote MP4s (file hosts) report
+      // duration only after mpv reads the moov atom, and a seek issued before
+      // then is clamped to 0 — the "always starts from 0" bug. Wait for it.
+      final dur = player.state.duration;
+      if (dur > Duration.zero && target < dur) await player.seek(target);
+    }
+  }
+
+  /// Filler episode NUMBERS for this show (from Jikan by malId); empty until
+  /// fetched / for non-anime. Drives auto-skip and the FILLER badges.
+  ///
+  /// A notifier rather than a plain field because it lands from a network call
+  /// well after the player is built: the badges have to be told, or they'd only
+  /// appear if something else happened to rebuild them. Sources don't carry
+  /// filler info, so [Episode.filler] is false here — this set is the only
+  /// thing that knows, the same way the detail screen does it.
+  final ValueNotifier<Set<int>> fillerEpisodes = ValueNotifier(const {});
+  Set<int> get _fillerEps => fillerEpisodes.value;
+
+  void _ensureFiller() {
+    final id = malId;
+    if (id == null) return;
+    FillerService.instance.fillerEpisodes(id).then((s) {
+      if (!isClosed) fillerEpisodes.value = s;
+    });
+  }
+
+  /// Whether the episode at [index] is filler, by its episode number.
+  bool isFillerAt(int index) {
+    if (index < 0 || index >= episodes.length) return false;
+    final n = episodes[index].number?.toInt();
+    return n != null && _fillerEps.contains(n);
+  }
+
+  /// Advance to the next episode. When "Auto-skip filler" is on, jumps past
+  /// consecutive filler episodes — but never strands the user (if everything
+  /// left is filler, it just plays the next one). Same rule for autoplay and
+  /// the Next button; pick an episode from the list to still watch filler.
+  /// Whether there is a next episode worth offering.
+  ///
+  /// Not just "is there another entry": an episode the catalogue lists but no
+  /// source has yet (an airing show's next one) is not something Next should
+  /// point at. Every Next affordance in the player reads this, so the button,
+  /// the outro pill, the Up-next card and autoplay all agree.
+  bool get hasPlayableNext =>
+      nextAutoplayIndex(
+        currentIndex: state.currentIndex,
+        episodes: episodes,
+        fillerEps: _fillerEps,
+        autoSkipFiller: sl<PlaybackPrefs>().autoSkipFiller,
+      ) !=
+      null;
+
+  Future<void> playNext({bool auto = false}) async {
+    final target = nextAutoplayIndex(
+      currentIndex: state.currentIndex,
+      episodes: episodes,
+      fillerEps: _fillerEps,
+      autoSkipFiller: sl<PlaybackPrefs>().autoSkipFiller,
+    );
+    if (target == null) return;
+    // Auto binge keeps over-budget cooldowns (avoid re-paying a slow source).
+    // A manual Next is the same intent as tapping an episode — try again.
+    await openEpisode(target, resetSourceCooldowns: !auto);
+  }
+
+  Future<void> playPrevious() async {
+    if (state.currentIndex > 0) {
+      await openEpisode(state.currentIndex - 1);
+    }
+  }
+
+  // ── Accurate skip times (AniSkip, anime only) ─────────────────────────────
+  List<SkipInterval> _skips = const [];
+  int _skipsForIndex = -1;
+  // Next-episode prefetch fires once per current episode, near the end, so the
+  // following episode's stream is already resolved when binge-advancing. Tracks
+  // the index it fired for so it re-arms whenever the episode/index changes.
+  int _prefetchedNextForIndex = -1;
+  List<SkipInterval> get currentSkips => _skips;
+
+  /// Interval starts (ms) already auto-skipped for the current episode.
+  final Set<int> _autoSkipped = <int>{};
+
+  /// Auto-skip the opening / ending when the user has opted in. Called on every
+  /// position tick, so it bails on the cheap checks first — the vast majority of
+  /// playback has no skip data at all.
+  ///
+  /// Routed through [seekTo] rather than `player.seek` so it drops the resume
+  /// floor, moves the glitch-guard baseline (otherwise the jump reads as a bad
+  /// forward seek and progress never persists), and — in a watch party — the
+  /// host's skip carries to the viewers instead of desyncing them.
+  void _maybeAutoSkip(Duration pos) {
+    if (_skips.isEmpty || _isRoomViewer) return;
+    // A resume seek still in flight means the player is briefly reporting ~0,
+    // which sits inside the opening. Skipping there would fire seekTo, drop the
+    // resume floor, and strand the user at the end of the OP instead of where
+    // they actually left off. Wait for the resume to land.
+    if (_pendingResume > Duration.zero) return;
+    final prefs = sl<PlaybackPrefs>();
+    final op = prefs.autoSkipOp;
+    final ed = prefs.autoSkipEd;
+    final recap = prefs.autoSkipRecap;
+    if (!op && !ed && !recap) return;
+    final iv = autoSkipAt(
+      _skips,
+      pos,
+      op: op,
+      ed: ed,
+      recap: recap,
+      fired: _autoSkipped,
+    );
+    if (iv == null) return;
+    _autoSkipped.add(iv.start.inMilliseconds);
+    seekTo(iv.end);
+  }
+
+  Future<void> _fetchSkips(int index, Duration dur) async {
+    _skips = const [];
+    final ep = episodes[index];
+    final num = ep.number?.toInt();
+    final title = showTitle;
+    if (num == null || title == null || title.isEmpty) return;
+    try {
+      final s = await sl<SkipService>()
+          .skipTimes(title: title, episode: num, duration: dur);
+      if (index == state.currentIndex) _skips = s; // ignore if switched away
+    } catch (_) {}
+  }
+
+  // ── Subtitle / audio sync (delay offsets, applied via mpv) ────────────────
+  Duration subtitleDelay = Duration.zero;
+  Duration audioDelay = Duration.zero;
+
+  // Aniyomi-style two-tap subtitle sync. Kept on the controller (not the sheet)
+  // so a capture survives closing the sheet — the user taps "Voice heard", shuts
+  // the sheet to watch, then reopens to tap "Subtitle seen". Playback position
+  // (ms) at each tap; the applied delay adjustment is voice − text.
+  int? subSyncVoiceMs;
+  int? subSyncTextMs;
+
+  /// Record a sync tap at the current playback position. When both points are
+  /// set, folds `voice − text` into [subtitleDelay] and returns that delta (ms);
+  /// otherwise returns null (one point captured, waiting for the other).
+  int? captureSubSync(bool voice) {
+    final pos = player.state.position.inMilliseconds;
+    if (voice) {
+      subSyncVoiceMs = pos;
+    } else {
+      subSyncTextMs = pos;
+    }
+    if (subSyncVoiceMs != null && subSyncTextMs != null) {
+      final delta = subSyncVoiceMs! - subSyncTextMs!;
+      subSyncVoiceMs = null;
+      subSyncTextMs = null;
+      final ms = (subtitleDelay.inMilliseconds + delta).clamp(-30000, 30000);
+      setSubtitleDelay(Duration(milliseconds: ms));
+      return delta;
+    }
+    return null;
+  }
+
+  /// Discard a pending sync capture (Clear/cancel).
+  void clearSubSync() {
+    subSyncVoiceMs = null;
+    subSyncTextMs = null;
+  }
+
+  /// Grab the current video frame and save it to the gallery. Returns true on
+  /// success. NOTE: subtitles are a Flutter overlay, so they are NOT part of the
+  /// captured frame — only the raw video.
+  Future<bool> captureScreenshot() async {
+    try {
+      final bytes = await player.screenshot(format: 'image/png');
+      if (bytes == null || bytes.isEmpty) {
+        _toast("Couldn't capture the frame");
+        return false;
+      }
+      final name = 'Zangetsu_${DateTime.now().millisecondsSinceEpoch}';
+      // Saving needs no runtime permission on Android 10+; on older Android /
+      // iOS the first attempt throws accessDenied — request, then retry once.
+      try {
+        await Gal.putImageBytes(bytes, name: name);
+      } on GalException {
+        await Gal.requestAccess();
+        await Gal.putImageBytes(bytes, name: name);
+      }
+      _toast('Saved to gallery');
+      return true;
+    } catch (_) {
+      _toast('Screenshot failed');
+      return false;
+    }
+  }
+
+  /// Read a single mpv property as a string, for the in-player info overlay.
+  /// Read-only — never touches playback. Returns null when unavailable.
+  Future<String?> mpvStat(String property) async {
+    final p = player.platform;
+    if (p is! NativePlayer) return null;
+    try {
+      final v = await p.getProperty(property);
+      return v.isEmpty ? null : v;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> setSubtitleDelay(Duration d) async {
+    subtitleDelay = d;
+    final p = player.platform;
+    if (p is NativePlayer) {
+      try {
+        await p.setProperty('sub-delay', (d.inMilliseconds / 1000).toString());
+      } catch (_) {}
+    }
+  }
+
+  Future<void> setAudioDelay(Duration d) async {
+    audioDelay = d;
+    final p = player.platform;
+    if (p is NativePlayer) {
+      try {
+        await p.setProperty('audio-delay', (d.inMilliseconds / 1000).toString());
+      } catch (_) {}
+    }
+  }
+
+  /// Re-apply the current sync offsets (mpv resets them on a new file).
+  Future<void> _reapplySync() async {
+    if (subtitleDelay != Duration.zero) await setSubtitleDelay(subtitleDelay);
+    if (audioDelay != Duration.zero) await setAudioDelay(audioDelay);
+  }
+
+  /// Apply the saved subtitle styling (size / font / colour / background /
+  /// position) via mpv. Called after each open and whenever the user changes a
+  /// style preference.
+  Future<void> applySubtitleStyle() async {
+    final p = player.platform;
+    if (p is! NativePlayer) return;
+    final prefs = sl<PlaybackPrefs>();
+    // Text colour: prefer the new hex pref (#RRGGBBAA → mpv #AARRGGBB), else
+    // fall back to the legacy white/yellow token.
+    final color =
+        _mpvColor(prefs.subtitleColorHex) ??
+        (prefs.subtitleColor == 'yellow' ? '#FFFFFF00' : '#FFFFFFFF');
+    // Box behind subtitles: prefer the new opacity slider (0–1 → alpha over
+    // black), else the legacy on/off toggle. mpv colour is #AARRGGBB.
+    final bgOpacity = prefs.subtitleBgOpacity;
+    final back = bgOpacity > 0
+        ? '#${_alphaHex(bgOpacity)}000000'
+        : (prefs.subtitleBackground ? '#A0000000' : '#00000000');
+    // Each property is set independently so a single rejected value can't abort
+    // the rest (the old single try/catch did).
+    Future<void> set(String k, String v) async {
+      try {
+        await p.setProperty(k, v);
+      } catch (_) {}
+    }
+
+    // ASS/SSA subtitles carry their OWN embedded styling. With libass ON
+    // (styled subtitles) keep it faithful — 'no' preserves signs/karaoke/
+    // positions, which is the whole point; the style sheet then governs only
+    // plain srt/vtt. With libass OFF this value is inert (a Flutter overlay
+    // renders text), but 'force' stays the sensible default there.
+    await set(
+      'sub-ass-override',
+      sl<PlaybackPrefs>().styledSubtitles ? 'no' : 'force',
+    );
+    await set('sub-scale', prefs.subtitleScale.toString());
+    if (prefs.subtitleFont.isNotEmpty) {
+      await set('sub-font', prefs.subtitleFont);
+    }
+    await set('sub-color', color);
+    await set('sub-back-color', back);
+    // Outline preset → libass. This used to be a hardcoded border size, so
+    // every preset (glow, bold, drop shadow…) drew the same thin black edge
+    // and only the Flutter overlay ever honoured the choice — the preview
+    // promised a look libass never delivered.
+    //
+    // libass has no "glow": a glow IS a coloured border with the blur turned
+    // up, which is what `sub-blur` does. The numbers mirror
+    // [buildSubtitleShadows] so both renderers land in the same place.
+    final o = libassOutline(
+      prefs.subtitleOutlineType,
+      prefs.subtitleOutlineWidth,
+    );
+    final outlineColor =
+        _mpvColor(prefs.subtitleOutlineColorHex) ?? '#FF000000';
+    await set('sub-border-color', outlineColor);
+    await set('sub-border-size', o.border.toStringAsFixed(1));
+    await set('sub-blur', o.blur.toStringAsFixed(1));
+    await set('sub-shadow-offset', o.shadow.toStringAsFixed(1));
+    // Shadows follow the outline colour, so a drop shadow reads as the user's
+    // choice rather than a second, always-black effect.
+    await set('sub-shadow-color', outlineColor);
+    await set('sub-pos', prefs.subtitlePosition.toString());
+    // media_kit renders text subtitles via a Flutter overlay (not libass), so
+    // the above mpv props are ignored in practice — the real styling is the
+    // Video's SubtitleViewConfiguration. Bump so the player screen rebuilds it.
+    subtitleStyleRev.value++;
+  }
+
+  /// Convert a `#RRGGBBAA` (or `#RRGGBB`) hex string into mpv's alpha-first
+  /// `#AARRGGBB` form. Returns null on a malformed/empty value so the caller
+  /// can fall back to the legacy token.
+  static String? _mpvColor(String hex) {
+    final h = hex.replaceFirst('#', '').trim();
+    if (h.length == 6) return '#FF${h.toUpperCase()}';
+    if (h.length == 8) {
+      final rgb = h.substring(0, 6);
+      final a = h.substring(6, 8);
+      return '#${a.toUpperCase()}${rgb.toUpperCase()}';
+    }
+    return null;
+  }
+
+  /// Two-digit hex (00–FF) for an opacity in 0–1, for mpv's alpha-first colour.
+  static String _alphaHex(double opacity) {
+    final v = (opacity.clamp(0.0, 1.0) * 255).round();
+    return v.toRadixString(16).padLeft(2, '0').toUpperCase();
+  }
+
+  /// Set the in-app volume (0–200%) via mpv's own 'volume' property — this is
+  /// independent of the Android system volume — and persist it as the default.
+  Future<void> setVolumeBoost(int percent) async {
+    final v = percent.clamp(0, 200);
+    await sl<PlaybackPrefs>().setVolumeBoost(v);
+    // Real software gain via mpv's native volume property (0–200, softvol).
+    final p = player.platform;
+    if (p is NativePlayer) {
+      try {
+        await p.setProperty('volume', v.toString());
+      } catch (_) {}
+    }
+  }
+
+  /// The mpv audio-filter chain from prefs. Volume boost is NOT here — it's the
+  /// native `volume` property (see _configureMpv). Only dynaudnorm lives in the
+  /// af chain (opt-in normalization).
+  String _audioFilterChain() {
+    return sl<PlaybackPrefs>().audioNormalize ? 'dynaudnorm' : '';
+  }
+
+  Future<void> _applyAudioFilters() async {
+    final p = player.platform;
+    if (p is! NativePlayer) return;
+    try {
+      await p.setProperty('af', _audioFilterChain());
+    } catch (_) {}
+  }
+
+  /// Toggle dynamic audio normalization (mpv 'dynaudnorm' filter) and persist.
+  Future<void> toggleAudioNormalize() async {
+    final prefs = sl<PlaybackPrefs>();
+    await prefs.setAudioNormalize(!prefs.audioNormalize);
+    await _applyAudioFilters();
+  }
+
+  Future<void> _persist({bool flush = false}) async {
+    if (peek) return; // just looking — leave saved progress alone
+    // Nothing watched yet — don't overwrite a real mark with position 0.
+    if (_lastPos <= Duration.zero) return;
+    // Ignore a clearly bogus position (mpv occasionally emits a spurious huge
+    // value mid-seek) — saving it corrupts the resume mark and can make a title
+    // un-resumable (it then tries to seek past the end forever).
+    if (_lastDur > Duration.zero &&
+        _lastPos > _lastDur + const Duration(seconds: 5)) {
+      return;
+    }
+    // While we're still trying to seek back to a resume point, don't let the low
+    // positions we play through in the meantime clobber the saved mark.
+    if (_pendingResume > Duration.zero &&
+        _lastPos + const Duration(seconds: 3) < _pendingResume) {
+      return;
+    }
+    // Glitch guard: during playback the position can't legitimately advance much
+    // faster than wall-clock. A big forward jump that ISN'T a user seek is a
+    // garbage value (broken-metadata remote MP4s emit these) — saving it would
+    // corrupt the mark and stall every future resume. Reject it.
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    if (_goodPosMs > 0 && nowMs - _userSeekMs > 3000) {
+      final elapsed = Duration(milliseconds: nowMs - _goodPosMs);
+      final jump = _lastPos - _goodPos;
+      if (jump > elapsed * 4 + const Duration(seconds: 10)) return; // implausible
+    }
+    _goodPos = _lastPos;
+    _goodPosMs = nowMs;
+    // Save resume even when the duration is unknown (downloaded HLS files):
+    // ResumeMark.finished is false at duration 0, so resume still seeks back.
+    await resume.save(sourceId, _showKey, currentEpisode.id, _lastPos, _lastDur);
+    final h = history;
+    final title = showTitle;
+    if (h != null && title != null) {
+      await h.save(
+        HistoryEntry(
+          sourceId: sourceId,
+          showId: showUrl ?? sourceId,
+          showTitle: title,
+          cover: cover,
+          coverHeaders: coverHeaders,
+          thumbnail: currentEpisode.thumbnail,
+          showUrl: showUrl ?? '',
+          category: _activeCategory,
+          episodeId: currentEpisode.id,
+          episodeNumber: currentEpisode.number,
+          episodeUrl: currentEpisode.url,
+          position: _lastPos,
+          duration: _lastDur,
+          updatedAt: DateTime.now().millisecondsSinceEpoch,
+          malId: malId,
+        ),
+        flush: flush,
+      );
+    }
+    _maybeScrobble();
+  }
+
+  /// AniList auto-scrobble: once the current episode crosses 92% (or the player
+  /// signals completion via [force], covering HLS streams with no reported
+  /// duration), push it once per episode per session (the service also de-dupes
+  /// persistently). Identifies the anime by [malId] when present, else by
+  /// [scrobbleTitle]. Whole-numbered episodes only.
+  /// Mark the anime CURRENT on AniList the instant playback starts.
+  void _markWatching() {
+    if (peek) return;
+    if (malId == null &&
+        (scrobbleTitle == null || scrobbleTitle!.isEmpty) &&
+        tmdbId == null &&
+        (imdbId == null || imdbId!.isEmpty)) {
+      return;
+    }
+    if (!sl.isRegistered<TrackerHub>()) return;
+    sl<TrackerHub>().markWatching(
+      malId: malId,
+      title: scrobbleTitle,
+      tmdbId: tmdbId,
+      tmdbIsTv: tmdbIsTv,
+      imdbId: imdbId,
+    );
+  }
+
+  void _maybeScrobble({bool force = false}) {
+    if (malId == null &&
+        (scrobbleTitle == null || scrobbleTitle!.isEmpty) &&
+        tmdbId == null &&
+        (imdbId == null || imdbId!.isEmpty)) {
+      return; // nothing to identify the title by
+    }
+    if (!force) {
+      if (_lastDur <= Duration.zero) return; // can't gauge % without duration
+      if (_lastPos.inMilliseconds < _lastDur.inMilliseconds * 0.92) return;
+    }
+    final idx = state.currentIndex;
+    if (_scrobbled.contains(idx)) return;
+    final ep = currentEpisode.number;
+    if (ep == null || ep <= 0 || ep != ep.truncateToDouble()) return;
+    if (!sl.isRegistered<TrackerHub>()) return;
+    _scrobbled.add(idx);
+    sl<TrackerHub>().scrobble(
+      malId: malId,
+      title: scrobbleTitle,
+      tmdbId: tmdbId,
+      tmdbIsTv: tmdbIsTv,
+      imdbId: imdbId,
+      episode: ep.toInt(),
+      // Deliberately the raw field, not seasonOf(): that falls back to parsing
+      // the episode title, and a guessed season written into someone's watch
+      // history is worse than the flat numbering it would replace.
+      season: currentEpisode.season,
+      seasonEpisode: seasonEpisodeOf(episodes, currentEpisode),
+    );
+  }
+
+  /// Push "Watching {title}" with timestamps Discord interpolates into a
+  /// progress bar. Waits for a known duration so Discord doesn't keep a first
+  /// payload with no end time (rate-limited).
+  void _pushDiscordWatching() {
+    final discordTitle = showTitle ?? scrobbleTitle;
+    if (discordTitle == null ||
+        discordTitle.isEmpty ||
+        _lastDur <= Duration.zero ||
+        !sl.isRegistered<DiscordRpc>()) {
+      return;
+    }
+    unawaited(
+      sl<DiscordRpc>().setWatching(
+        title: discordTitle,
+        episodeLabel: discordEpisodeLabel(
+          currentEpisode,
+          fallbackNumber: state.currentIndex + 1,
+        ),
+        posterUrl: cover,
+        position: _lastPos,
+        duration: _lastDur,
+        playing: !_discordPaused,
+      ),
+    );
+  }
+
+  Future<void> _enrichEpisodeTitles() async {
+    if (!sl.isRegistered<EpisodeMetadataService>()) return;
+    try {
+      final next = await sl<EpisodeMetadataService>().enrich(
+        episodes: episodes,
+        type: (scrobbleTitle != null || malId != null)
+            ? ProviderType.anime
+            : ProviderType.movie,
+        malId: malId,
+        tmdbId: tmdbId,
+        tmdbIsTv: tmdbIsTv,
+      );
+      if (isClosed || identical(next, episodes)) return;
+      episodes = next;
+    } catch (_) {/* keep source titles */}
+  }
+
+  /// Client-mode: apply the host's state without re-broadcasting. Seeks only on
+  /// meaningful drift (the controller already gates with needsCorrection).
+  Future<void> applyRemote(
+      {required bool playing, required Duration position, double? rate}) async {
+    if ((_lastPos - position).abs() > const Duration(milliseconds: 2500)) {
+      // Reuse the robust resume machinery so the seek lands on flaky hosts.
+      _pendingResume = position;
+      await player.seek(position);
+    }
+    if (rate != null && rate > 0) player.setRate(rate);
+    if (playing && !player.state.playing) player.play();
+    if (!playing && player.state.playing) player.pause();
+  }
+
+  @override
+  Future<void> close() async {
+    // Leaving supersedes anything still in flight. Every delayed continuation
+    // in here bails when _gen moves on, so bumping it once is what stops one
+    // firing into a disposed player: the resume watchdog sleeps 15s, then 4s
+    // more, then seeks — and a tester who left before that landed on
+    // `Assertion failed: "[Player] has been disposed"`. Its only other guard
+    // was "a newer open replaced me", which closing never was.
+    //
+    // Before _persist, which doesn't consult _gen — the resume mark is still
+    // written on the way out.
+    _gen++;
+    // SILENCE FIRST, then do the bookkeeping.
+    //
+    // Everything below can wait on the network — _persist's exit flush forces a
+    // cloud upsert past its throttle — and mpv keeps playing for as long as any
+    // of it takes. A signed-in user on a slow connection hears the episode for
+    // another 5-10 seconds after leaving. (Signed out there is no upsert at
+    // all, which is why this never shows up in local testing.)
+    //
+    // Nothing after this reads live player state: _persist saves _lastPos /
+    // _lastDur, which the position stream already filled, so pausing changes
+    // what the user HEARS and nothing about what gets SAVED. Deliberately not
+    // awaited — a wedged player must not be able to delay teardown, which is
+    // the very thing being fixed.
+    unawaited(player.pause().catchError((_) {}));
+    await _persist(flush: true);
+    // Leaving the player → drop Watching. Do not immediately restore a
+    // "Playing" browse status; that is what kept the profile occupied after
+    // the episode ended. Detail screens set browsing on their own init.
+    if (sl.isRegistered<DiscordRpc>()) {
+      sl<DiscordRpc>().clear(delay: DiscordRpc.playerExitClearDelay);
+    }
+    for (final s in _subs) {
+      s.cancel();
+    }
+    _stallTimer?.cancel();
+    _toastTimer?.cancel();
+    _discordPauseTimer?.cancel();
+    // Stop any active torrent stream + delete its buffered pieces.
+    await _stopTorrent();
+    toast.dispose();
+    subtitleStyleRev.dispose();
+    fillerEpisodes.dispose();
+    await player.dispose();
+    return super.close();
+  }
+}
