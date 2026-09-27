@@ -1,0 +1,201 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:watch_app/core/reading/reader_settings.dart';
+
+void main() {
+  group('readerDecodeWidth', () {
+    test('scales device width by zoom headroom', () {
+      expect(readerDecodeWidth(1080), 2160); // 2x headroom for pinch-zoom
+    });
+    test('never returns below device width', () {
+      expect(readerDecodeWidth(1080, zoomHeadroom: 0.5), 1080);
+    });
+    test('caps to a sane maximum so huge webtoon strips do not decode 8k wide', () {
+      expect(readerDecodeWidth(4000), 4096);
+    });
+  });
+
+  group('fitToBoxFit', () {
+    test('contain maps to BoxFit.contain', () {
+      expect(
+        fitToBoxFit(FitMode.contain, pageAspect: 0.7, screenAspect: 0.5),
+        BoxFit.contain,
+      );
+    });
+    test('width maps to BoxFit.fitWidth', () {
+      expect(
+        fitToBoxFit(FitMode.width, pageAspect: 0.7, screenAspect: 0.5),
+        BoxFit.fitWidth,
+      );
+    });
+    test('height maps to BoxFit.fitHeight', () {
+      expect(
+        fitToBoxFit(FitMode.height, pageAspect: 0.7, screenAspect: 0.5),
+        BoxFit.fitHeight,
+      );
+    });
+    test('original maps to BoxFit.none', () {
+      expect(
+        fitToBoxFit(FitMode.original, pageAspect: 0.7, screenAspect: 0.5),
+        BoxFit.none,
+      );
+    });
+    test('smart fits width when the page is taller than the screen', () {
+      // pageAspect < screenAspect => page is relatively taller/narrower.
+      expect(
+        fitToBoxFit(FitMode.smart, pageAspect: 0.5, screenAspect: 0.6),
+        BoxFit.fitWidth,
+      );
+    });
+    test('smart fits height when the page is not taller than the screen', () {
+      expect(
+        fitToBoxFit(FitMode.smart, pageAspect: 0.7, screenAspect: 0.6),
+        BoxFit.fitHeight,
+      );
+    });
+  });
+
+  group('readerBgColor', () {
+    test('black', () {
+      expect(readerBgColor('black'), Colors.black);
+    });
+    test('white', () {
+      expect(readerBgColor('white'), Colors.white);
+    });
+    test('gray', () {
+      expect(readerBgColor('gray'), const Color(0xFF121212));
+    });
+    test('system falls back to the app background', () {
+      expect(readerBgColor('system'), isNotNull);
+    });
+  });
+
+  group('readerColorFilter', () {
+    test('none applies no filter', () {
+      expect(readerColorFilter('none'), isNull);
+    });
+
+    test('an unrecognized key falls back to no filter', () {
+      expect(readerColorFilter('bogus'), isNull);
+    });
+
+    test('grayscale weights every row by luminance (0.2126/0.7152/0.0722)', () {
+      expect(
+        readerColorFilter('grayscale'),
+        const ColorFilter.matrix(<double>[
+          0.2126, 0.7152, 0.0722, 0, 0, //
+          0.2126, 0.7152, 0.0722, 0, 0, //
+          0.2126, 0.7152, 0.0722, 0, 0, //
+          0, 0, 0, 1, 0, //
+        ]),
+      );
+    });
+
+    test('invert negates each channel and offsets by 255', () {
+      expect(
+        readerColorFilter('invert'),
+        const ColorFilter.matrix(<double>[
+          -1, 0, 0, 0, 255, //
+          0, -1, 0, 0, 255, //
+          0, 0, -1, 0, 255, //
+          0, 0, 0, 1, 0, //
+        ]),
+      );
+    });
+
+    test('sepia uses the standard sepia coefficients', () {
+      expect(
+        readerColorFilter('sepia'),
+        const ColorFilter.matrix(<double>[
+          0.393, 0.769, 0.189, 0, 0, //
+          0.349, 0.686, 0.168, 0, 0, //
+          0.272, 0.534, 0.131, 0, 0, //
+          0, 0, 0, 1, 0, //
+        ]),
+      );
+    });
+  });
+
+  group('pairPages', () {
+    test('four normal pages pair up left-to-right', () {
+      expect(pairPages(4, rtl: false), [
+        [0, 1],
+        [2, 3],
+      ]);
+    });
+
+    test('rtl reverses the two indices within each pair', () {
+      expect(pairPages(4, rtl: true), [
+        [1, 0],
+        [3, 2],
+      ]);
+    });
+
+    test('a wide page stands alone, and so does the page it displaced', () {
+      // Page 2 is a full-spread scan: it takes a slot on its own, which
+      // leaves page 3 without a partner, so it stands alone too.
+      expect(pairPages(4, rtl: false, wide: {2}), [
+        [0, 1],
+        [2],
+        [3],
+      ]);
+    });
+
+    test('empty chapter yields no spreads', () {
+      expect(pairPages(0, rtl: false), <List<int>>[]);
+    });
+
+    test('a single page is its own spread', () {
+      expect(pairPages(1, rtl: false), [
+        [0],
+      ]);
+    });
+
+    test('an odd count leaves the last page alone', () {
+      expect(pairPages(5, rtl: false), [
+        [0, 1],
+        [2, 3],
+        [4],
+      ]);
+    });
+  });
+
+  group('webtoonZoomHeadroom', () {
+    // The strip is a different problem from a paged reader. ResizeImage caps
+    // width only, so a 1:3 slice at 2x headroom decodes to ~53MB against an
+    // 80MB image cache — one page. Every scroll then evicts the page behind
+    // it and scrolling back re-decodes, which is the stutter users report.
+    test('an un-zoomed strip decodes at 1x, so pages stay resident', () {
+      expect(webtoonZoomHeadroom(1.0), 1.0);
+      expect(readerDecodeWidth(1080, zoomHeadroom: webtoonZoomHeadroom(1.0)),
+          1080);
+    });
+
+    test('a hair above 1 is still 1x — a stray pixel must not cost 4x memory',
+        () {
+      expect(webtoonZoomHeadroom(1.02), 1.0);
+      expect(webtoonZoomHeadroom(1.05), 1.0);
+    });
+
+    test('zooming in asks for the resolution actually on screen', () {
+      expect(webtoonZoomHeadroom(2.0), 2.0);
+      expect(readerDecodeWidth(1080, zoomHeadroom: webtoonZoomHeadroom(2.0)),
+          2160);
+    });
+
+    test('capped at 3x — past that the source has no more detail to give', () {
+      expect(webtoonZoomHeadroom(4.0), 3.0);
+      expect(webtoonZoomHeadroom(99.0), 3.0);
+    });
+
+    test('the memory it buys, stated plainly', () {
+      // 1:3 slice on a 1080px phone, 4 bytes a pixel.
+      double mb(double headroom) {
+        final w = readerDecodeWidth(1080, zoomHeadroom: headroom);
+        return w * w * 3 * 4 / (1024 * 1024);
+      }
+      expect(mb(webtoonZoomHeadroom(1.0)), lessThan(15));   // ~13MB, 6 fit
+      expect(mb(2.0), greaterThan(50));                     // ~53MB, one fits
+    });
+  });
+}
