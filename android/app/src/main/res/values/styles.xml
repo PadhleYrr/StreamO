@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Theme applied to the Android Window while the process is starting when the OS's Dark Mode setting is off -->
+    <style name="LaunchTheme" parent="Theme.AppCompat.Light.NoActionBar">
+        <!-- Show a splash screen on the activity. Automatically removed when
+             the Flutter engine draws its first frame -->
+        <item name="android:windowBackground">@drawable/launch_background</item>
+        <!-- Draw into the display cutout instead of letting the system letterbox
+             the window away from it. On a punch-hole phone in landscape that
+             reserved strip is the full height of the camera edge (81px on the
+             test device), which showed up as a black band the player could never
+             fill — no BoxFit reaches it, because those pixels are outside our
+             window entirely. Deliberately on LaunchTheme, not NormalTheme: this
+             is a *window* attribute, resolved when the window is created, and
+             LaunchTheme is what's in force then. Flutter's later swap to
+             NormalTheme doesn't rebuild the window, so setting it there is a
+             no-op. Needs API 27+; older devices ignore attributes they don't
+             know, so no values-v27 split is required. -->
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+    </style>
+    <!-- Theme applied to the Android Window as soon as the process has started.
+         This theme determines the color of the Android Window while your
+         Flutter UI initializes, as well as behind your Flutter UI while its
+         running.
+
+         This Theme is only used starting with V2 of Flutter's Android embedding. -->
+    <style name="NormalTheme" parent="Theme.AppCompat.Light.NoActionBar">
+        <item name="android:windowBackground">@color/launch_bg</item>
+    </style>
+    <!-- Transparent Material theme for CloudStreamSettingsActivity: a host for a
+         plugin's own settings UI (a BottomSheetDialogFragment). MaterialComponents
+         parent supplies the bottomSheetDialogTheme attrs the plugin relies on; the
+         translucent window lets the sheet float over a dim backdrop. -->
+    <style name="Theme.CloudStreamSettings" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:windowAnimationStyle">@null</item>
+    </style>
+    <!-- Standard Material DayNight theme for AniyomiSettingsActivity: hosts a
+         PreferenceFragmentCompat for an Aniyomi source's own settings. -->
+    <style name="Theme.AniyomiSettings" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/settings_surface</item>
+        <item name="colorPrimaryDark">@color/settings_surface</item>
+        <item name="colorAccent">@color/settings_accent</item>
+        <item name="android:colorBackground">@color/launch_bg</item>
+        <item name="android:windowBackground">@color/launch_bg</item>
+        <item name="android:textColorPrimary">@color/settings_text</item>
+    </style>
+    <!-- Same, for MihonSettingsActivity: hosts a PreferenceFragmentCompat for a
+         Mihon manga source's own settings. Separate style so the anime theme
+         can be restyled without touching manga (and vice versa). -->
+    <style name="Theme.MihonSettings" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/settings_surface</item>
+        <item name="colorPrimaryDark">@color/settings_surface</item>
+        <item name="colorAccent">@color/settings_accent</item>
+        <item name="android:colorBackground">@color/launch_bg</item>
+        <item name="android:windowBackground">@color/launch_bg</item>
+        <item name="android:textColorPrimary">@color/settings_text</item>
+    </style>
+
+    <!-- Native TV player control-row button (Episodes / Audio & Subs / Next).
+         The Activity handles focus highlight (accent tint + scale) in code so it
+         can use the caller's theme accent. -->
+    <style name="TvPillButton">
+        <item name="android:layout_width">wrap_content</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:background">@drawable/tv_btn_pill</item>
+        <item name="android:focusable">true</item>
+        <item name="android:gravity">center_vertical</item>
+        <item name="android:drawablePadding">9dp</item>
+        <item name="android:paddingHorizontal">22dp</item>
+        <item name="android:paddingVertical">13dp</item>
+        <item name="android:textColor">#FFFFFF</item>
+        <item name="android:textSize">15sp</item>
+        <item name="android:textStyle">bold</item>
+        <item name="android:letterSpacing">0.01</item>
+    </style>
+
+    <!-- Smaller header/quick-action pill (JioHotstar-style top-right + slim bottom
+         row). Same behaviour, tighter footprint. -->
+    <style name="TvPillButtonSmall" parent="TvPillButton">
+        <item name="android:paddingHorizontal">15dp</item>
+        <item name="android:paddingVertical">9dp</item>
+        <item name="android:textSize">13sp</item>
+        <item name="android:drawablePadding">7dp</item>
+    </style>
+</resources>
