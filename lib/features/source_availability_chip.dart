@@ -128,7 +128,7 @@ class _SourceAvailabilityChipState extends State<SourceAvailabilityChip> {
           color: bg,
           borderRadius: BorderRadius.circular(20),
           border: Border.all(
-            color: count > 0 ? AppColors.accent.withOpacity(0.3) : AppColors.divider,
+            color: count > 0 ? AppColors.accent.withOpacity(0.3) : AppColors.hairline,
             width: 1,
           ),
         ),
