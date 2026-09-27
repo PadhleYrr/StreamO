@@ -1,0 +1,1720 @@
+import 'dart:async';
+import 'dart:io';
+
+import 'package:cached_network_image/cached_network_image.dart';
+import 'package:dio/dio.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:hive/hive.dart';
+import 'package:watch_app/core/di/injector.dart';
+import 'package:watch_app/core/models/episode.dart';
+import 'package:watch_app/core/models/home_section.dart';
+import 'package:watch_app/core/models/media_detail.dart';
+import 'package:watch_app/core/models/media_item.dart';
+import 'package:watch_app/core/models/page_content.dart';
+import 'package:watch_app/core/models/provider_info.dart';
+import 'package:watch_app/core/models/video_source.dart';
+import 'package:watch_app/core/models/watch_status.dart';
+import 'package:watch_app/core/playback/playback_prefs.dart';
+import 'package:watch_app/core/privacy/incognito_mode.dart';
+import 'package:watch_app/core/provider/base_provider.dart';
+import 'package:watch_app/core/provider/cloudstream_provider.dart';
+import 'package:watch_app/core/provider/provider_manager.dart';
+import 'package:watch_app/core/provider/reading_provider.dart';
+import 'package:watch_app/core/reading/read_history.dart';
+import 'package:watch_app/core/reading/read_store.dart';
+import 'package:watch_app/core/reading/reader_prefs.dart';
+import 'package:watch_app/core/reading/reader_settings.dart';
+import 'package:watch_app/core/reading/tiles/tiled_page_image.dart';
+import 'package:watch_app/core/repository/source_repository.dart';
+import 'package:watch_app/core/state/active_source_cubit.dart';
+import 'package:watch_app/core/supabase/supabase_service.dart';
+import 'package:watch_app/core/tracker/tracker.dart';
+import 'package:watch_app/core/tracker/tracker_hub.dart';
+import 'package:watch_app/features/reader/manga_reader_screen.dart';
+import 'package:watch_app/features/reader/reader_pull_chapter.dart';
+
+// ── Pure-logic tests ────────────────────────────────────────────────────────
+
+void _pureLogicTests() {
+  // Tap-zone behaviour now lives in test/reading/tap_zones_test.dart — the
+  // reader reads a configurable layout instead of a hardcoded thirds split,
+  // and webtoon mode scrolls on tap where it used to do nothing.
+
+  group('preloadWindow', () {
+    test('returns the next 3 indices', () {
+      expect(preloadWindow(0, 10), [1, 2, 3]);
+      expect(preloadWindow(5, 10), [6, 7, 8]);
+    });
+
+    test('clamps to the end of the chapter', () {
+      expect(preloadWindow(8, 10), [9]);
+      expect(preloadWindow(9, 10), <int>[]);
+    });
+
+    test('empty chapter yields nothing', () {
+      expect(preloadWindow(0, 0), <int>[]);
+    });
+  });
+
+  group('clampPageIndex', () {
+    test('in-range index passes through', () {
+      expect(clampPageIndex(3, 10), 3);
+    });
+
+    test('negative clamps to 0', () {
+      expect(clampPageIndex(-1, 10), 0);
+    });
+
+    test('out-of-range clamps to the last page', () {
+      expect(clampPageIndex(99, 10), 9);
+    });
+
+    test('an empty/unknown chapter clamps to 0', () {
+      expect(clampPageIndex(5, 0), 0);
+    });
+  });
+
+  group('mostVisiblePage', () {
+    // What the page counter reads in webtoon mode now. It used to come off
+    // scroll position, which assumes uniform page heights — webtoon pages vary
+    // enormously, so the number stuck, jumped and skipped, and a reader could
+    // not tell whether they were in sequence.
+    test('nothing on screen yet reads as unknown, not page 0', () {
+      // Null lets the caller keep its old estimate for that frame; 0 would
+      // yank the counter back to the top of the chapter.
+      expect(mostVisiblePage({}), isNull);
+    });
+
+    test('the page with most of itself showing wins', () {
+      expect(mostVisiblePage({3: 0.2, 4: 0.75, 5: 0.05}), 4);
+    });
+
+    test('a half-and-half scroll picks one, and not the later one', () {
+      // Mid-scroll both pages report the same fraction. Taking the later one
+      // would tick the counter forward before the page arrived.
+      expect(mostVisiblePage({6: 0.5, 7: 0.5}), 6);
+    });
+
+    test('a single fully visible page is that page', () {
+      expect(mostVisiblePage({9: 1.0}), 9);
+    });
+
+    test('pages scrolled past are gone, not zero-weighted', () {
+      // The caller removes them at 0; if any slipped through they must not win.
+      expect(mostVisiblePage({1: 0.0, 2: 0.0, 8: 0.3}), 8);
+    });
+  });
+
+  group('verticalPageIndex', () {
+    // The bug this guards: pages that have not loaded reserve a guessed
+    // height, so a chapter of tall webtoon strips can lay out at half its real
+    // length. Scroll fast and you hit a "bottom" that is nowhere near the end
+    // — and reaching the bottom marks the chapter read AND scrobbles it to
+    // AniList/MAL, for a chapter nobody looked at.
+    test('the bottom of a fully loaded chapter is the last page', () {
+      expect(
+        verticalPageIndex(
+          atBottom: true,
+          lastPageLoaded: true,
+          pageCount: 40,
+          visible: {38: 0.9},
+        ),
+        39,
+      );
+    });
+
+    test('a bottom reached before the last page loaded is not the end', () {
+      // The list is short because the pages below are still placeholders.
+      // Report where the reader actually is, not "finished".
+      expect(
+        verticalPageIndex(
+          atBottom: true,
+          lastPageLoaded: false,
+          pageCount: 40,
+          visible: {5: 0.8},
+        ),
+        5,
+      );
+    });
+
+    test('mid-chapter reads as the visible page either way', () {
+      for (final loaded in [true, false]) {
+        expect(
+          verticalPageIndex(
+            atBottom: false,
+            lastPageLoaded: loaded,
+            pageCount: 40,
+            visible: {12: 0.6, 13: 0.4},
+          ),
+          12,
+        );
+      }
+    });
+
+    test('nothing visible yet is unknown, so the caller can fall back', () {
+      expect(
+        verticalPageIndex(
+          atBottom: false,
+          lastPageLoaded: false,
+          pageCount: 40,
+          visible: const {},
+        ),
+        isNull,
+      );
+    });
+
+    test('an empty chapter is page 0, never a negative index', () {
+      expect(
+        verticalPageIndex(
+          atBottom: true,
+          lastPageLoaded: true,
+          pageCount: 0,
+          visible: const {},
+        ),
+        0,
+      );
+    });
+  });
+
+  group('reservedPageHeight', () {
+    test("uses the page's own measured shape when it has one", () {
+      expect(reservedPageHeight(400, measured: 2.0, chapter: 1.2), 800);
+    });
+
+    test("falls back to the chapter's shape for a page not yet seen", () {
+      // Webtoon pages within a chapter are near enough the same shape, so the
+      // first measured page is a good stand-in for the rest.
+      expect(reservedPageHeight(400, chapter: 3.0), 1200);
+    });
+
+    test('knows nothing yet — still reserves a portrait page, not 200px', () {
+      // The flat 200px placeholder is what made the list jump by most of a
+      // screen on every load.
+      expect(reservedPageHeight(400), 400 * kDefaultPageAspect);
+      expect(reservedPageHeight(400), greaterThan(400));
+    });
+
+    test('a nonsense aspect does not collapse the page to nothing', () {
+      expect(reservedPageHeight(400, measured: 0), 400 * kDefaultPageAspect);
+      expect(reservedPageHeight(400, measured: -1), 400 * kDefaultPageAspect);
+    });
+  });
+
+  group('estimateIndexFromScroll', () {
+    test('top of scroll is page 0, bottom is the last page', () {
+      expect(estimateIndexFromScroll(0, 1000, 5), 0);
+      expect(estimateIndexFromScroll(1000, 1000, 5), 4);
+    });
+
+    test('midway scroll lands near the middle page', () {
+      expect(estimateIndexFromScroll(500, 1000, 5), 2);
+    });
+
+    test(
+      'a chapter that fits on screen (no scroll extent) is the last page',
+      () {
+        expect(estimateIndexFromScroll(0, 0, 5), 4);
+      },
+    );
+
+    test('empty chapter is page 0', () {
+      expect(estimateIndexFromScroll(0, 1000, 0), 0);
+    });
+  });
+}
+
+// ── Widget-level fakes ───────────────────────────────────────────────────────
+
+/// A fake reading-capable source that hands back canned pages per chapter
+/// URL — mirrors `_FakeReadingProvider` in novel_reader_test.dart, with
+/// `getPages` implemented instead of `getText`.
+class _FakeReadingProvider implements BaseProvider, ReadingProvider {
+  _FakeReadingProvider(
+    this.sourceId,
+    this.pagesByUrl, {
+    this.episodes,
+    this.gate,
+  });
+
+  /// Holds `getPages` open so a test can look at the reader mid-load. Left
+  /// null by every other test, which keeps the call synchronous as before.
+  final Future<void>? gate;
+
+  @override
+  final String sourceId;
+  final Map<String, List<PageImage>> pagesByUrl;
+
+  /// Full chapter list for `getEpisodes` — the `resolveChapters` upgrade
+  /// test is the only one that sets this. Every other test leaves it null,
+  /// so `getEpisodes` stays unreachable (`UnimplementedError`), same as
+  /// before this field existed.
+  final List<Episode>? episodes;
+
+  @override
+  String get displayName => sourceId;
+
+  @override
+  Future<ProviderInfo> getInfo() => throw UnimplementedError();
+
+  @override
+  Future<List<HomeSection>?> getHome({String category = 'sub'}) =>
+      throw UnimplementedError();
+
+  @override
+  Future<List<MediaItem>> popular({
+    String category = 'sub',
+    int dateRange = 7,
+    int page = 1,
+  }) => throw UnimplementedError();
+
+  @override
+  Future<List<MediaItem>> search(
+    String query,
+    int page, {
+    String category = '',
+  }) => throw UnimplementedError();
+
+  @override
+  Future<MediaDetail> getDetail(String url, {String category = 'sub'}) =>
+      throw UnimplementedError();
+
+  @override
+  Future<List<Episode>> getEpisodes(String url, {String category = 'sub'}) {
+    final eps = episodes;
+    if (eps == null) throw UnimplementedError();
+    return Future.value(eps);
+  }
+
+  @override
+  Future<List<VideoSource>> getVideoSources(
+    String episodeUrl, {
+    bool fast = false,
+  }) => throw UnimplementedError();
+
+  @override
+  Future<List<PageImage>> getPages(String chapterUrl) async {
+    if (gate != null) await gate;
+    return pagesByUrl[chapterUrl] ?? const [];
+  }
+
+  @override
+  Future<ChapterText> getText(String chapterUrl) => throw UnimplementedError();
+}
+
+/// A reading source whose `getPages` throws for the first [failures] calls and
+/// succeeds after — for the retry paths. One failure is recovered from
+/// automatically; more than the reader's attempt budget is not.
+class _FlakyReadingProvider implements BaseProvider, ReadingProvider {
+  _FlakyReadingProvider(this.sourceId, this.pages, {this.failures = 1});
+
+  final int failures;
+
+  @override
+  final String sourceId;
+  final List<PageImage> pages;
+  int calls = 0;
+
+  @override
+  String get displayName => sourceId;
+
+  @override
+  Future<ProviderInfo> getInfo() => throw UnimplementedError();
+
+  @override
+  Future<List<HomeSection>?> getHome({String category = 'sub'}) =>
+      throw UnimplementedError();
+
+  @override
+  Future<List<MediaItem>> popular({
+    String category = 'sub',
+    int dateRange = 7,
+    int page = 1,
+  }) => throw UnimplementedError();
+
+  @override
+  Future<List<MediaItem>> search(
+    String query,
+    int page, {
+    String category = '',
+  }) => throw UnimplementedError();
+
+  @override
+  Future<MediaDetail> getDetail(String url, {String category = 'sub'}) =>
+      throw UnimplementedError();
+
+  @override
+  Future<List<Episode>> getEpisodes(String url, {String category = 'sub'}) =>
+      throw UnimplementedError();
+
+  @override
+  Future<List<VideoSource>> getVideoSources(
+    String episodeUrl, {
+    bool fast = false,
+  }) => throw UnimplementedError();
+
+  @override
+  Future<List<PageImage>> getPages(String chapterUrl) async {
+    calls++;
+    if (calls <= failures) throw Exception('network blip');
+    return pages;
+  }
+
+  @override
+  Future<ChapterText> getText(String chapterUrl) => throw UnimplementedError();
+}
+
+/// Records every `flush` value passed to [ReadHistory.save] (synchronously,
+/// before delegating to the real implementation) so the carry-forward
+/// requirement — flush on chapter change + on dispose — is provable without
+/// reaching into private reader state. Same shape as novel_reader_test.dart's
+/// spy.
+class _SpyReadHistory extends ReadHistory {
+  _SpyReadHistory(super.service, super.currentUserId);
+
+  final List<bool> flushCalls = [];
+
+  @override
+  Future<void> save(ReadEntry e, {bool flush = false}) {
+    flushCalls.add(flush);
+    return super.save(e, flush: flush);
+  }
+}
+
+Episode chapter(String id, String url, {double? number}) =>
+    Episode(id: id, title: id, url: url, number: number);
+
+/// Records every [Tracker.scrobble] call — no network, everything else is a
+/// no-op. Mirrors media_kind_test.dart's `_FakeTracker`.
+class _FakeTracker extends ChangeNotifier implements Tracker {
+  @override
+  bool get supportsReading => true;
+
+  int scrobbleCalls = 0;
+  MediaKind? lastScrobbleKind;
+  int? lastScrobbleEpisode;
+  int? lastScrobbleMalId;
+  bool? lastScrobbleNovel;
+
+  @override
+  String get displayName => 'Fake';
+  @override
+  bool get isConnected => true;
+  @override
+  String? get viewerName => 'someone';
+  @override
+  String? get viewerAvatar => null;
+  @override
+  bool get autoSync => true;
+  @override
+  set autoSync(bool value) {}
+
+  @override
+  Future<bool> connect() async => true;
+  @override
+  Future<void> disconnect() async {}
+
+  @override
+  Future<void> markWatching({
+    int? malId,
+    String? title,
+    int? tmdbId,
+    bool tmdbIsTv = false,
+    String? imdbId,
+    MediaKind kind = MediaKind.anime,
+  }) async {}
+
+  @override
+  Future<void> scrobble({
+    int? malId,
+    String? title,
+    int? tmdbId,
+    bool tmdbIsTv = false,
+    String? imdbId,
+    required int episode,
+    int? season,
+    int? seasonEpisode,
+    MediaKind kind = MediaKind.anime,
+    bool novel = false,
+  }) async {
+    scrobbleCalls++;
+    lastScrobbleKind = kind;
+    lastScrobbleEpisode = episode;
+    lastScrobbleMalId = malId;
+    lastScrobbleNovel = novel;
+  }
+
+  @override
+  Future<void> setStatus({
+    int? malId,
+    String? title,
+    int? tmdbId,
+    bool tmdbIsTv = false,
+    String? imdbId,
+    required WatchStatus status,
+    MediaKind kind = MediaKind.anime,
+  }) async {}
+
+  @override
+  Future<void> removeFromList({
+    int? malId,
+    String? title,
+    int? tmdbId,
+    bool tmdbIsTv = false,
+    String? imdbId,
+    String? pinnedId,
+    MediaKind kind = MediaKind.anime,
+  }) async {}
+
+  @override
+  Future<List<TrackerListItem>> fetchList() async => const [];
+
+  @override
+  Future<TrackerEntry?> fetchEntry({
+    int? malId,
+    String? title,
+    int? tmdbId,
+    bool tmdbIsTv = false,
+    String? imdbId,
+    String? pinnedId,
+    MediaKind kind = MediaKind.anime,
+    bool novel = false,
+  }) async => null;
+
+  @override
+  Future<void> updateEntry({
+    int? malId,
+    String? title,
+    int? tmdbId,
+    bool tmdbIsTv = false,
+    String? imdbId,
+    String? pinnedId,
+    WatchStatus? status,
+    double? score,
+    int? progress,
+    MediaKind kind = MediaKind.anime,
+  }) async {}
+
+  @override
+  Future<List<TrackerSearchResult>> searchEntries(
+    String query, {
+    MediaKind kind = MediaKind.anime,
+  }) async => const [];
+
+  @override
+  Map<String, dynamic>? exportSession() => null;
+  @override
+  Future<void> importSession(Map<String, dynamic> session) async {}
+}
+
+List<PageImage> pages(int count, {String prefix = 'https://example.com/p'}) =>
+    List.generate(count, (i) => PageImage(url: '$prefix$i.jpg'));
+
+/// Pumps a bounded, small number of frames instead of `pumpAndSettle()`.
+///
+/// Not `pumpAndSettle()` because every page's loading placeholder used to be
+/// an indeterminate `CircularProgressIndicator`, which — against an
+/// unreachable fake URL in this network-less sandbox — animates forever and
+/// never lets `pumpAndSettle()` see "no more frames scheduled". The
+/// placeholders are now static (`ColoredBox`, matching
+/// poster_card.dart/continue_card.dart's convention), so this is moot, but
+/// bounded pumping is kept regardless — it's simpler to reason about than
+/// "settle, but only sometimes."
+///
+/// Pumps past `kDoubleTapTimeout` (~300ms): every page's GestureDetector
+/// registers both `onTapUp` (tap zones) and `onDoubleTap` (zoom), so Flutter
+/// delays resolving a single tap until it's sure a second tap isn't coming.
+/// A shorter pump budget would assert before that single tap ever fires.
+Future<void> settle(WidgetTester tester) async {
+  await tester.pump();
+  for (var i = 0; i < 5; i++) {
+    await tester.pump(const Duration(milliseconds: 100));
+  }
+}
+
+/// [settle], but past the reader's automatic retry wait as well — otherwise a
+/// test sees the moment between the two attempts and reads it as a failure.
+Future<void> settleThroughRetry(WidgetTester tester) async {
+  await tester.pump();
+  await tester.pump(const Duration(milliseconds: 700));
+  await settle(tester);
+}
+
+/// Whether [url] is registered (pending/live/keepAlive) in Flutter's global
+/// image cache — proves `precacheImage`/`CachedNetworkImage` actually
+/// touched it, without needing the real fetch to complete (unreachable in
+/// this sandbox). `precacheImage` → `ImageProvider.resolve` →
+/// `ImageCache.putIfAbsent` runs synchronously, so no extra pump is needed
+/// between triggering it and checking here.
+///
+/// [width] must be the same `readerDecodeWidth` result the reader itself
+/// computed (via [_decodeWidthFor]), since the on-screen page resolves
+/// through a `ResizeImage`-wrapped, `maxWidth`-bounded provider — a
+/// different cache key from a bare `CachedNetworkImageProvider(url)`.
+///
+/// Preloading no longer shows up here at all: it warms the disk cache
+/// rather than decoding into memory, so these checks are now about what
+/// should be *absent* from the image cache.
+Future<bool> _imageTracked(String url, int width) async {
+  final key = await ResizeImage.resizeIfNeeded(
+    width,
+    null,
+    CachedNetworkImageProvider(url, maxWidth: width),
+  ).obtainKey(ImageConfiguration.empty);
+  return PaintingBinding.instance.imageCache.statusForKey(key).tracked;
+}
+
+/// The decode width the reader itself would compute for the current test
+/// surface — mirrors `_MangaReaderScreenState._decodeWidth` exactly so
+/// `_imageTracked` checks the real cache key instead of a guessed one.
+int _decodeWidthFor(WidgetTester tester) {
+  final mq = MediaQuery.of(tester.element(find.byType(MangaReaderScreen)));
+  return readerDecodeWidth((mq.size.width * mq.devicePixelRatio).round());
+}
+
+/// The scale currently applied to the webtoon strip — read straight off the
+/// `Transform` that wraps the vertical `ListView` (the same one both the
+/// broken `InteractiveViewer` and the fixed `RawGestureDetector` produce), so
+/// the pinch test asserts the real rendered scale in either structure.
+double _webtoonScale(WidgetTester tester) {
+  final t = tester
+      .widgetList<Transform>(
+        find.ancestor(
+          of: find.byKey(const ValueKey('manga-listview')),
+          matching: find.byType(Transform),
+        ),
+      )
+      .first;
+  return t.transform.getMaxScaleOnAxis();
+}
+
+/// A real two-pointer pinch driven by two `TestGesture`s. It starts with a
+/// small *common* downward drift (both fingers together — a pure translation,
+/// no change in span) and only then spreads the fingers apart.
+///
+/// That opening drift is deliberate and is what makes this a faithful repro
+/// of the on-device bug: a Scrollable's vertical-drag recognizer greedily
+/// claims that net downward motion and wins the gesture arena, after which a
+/// scale recognizer sitting *above* the ListView (the old
+/// InteractiveViewer) never gets the pinch. Real fingers never spread with a
+/// perfectly cancelling net motion, so on a device the strip refused to zoom;
+/// a symmetric-only spread hides the bug because the net drag is zero.
+Future<void> _pinchOpen(WidgetTester tester) async {
+  final center = tester.getCenter(
+    find.byKey(const ValueKey('manga-listview')),
+  );
+  final f1 = await tester.startGesture(center - const Offset(0, 40), pointer: 1);
+  final f2 = await tester.startGesture(center + const Offset(0, 40), pointer: 2);
+  await tester.pump();
+  // Phase 1: both fingers drift down together (net vertical drag, span held).
+  for (var i = 0; i < 3; i++) {
+    await f1.moveBy(const Offset(0, 10));
+    await f2.moveBy(const Offset(0, 10));
+    await tester.pump();
+  }
+  // Phase 2: spread apart (span grows -> a pinch).
+  for (var i = 0; i < 8; i++) {
+    await f1.moveBy(const Offset(0, -16));
+    await f2.moveBy(const Offset(0, 16));
+    await tester.pump();
+  }
+  await f1.up();
+  await f2.up();
+}
+
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  _pureLogicTests();
+
+  group('MangaReaderScreen', () {
+    late Directory dir;
+    late _SpyReadHistory spyHistory;
+    late AniyomiManager ani;
+
+    // flutter_cache_manager's cache-info repo (sqflite-backed on macOS/iOS/
+    // Android) throws `StateError: databaseFactory not initialized` the
+    // first time *any* CachedNetworkImage in this whole test process ever
+    // resolves — `flutter test` never registers a sqflite plugin, and
+    // there's no first-party way to fake `databaseFactory` without a new
+    // dependency. The failure is one-time only: flutter_cache_manager
+    // doesn't retry its metadata-store lookup after the first failure, so
+    // every image after this one silently falls straight through to a
+    // network fetch instead. Absorbing that failure here — before any real
+    // test runs, and with no widget/BuildContext needed, since
+    // ImageProvider.resolve() doesn't require one — means whichever test
+    // happens to run first doesn't pay for it. Unlike a first-position
+    // `testWidgets`, `setUpAll` runs once for the group regardless of
+    // `--name` filtering, so this doesn't create an ordering dependency the
+    // way an explicit warm-up test would.
+    setUpAll(() async {
+      TestWidgetsFlutterBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(
+            const MethodChannel('plugins.flutter.io/path_provider'),
+            (call) async => '/tmp',
+          );
+      final completer = Completer<void>();
+      // runZonedGuarded, not a plain try/catch: the databaseFactory
+      // StateError is thrown from deep inside flutter_cache_manager's own
+      // detached stream-subscription chain, not from anything this function
+      // directly awaits — a try/catch here doesn't see it. Only a zone error
+      // handler around where the resolve() call *starts* that chain catches
+      // it.
+      runZonedGuarded(
+        () {
+          final stream = const CachedNetworkImageProvider(
+            'https://example.com/warmup.jpg',
+          ).resolve(ImageConfiguration.empty);
+          late ImageStreamListener listener;
+          listener = ImageStreamListener(
+            (image, sync) {
+              stream.removeListener(listener);
+              if (!completer.isCompleted) completer.complete();
+            },
+            onError: (error, stack) {
+              stream.removeListener(listener);
+              if (!completer.isCompleted) completer.complete();
+            },
+          );
+          stream.addListener(listener);
+        },
+        (error, stack) {
+          // Expected: the one-time databaseFactory failure. Swallow it.
+          if (!completer.isCompleted) completer.complete();
+        },
+      );
+      // Best-effort: don't hang the whole suite if this never resolves for
+      // some unrelated reason.
+      await completer.future.timeout(
+        const Duration(seconds: 5),
+        onTimeout: () {},
+      );
+    });
+
+    setUp(() async {
+      // CachedNetworkImage (flutter_cache_manager) hits path_provider to find
+      // a disk-cache directory; without a mock handler that throws
+      // MissingPluginException on the first real image load. Same fix as
+      // reading_detail_routing_test.dart (Task 11's own test for this
+      // routing).
+      TestWidgetsFlutterBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(
+            const MethodChannel('plugins.flutter.io/path_provider'),
+            (call) async => '/tmp',
+          );
+
+      // The global image cache persists across tests in this file — clear it
+      // so one test's precache calls can't leave stale entries that make a
+      // later test's cache assertions pass for the wrong reason.
+      PaintingBinding.instance.imageCache.clear();
+      PaintingBinding.instance.imageCache.clearLiveImages();
+
+      dir = await Directory.systemTemp.createTemp('manga_reader_test');
+      Hive.init(dir.path);
+      IncognitoMode.notifier.value = false;
+
+      await ReadStore.init();
+      await ReadHistory.init();
+      await ReaderPrefs.init();
+
+      sl.registerSingleton<ReadStore>(ReadStore());
+      spyHistory = _SpyReadHistory(SupabaseService(), () => null);
+      sl.registerSingleton<ReadHistory>(spyHistory);
+      sl.registerSingleton<ReaderPrefs>(ReaderPrefs());
+
+      ani = AniyomiManager();
+      ani.register(
+        // 'u3' returns NOTHING — the case that used to render a blank screen.
+        _FakeReadingProvider(
+          'ani:m',
+          {'u1': pages(3), 'u2': pages(2), 'u3': pages(0)},
+        ),
+      );
+      sl.registerSingleton<SourceRepository>(
+        SourceRepository(
+          manager: ProviderManager(dio: Dio()),
+          csManager: CloudStreamManager(),
+          aniManager: ani,
+          activeSource: ActiveSourceCubit(),
+          prefs: PlaybackPrefs(),
+        ),
+      );
+    });
+
+    tearDown(() async {
+      TestWidgetsFlutterBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(
+            const MethodChannel('plugins.flutter.io/path_provider'),
+            null,
+          );
+      await sl.reset();
+      await Hive.close();
+      if (await dir.exists()) await dir.delete(recursive: true);
+    });
+
+    Widget harness({int startIndex = 0}) => MaterialApp(
+      home: MangaReaderScreen(
+        sourceId: 'ani:m',
+        showId: 'm1',
+        showTitle: 'Some Manga',
+        cover: null,
+        chapters: [chapter('c1', 'u1'), chapter('c2', 'u2')],
+        startIndex: startIndex,
+      ),
+    );
+
+    /// A chapter whose source hands back an empty page list.
+    Widget emptyChapterHarness() => MaterialApp(
+      home: MangaReaderScreen(
+        sourceId: 'ani:m',
+        showId: 'm1',
+        showTitle: 'Some Manga',
+        cover: null,
+        chapters: [chapter('c3', 'u3')],
+        startIndex: 0,
+      ),
+    );
+
+    Future<void> disposeHarness(WidgetTester tester) async {
+      // Real Hive I/O happens fire-and-forget on dispose (flushed
+      // ReadHistory write) — run under runAsync so it actually resolves
+      // instead of dangling into tearDown's Hive.close(), same as
+      // novel_reader_test.dart.
+      await tester.runAsync(() async {
+        await tester.pumpWidget(const SizedBox());
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      });
+    }
+
+    testWidgets('a chapter with no pages says so instead of going black', (
+      tester,
+    ) async {
+      // The reported bug: open a chapter, get a black screen. A source
+      // returning [] is not an exception, so _error stayed null and the reader
+      // drew an empty box — no message, no retry, no way to tell whether it
+      // was loading, broken or empty.
+      //
+      // Same wording as a thrown failure on purpose: "no pages" reads as "this
+      // chapter is empty", and the real cause is almost always the source
+      // failing, which the Retry fixes.
+      await tester.pumpWidget(emptyChapterHarness());
+      // Past the retry: an empty list is asked again before it is believed.
+      await settleThroughRetry(tester);
+
+      expect(find.text(kChapterLoadFailedMessage), findsOneWidget);
+      // The way out matters as much as the message: opening the same chapter
+      // again is what actually worked when this was hit by hand.
+      expect(find.text('Retry'), findsOneWidget);
+      expect(find.byIcon(Icons.error_outline), findsOneWidget);
+
+      await disposeHarness(tester);
+    });
+
+    testWidgets('ltr direction renders a non-reversed PageView', (
+      tester,
+    ) async {
+      await tester.runAsync(() => sl<ReaderPrefs>().setDirection('ltr'));
+      await tester.pumpWidget(harness());
+      await settle(tester);
+
+      expect(find.byType(PageView), findsOneWidget);
+      expect(find.byType(ListView), findsNothing);
+      final pv = tester.widget<PageView>(find.byType(PageView));
+      expect(pv.reverse, isFalse);
+
+      await disposeHarness(tester);
+    });
+
+    testWidgets('rtl direction renders a reversed PageView', (tester) async {
+      await tester.runAsync(() => sl<ReaderPrefs>().setDirection('rtl'));
+      await tester.pumpWidget(harness());
+      await settle(tester);
+
+      expect(find.byType(PageView), findsOneWidget);
+      final pv = tester.widget<PageView>(find.byType(PageView));
+      expect(pv.reverse, isTrue);
+
+      await disposeHarness(tester);
+    });
+
+    testWidgets('vertical direction renders a scrolling strip, not a PageView', (
+      tester,
+    ) async {
+      await tester.runAsync(() => sl<ReaderPrefs>().setDirection('vertical'));
+      await tester.pumpWidget(harness());
+      await settle(tester);
+
+      // The strip is a centre-anchored CustomScrollView (two slivers around
+      // the page being read) rather than a flat ListView — see _anchorToPage.
+      expect(find.byType(CustomScrollView), findsOneWidget);
+      expect(find.byType(PageView), findsNothing);
+
+      await disposeHarness(tester);
+    });
+
+    testWidgets('jumping to a page saves it as the ReadStore position', (
+      tester,
+    ) async {
+      await tester.runAsync(() => sl<ReaderPrefs>().setDirection('ltr'));
+      await tester.pumpWidget(harness());
+      await settle(tester);
+
+      final pv = tester.widget<PageView>(find.byType(PageView));
+      await tester.runAsync(() async {
+        pv.controller!.jumpToPage(1); // the chapter's 2nd page (index 1)
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      });
+      await settle(tester);
+
+      final saved = sl<ReadStore>().get('ani:m', 'm1', 'c1');
+      expect(saved, isNotNull);
+      expect(saved!.pos, 1);
+      expect(saved.total, 3);
+
+      // Pin the other half of the carry-forward contract: a routine page
+      // turn (no chapter change, no dispose) must never flush. A regression
+      // that flips _saveProgress's default to flush: true would still leave
+      // every other assertion in this file green while pushing to Supabase
+      // on every page turn.
+      expect(spyHistory.flushCalls, everyElement(isFalse));
+
+      await disposeHarness(tester);
+    });
+
+    testWidgets(
+      'landing on the last page of a chapter scrobbles it exactly once, '
+      'with kind: manga',
+      (tester) async {
+        await tester.runAsync(() => sl<ReaderPrefs>().setDirection('ltr'));
+        final fake = _FakeTracker();
+        sl.registerSingleton<TrackerHub>(TrackerHub([fake]));
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: MangaReaderScreen(
+              sourceId: 'ani:m',
+              showId: 'm1',
+              showTitle: 'Some Manga',
+              cover: null,
+              chapters: [chapter('c1', 'u1', number: 2), chapter('c2', 'u2')],
+              startIndex: 0,
+              malId: 555,
+            ),
+          ),
+        );
+        await settle(tester);
+
+        final pv = tester.widget<PageView>(find.byType(PageView));
+        await tester.runAsync(() async {
+          pv.controller!.jumpToPage(2); // last page of a 3-page chapter
+          await Future<void>.delayed(const Duration(milliseconds: 50));
+        });
+        await settle(tester);
+
+        expect(fake.scrobbleCalls, 1);
+        expect(fake.lastScrobbleKind, MediaKind.manga);
+        expect(fake.lastScrobbleEpisode, 2);
+        expect(fake.lastScrobbleMalId, 555);
+        // Manga is not a novel — must stay on the plain (unfiltered) search.
+        expect(fake.lastScrobbleNovel, isFalse);
+
+        // Committing a slider seek back to the same (still-finished) last
+        // page must not scrobble a second time.
+        await tester.tapAt(const Offset(400, 300)); // reveal chrome
+        await settle(tester);
+        final slider = tester.widget<Slider>(find.byType(Slider));
+        await tester.runAsync(() async {
+          slider.onChangeStart!(2);
+          slider.onChangeEnd!(2);
+          await Future<void>.delayed(const Duration(milliseconds: 50));
+        });
+        await settle(tester);
+        expect(fake.scrobbleCalls, 1);
+
+        await disposeHarness(tester);
+      },
+    );
+
+    testWidgets('flushes ReadHistory on chapter change and on dispose', (
+      tester,
+    ) async {
+      await tester.runAsync(() => sl<ReaderPrefs>().setDirection('ltr'));
+      await tester.pumpWidget(harness());
+      await settle(tester);
+
+      // Chrome (bottom bar) starts hidden — reveal it so the skip_next icon
+      // exists to tap.
+      await tester.tapAt(const Offset(400, 300));
+      await settle(tester);
+
+      await tester.runAsync(() async {
+        await tester.tap(find.byIcon(Icons.skip_next_rounded));
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      });
+      await settle(tester);
+
+      expect(spyHistory.flushCalls, contains(true));
+      final flushesAfterChapterChange = spyHistory.flushCalls
+          .where((f) => f)
+          .length;
+      expect(flushesAfterChapterChange, greaterThanOrEqualTo(1));
+
+      await disposeHarness(tester);
+
+      final flushesAfterDispose = spyHistory.flushCalls.where((f) => f).length;
+      expect(flushesAfterDispose, greaterThan(flushesAfterChapterChange));
+    });
+
+    testWidgets(
+      'the next chapter stays in the scanlation group being read',
+      (tester) async {
+        await tester.runAsync(() => sl<ReaderPrefs>().setDirection('ltr'));
+
+        // How a multi-group source really lists things: every chapter, once
+        // per group. The row after Alpha's chapter 1 is BETA's chapter 1 —
+        // the same chapter again, which is what the reader used to open.
+        Episode c(int n, String group) => Episode(
+          id: 'c$n$group',
+          title: 'ch$n $group',
+          number: n.toDouble(),
+          url: 'u$n$group',
+          scanlator: group,
+        );
+        ani.register(
+          _FakeReadingProvider('ani:m', {
+            'u1Alpha': pages(3),
+            'u1Beta': pages(3),
+            'u2Alpha': pages(3),
+            'u2Beta': pages(3),
+          }),
+        );
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: MangaReaderScreen(
+              sourceId: 'ani:m',
+              showId: 'm1',
+              showTitle: 'Some Manga',
+              cover: null,
+              chapters: [
+                c(1, 'Alpha'),
+                c(1, 'Beta'),
+                c(2, 'Alpha'),
+                c(2, 'Beta'),
+              ],
+              startIndex: 0,
+            ),
+          ),
+        );
+        await settle(tester);
+
+        // The pull indicator names Alpha's chapter 2, not Beta's chapter 1.
+        var pull = tester.widget<ReaderPullChapter>(
+          find.byType(ReaderPullChapter),
+        );
+        expect(pull.nextLabel, 'ch2 Alpha');
+
+        // Pull past the end, exactly as the widget does on a real overscroll.
+        await tester.runAsync(() async {
+          pull.onChangeChapter(1);
+          await Future<void>.delayed(const Duration(milliseconds: 50));
+        });
+        await settle(tester);
+
+        pull = tester.widget<ReaderPullChapter>(
+          find.byType(ReaderPullChapter),
+        );
+        // Landed on Alpha's chapter 2: back one is Alpha's chapter 1, and
+        // Alpha has nothing after this, so there is no next. Landing on
+        // Beta's chapter 1 instead would leave prevLabel null.
+        expect(pull.prevLabel, 'ch1 Alpha');
+        expect(pull.hasNext, isFalse);
+
+        // …and the header says so: chapter 2 of 2, not "ch 3 of 4" — the row
+        // position is not the chapter number on a multi-group source.
+        await tester.tapAt(const Offset(400, 300)); // reveal chrome
+        await settle(tester);
+        expect(find.textContaining('ch 2 · pg 1/3'), findsOneWidget);
+
+        await disposeHarness(tester);
+      },
+    );
+
+    testWidgets(
+      'a single pages() failure recovers on its own, without a Retry tap',
+      (tester) async {
+        // This used to stop at the error state and wait for a tap. The failure
+        // is transient and the app already knows the fix is "ask again", so
+        // making someone press a button to do that was our problem, not theirs.
+        final flaky = _FlakyReadingProvider('ani:m', pages(3));
+        ani.register(flaky);
+
+        await tester.pumpWidget(harness());
+        await settleThroughRetry(tester);
+
+        expect(find.text('Retry'), findsNothing);
+        expect(find.byType(PageView), findsOneWidget);
+        expect(flaky.calls, 2, reason: 'should have asked a second time');
+
+        await disposeHarness(tester);
+      },
+    );
+
+    testWidgets(
+      'a source that keeps failing still shows the error, and Retry works',
+      (tester) async {
+        // Retrying forever would leave someone watching a spinner with no idea
+        // anything is wrong. Two attempts, then say so.
+        final flaky = _FlakyReadingProvider('ani:m', pages(3), failures: 3);
+        ani.register(flaky);
+
+        await tester.pumpWidget(harness());
+        await settleThroughRetry(tester);
+
+        expect(find.text(kChapterLoadFailedMessage), findsOneWidget);
+        expect(find.text('Retry'), findsOneWidget);
+        expect(find.byType(PageView), findsNothing);
+        expect(flaky.calls, 2, reason: 'two attempts, not an endless loop');
+
+        await tester.tap(find.text('Retry'));
+        await settleThroughRetry(tester);
+
+        expect(find.text('Retry'), findsNothing);
+        expect(find.byType(PageView), findsOneWidget);
+
+        await disposeHarness(tester);
+      },
+    );
+
+    testWidgets('reopening a chapter restores its saved page', (tester) async {
+      await tester.runAsync(() => sl<ReaderPrefs>().setDirection('ltr'));
+      // Pre-seed a saved position: page index 2 of a 3-page chapter.
+      await tester.runAsync(
+        () => sl<ReadStore>().save('ani:m', 'm1', 'c1', pos: 2, total: 3),
+      );
+
+      await tester.pumpWidget(harness());
+      await settle(tester);
+
+      final pv = tester.widget<PageView>(find.byType(PageView));
+      expect(pv.controller!.page, closeTo(2, 0.01));
+
+      await disposeHarness(tester);
+    });
+
+    testWidgets(
+      'resolveChapters widens a single-chapter Continue Reading resume to '
+      'the full list in the background, enabling prev/next',
+      (tester) async {
+        // Same show as a real resume: the source has 3 chapters, but the
+        // reader opens with just the middle one (mirrors what
+        // home_screen.dart's readerFor builds from a ReadEntry).
+        ani.register(
+          _FakeReadingProvider(
+            'ani:m',
+            {'u1': pages(3), 'u2': pages(2), 'u3': pages(1)},
+            episodes: [
+              chapter('c1', 'u1'),
+              chapter('c2', 'u2'),
+              chapter('c3', 'u3'),
+            ],
+          ),
+        );
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: MangaReaderScreen(
+              sourceId: 'ani:m',
+              showId: 'm1',
+              showTitle: 'Some Manga',
+              cover: null,
+              chapters: [chapter('c2', 'u2')],
+              startIndex: 0,
+              resolveChapters: true,
+            ),
+          ),
+        );
+        await settle(tester);
+
+        final prevBtn = tester.widget<IconButton>(
+          find.widgetWithIcon(IconButton, Icons.skip_previous_rounded),
+        );
+        final nextBtn = tester.widget<IconButton>(
+          find.widgetWithIcon(IconButton, Icons.skip_next_rounded),
+        );
+        expect(prevBtn.onPressed, isNotNull);
+        expect(nextBtn.onPressed, isNotNull);
+
+        await disposeHarness(tester);
+      },
+    );
+
+    testWidgets(
+      'a genuinely single-chapter title stays single — resolveChapters '
+      'leaves prev/next disabled when the source only has one chapter',
+      (tester) async {
+        ani.register(
+          _FakeReadingProvider(
+            'ani:m',
+            {'u1': pages(3)},
+            episodes: [chapter('c1', 'u1')],
+          ),
+        );
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: MangaReaderScreen(
+              sourceId: 'ani:m',
+              showId: 'm1',
+              showTitle: 'Some Manga',
+              cover: null,
+              chapters: [chapter('c1', 'u1')],
+              startIndex: 0,
+              resolveChapters: true,
+            ),
+          ),
+        );
+        await settle(tester);
+
+        final prevBtn = tester.widget<IconButton>(
+          find.widgetWithIcon(IconButton, Icons.skip_previous_rounded),
+        );
+        final nextBtn = tester.widget<IconButton>(
+          find.widgetWithIcon(IconButton, Icons.skip_next_rounded),
+        );
+        expect(prevBtn.onPressed, isNull);
+        expect(nextBtn.onPressed, isNull);
+
+        await disposeHarness(tester);
+      },
+    );
+
+    testWidgets('page/chapter header shows "ch n · pg i/N"', (tester) async {
+      await tester.runAsync(() => sl<ReaderPrefs>().setDirection('ltr'));
+      await tester.pumpWidget(harness());
+      await settle(tester);
+
+      // Chrome starts hidden — tap the chrome (center) zone to reveal it.
+      await tester.tapAt(const Offset(400, 300)); // center third
+      await settle(tester);
+
+      expect(find.textContaining('ch 1 · pg 1/3'), findsOneWidget);
+
+      await disposeHarness(tester);
+    });
+
+    testWidgets(
+      "a page's CachedNetworkImage receives its real imageUrl and headers "
+      '(the exact detail that breaks CF-walled sources if dropped)',
+      (tester) async {
+        await tester.runAsync(() => sl<ReaderPrefs>().setDirection('ltr'));
+        ani.register(
+          _FakeReadingProvider('ani:m', {
+            'u1': [
+              PageImage(
+                url: 'https://example.com/cf-page.jpg',
+                headers: const {'cf-clearance': 'abc123'},
+              ),
+            ],
+          }),
+        );
+
+        await tester.pumpWidget(harness());
+        await settle(tester);
+
+        final img = tester.widget<CachedNetworkImage>(
+          find.byType(CachedNetworkImage),
+        );
+        expect(img.imageUrl, 'https://example.com/cf-page.jpg');
+        expect(img.httpHeaders, const {'cf-clearance': 'abc123'});
+
+        await disposeHarness(tester);
+      },
+    );
+
+    testWidgets(
+      'landing on a page leaves preloaded pages out of the image cache',
+      (tester) async {
+        await tester.runAsync(() => sl<ReaderPrefs>().setDirection('ltr'));
+        final sixPages = pages(6);
+        ani.register(_FakeReadingProvider('ani:m', {'u1': sixPages}));
+
+        await tester.pumpWidget(harness());
+        await settle(tester);
+        final width = _decodeWidthFor(tester);
+
+        // Preloading warms the disk cache and nothing else. It used to call
+        // precacheImage, which decoded each page into the global image cache —
+        // roughly 28MB a page against a 100MB budget, so a few pages ahead
+        // evicted the ones already decoded and the reader paid to decode them
+        // again on the way past. Only the page on screen belongs in there now.
+        expect(
+          await _imageTracked(sixPages[1].url, width),
+          isFalse,
+          reason: 'preload warms disk, not the image cache',
+        );
+        expect(
+          await _imageTracked(sixPages[4].url, width),
+          isFalse,
+          reason: 'well outside the window either way',
+        );
+
+        await disposeHarness(tester);
+      },
+    );
+
+    test('preloadWindow stays ahead of the page and inside the chapter', () {
+      // The bounds the widget test can no longer observe now that preloading
+      // is invisible to the image cache.
+      expect(preloadWindow(0, 6, count: 3), [1, 2, 3]);
+      expect(preloadWindow(15, 20, count: 3), [16, 17, 18]);
+      // Never past the last page, and never the page you're already on.
+      expect(preloadWindow(18, 20, count: 3), [19]);
+      expect(preloadWindow(19, 20, count: 3), isEmpty);
+      // The shipped default reaches further than the three it started with.
+      expect(preloadWindow(0, 20, count: 6), [1, 2, 3, 4, 5, 6]);
+    });
+
+    // ── Slider drag throttling (paged + vertical) ────────────────────────
+    //
+    // _seekToPage (Slider.onChanged) jumps the real PageController/
+    // ScrollController on every drag tick so the page stays visually in
+    // sync with the thumb — but PageController.jumpToPage synchronously
+    // fires onPageChanged, and ScrollController.jumpTo synchronously
+    // notifies its listeners, both of which are wired to _onPageChanged/
+    // _onVerticalScroll. Without the `_seeking` guard, that would preload
+    // and save on every tick instead of once, on release. These two tests
+    // drive the *real* Slider widget's own callbacks (not
+    // PageController.jumpToPage directly, which would miss this regression
+    // entirely) across several intermediate ticks, then release.
+    //
+    // The tick values are deliberately NOT a simple sweep toward the final
+    // page: PageView/ListView both build a small cache-extent of pages
+    // *adjacent* to whichever page is current — entirely separate from, and
+    // legitimate regardless of, `_preload`. A leaked `_preload` call at an
+    // intermediate tick would touch a window 1-3 pages further out than
+    // that adjacency reaches, so the intermediate ticks are clustered near
+    // the start (0-3) and the release is far away (15, in a 20-page
+    // chapter) — isolating "would only be tracked if an intermediate tick
+    // leaked a preload" (pages 5-6) from "tracked because it's merely
+    // adjacent to a visited page" (pages 0-4, 14-16) or "tracked because
+    // it's the final commit's own window" (16-18).
+    testWidgets(
+      'dragging the slider across several pages preloads/saves exactly '
+      'once, on release — not per tick (paged)',
+      (tester) async {
+        await tester.runAsync(() => sl<ReaderPrefs>().setDirection('ltr'));
+        final twentyPages = pages(20);
+        ani.register(_FakeReadingProvider('ani:m', {'u1': twentyPages}));
+
+        await tester.pumpWidget(harness());
+        await settle(tester);
+        await tester.tapAt(const Offset(400, 300)); // reveal chrome
+        await settle(tester);
+
+        // Clean slate: only what happens during the drag below should show
+        // up in the cache assertions (the initial chapter load already
+        // preloaded a window of its own).
+        PaintingBinding.instance.imageCache.clear();
+        PaintingBinding.instance.imageCache.clearLiveImages();
+        final savesBefore = spyHistory.flushCalls.length;
+        final width = _decodeWidthFor(tester);
+
+        final slider = tester.widget<Slider>(find.byType(Slider));
+        slider.onChangeStart!(0);
+        for (final v in [1.0, 2.0, 3.0]) {
+          slider.onChanged!(v);
+          await tester.pump();
+        }
+        slider.onChangeEnd!(15.0);
+        await settle(tester);
+
+        expect(
+          spyHistory.flushCalls.length - savesBefore,
+          1,
+          reason: 'one save for the whole drag, not one per tick',
+        );
+        // The save count above is what proves the drag was throttled. Preload
+        // used to be checked here too, by looking for mid-drag pages in the
+        // image cache — it warms the disk cache now, so nothing from any tick
+        // lands there. `preloadWindow` covers the bounds separately.
+        expect(
+          await _imageTracked(twentyPages[16].url, width),
+          isFalse,
+          reason: 'preload warms disk, not the image cache',
+        );
+
+        await disposeHarness(tester);
+      },
+    );
+
+    // Vertical mode's negative ("did an intermediate tick leak a preload")
+    // check can't reuse the paged test's ImageCache-tracking trick: measured
+    // directly (a throwaway diagnostic jumping ListView's own controller to
+    // an arbitrary offset, since deleted), ListView's cache-extent around a
+    // 200px-tall item spans roughly 7 items either side of wherever it's
+    // scrolled to — versus PageView's ±1 for a full-screen-width item. That
+    // 7-item natural window always swallows `_preload`'s 3-page window
+    // mathematically, for any chapter length or tick spacing, so a leaked
+    // preload and normal ListView windowing are indistinguishable via the
+    // image cache here. The save-count assertion below is still fully
+    // reliable (ReadHistory.save is entirely our own code, no Flutter
+    // internals to confound it) and proves the *_seeking* guard is reached
+    // and works for this listener; the same guard, checked immediately
+    // above the save-guard in `_onVerticalScroll`, protects `_preload` —
+    // and the paged test above already proves that guard mechanism
+    // suppresses a real leak when the signal *can* be isolated.
+    testWidgets(
+      'dragging the slider across several pages saves exactly once, on '
+      'release — not per tick (vertical); preload fires for the final '
+      'position',
+      (tester) async {
+        await tester.runAsync(() => sl<ReaderPrefs>().setDirection('vertical'));
+        final twentyPages = pages(20);
+        ani.register(_FakeReadingProvider('ani:m', {'u1': twentyPages}));
+
+        await tester.pumpWidget(harness());
+        await settle(tester);
+        await tester.tapAt(const Offset(400, 300)); // reveal chrome
+        await settle(tester);
+
+        PaintingBinding.instance.imageCache.clear();
+        PaintingBinding.instance.imageCache.clearLiveImages();
+        final savesBefore = spyHistory.flushCalls.length;
+        final width = _decodeWidthFor(tester);
+
+        final slider = tester.widget<Slider>(find.byType(Slider));
+        slider.onChangeStart!(0);
+        for (final v in [1.0, 2.0, 3.0]) {
+          slider.onChanged!(v);
+          await tester.pump();
+        }
+        slider.onChangeEnd!(15.0);
+        await settle(tester);
+
+        expect(
+          spyHistory.flushCalls.length - savesBefore,
+          1,
+          reason: 'one save for the whole drag, not one per tick',
+        );
+        // This used to prove _commitSeek's preload fired, by finding the
+        // window's pages in the image cache. Preload warms the disk cache
+        // now, so nothing lands there — the save count above is what shows
+        // the seek committed, and `preloadWindow` covers the bounds.
+        expect(
+          await _imageTracked(twentyPages[16].url, width),
+          isFalse,
+          reason: 'preload warms disk, not the image cache',
+        );
+
+        await disposeHarness(tester);
+      },
+    );
+
+    // ── Webtoon pinch-zoom ───────────────────────────────────────────────
+    //
+    // A real two-finger pinch (two TestGesture pointers spreading apart) must
+    // scale the strip. The old InteractiveViewer(panEnabled:false) lost the
+    // gesture arena for this: the ListView's own vertical-drag recognizer
+    // claimed the two-finger gesture before the scale recognizer could, so
+    // the pinch was a no-op — the Transform stayed at scale 1. This asserts
+    // the strip actually zooms now.
+    testWidgets('a two-finger pinch zooms the webtoon strip', (tester) async {
+      await tester.runAsync(() => sl<ReaderPrefs>().setDirection('vertical'));
+      ani.register(_FakeReadingProvider('ani:m', {'u1': pages(20)}));
+
+      await tester.pumpWidget(harness());
+      await settle(tester);
+
+      expect(
+        _webtoonScale(tester),
+        closeTo(1.0, 0.001),
+        reason: 'starts un-zoomed',
+      );
+
+      await _pinchOpen(tester);
+      await settle(tester);
+
+      expect(
+        _webtoonScale(tester),
+        greaterThan(1.0),
+        reason: 'a two-finger spread must scale the strip',
+      );
+
+      await disposeHarness(tester);
+    });
+
+    // Guardrail: zoom must not cost the single-finger scroll that drives
+    // mark-read-on-scroll-to-bottom. A one-pointer drag still moves the
+    // strip's own controller.
+    testWidgets('vertical: a single-finger drag still scrolls the strip', (
+      tester,
+    ) async {
+      await tester.runAsync(() => sl<ReaderPrefs>().setDirection('vertical'));
+      ani.register(_FakeReadingProvider('ani:m', {'u1': pages(20)}));
+
+      await tester.pumpWidget(harness());
+      await settle(tester);
+
+      final list = tester.widget<CustomScrollView>(
+        find.byKey(const ValueKey('manga-listview')),
+      );
+      expect(list.controller!.offset, 0);
+
+      await tester.drag(
+        find.byKey(const ValueKey('manga-listview')),
+        const Offset(0, -300),
+      );
+      await settle(tester);
+
+      expect(list.controller!.offset, greaterThan(0));
+
+      await disposeHarness(tester);
+    });
+
+    // The scrambling fix. Resuming used to `jumpTo(index / (count - 1) *
+    // maxScrollExtent)` — a percentage of a strip whose height was a guess,
+    // because none of the pages had loaded yet. It landed near the right page
+    // and then drifted as every real height arrived, which is what reading a
+    // resumed chapter felt like.
+    //
+    // The strip is now centred on the resumed page, so offset 0 IS its top and
+    // the pages above it lay out into negative offsets. Two things follow, and
+    // both are asserted here: the resume is exact, and a page above finishing
+    // its decode can only extend the strip upward — it cannot move the page
+    // being read.
+    testWidgets('vertical: resuming lands exactly on the saved page', (
+      tester,
+    ) async {
+      await tester.runAsync(() => sl<ReaderPrefs>().setDirection('vertical'));
+      ani.register(_FakeReadingProvider('ani:m', {'u1': pages(20)}));
+      await tester.runAsync(
+        () => sl<ReadStore>().save('ani:m', 'm1', 'c1', pos: 10, total: 20),
+      );
+
+      await tester.pumpWidget(harness());
+      await settle(tester);
+
+      final pos = tester
+          .widget<CustomScrollView>(
+            find.byKey(const ValueKey('manga-listview')),
+          )
+          .controller!
+          .position;
+
+      // Page 10's top, not 52% of the way down a strip nothing has measured.
+      expect(pos.pixels, 0);
+      expect(
+        tester.getTopLeft(find.byKey(const ValueKey('manga-page-10'))).dy,
+        0,
+      );
+
+      // The ten pages above are real, laid out upward. A flat ListView could
+      // only ever report a zero minimum here, so this is what fails if the
+      // percentage jump ever comes back.
+      expect(pos.minScrollExtent, lessThan(0));
+      expect(pos.maxScrollExtent, greaterThan(0));
+
+      await disposeHarness(tester);
+    });
+
+    // The other half of the reading fix, and the one most at risk of being
+    // dropped by a future refactor of the strip: pages are built and decoded
+    // three quarters of a viewport PAST the visible area in both directions.
+    // Flutter's default is 250px, which on pages that run thousands of pixels
+    // tall means a page only starts decoding as its top edge arrives — so it
+    // shows up blank and fills in late.
+    testWidgets('vertical: the strip keeps its decode-ahead reserve', (
+      tester,
+    ) async {
+      await tester.runAsync(() => sl<ReaderPrefs>().setDirection('vertical'));
+      ani.register(_FakeReadingProvider('ani:m', {'u1': pages(20)}));
+
+      await tester.pumpWidget(harness());
+      await settle(tester);
+
+      final strip = tester.widget<CustomScrollView>(
+        find.byKey(const ValueKey('manga-listview')),
+      );
+      expect(strip.scrollCacheExtent, const ScrollCacheExtent.viewport(0.75));
+
+      await disposeHarness(tester);
+    });
+
+    // Opening a chapter used to fill the screen with shimmering page slots
+    // that were indistinguishable from the placeholder a real page shows
+    // while its image downloads — so a slow source read as one endless
+    // loading screen with no way to tell what was actually happening.
+    //
+    // A chapter that hasn't arrived now shows a spinner and nothing else.
+    testWidgets('a loading chapter shows a spinner, not fake pages', (
+      tester,
+    ) async {
+      await tester.runAsync(() => sl<ReaderPrefs>().setDirection('vertical'));
+      final gate = Completer<void>();
+      ani.register(
+        _FakeReadingProvider('ani:m', {'u1': pages(5)}, gate: gate.future),
+      );
+
+      await tester.pumpWidget(harness());
+      await tester.pump(); // mid-load: getPages is still held open
+
+      // Exactly one: the chapter's own spinner, with no pages behind it.
+      expect(find.byType(CircularProgressIndicator), findsOneWidget);
+      // The skeleton was a ListView of page-sized slots. Nothing scrollable
+      // belongs on screen before there are pages to scroll.
+      expect(find.byType(ListView), findsNothing);
+      expect(find.byType(CustomScrollView), findsNothing);
+
+      gate.complete();
+      await settle(tester);
+
+      // ...and once the pages land it's a real strip. (Page placeholders have
+      // spinners of their own now, so the strip's presence — not the absence
+      // of a spinner — is what separates the two states.)
+      expect(find.byType(CustomScrollView), findsOneWidget);
+
+      await disposeHarness(tester);
+    });
+
+    // Reading a chapter to the end saves the last page as your position. In
+    // the strip that page carries the end-of-chapter card, so resuming onto it
+    // opened the chapter showing "End of ..." and nothing else — everything
+    // above already read, nothing below but a button.
+    testWidgets('vertical: a finished chapter reopens at the top, not its end '
+        'card', (tester) async {
+      await tester.runAsync(() => sl<ReaderPrefs>().setDirection('vertical'));
+      ani.register(_FakeReadingProvider('ani:m', {'u1': pages(20)}));
+      await tester.runAsync(
+        () => sl<ReadStore>().save('ani:m', 'm1', 'c1', pos: 19, total: 20),
+      );
+
+      await tester.pumpWidget(harness());
+      await settle(tester);
+
+      expect(
+        tester.getTopLeft(find.byKey(const ValueKey('manga-page-0'))).dy,
+        0,
+      );
+      expect(find.textContaining('End of'), findsNothing);
+
+      await disposeHarness(tester);
+    });
+
+    // The chapter-change black screen. On the first frame after a chapter
+    // loads, maxScrollExtent is still 0 — and estimateIndexFromScroll(0, 0, n)
+    // answers n-1, the LAST page (pinned that way by its own test above). The
+    // anchor follows _pageIndex, so the reader moved to the final page and
+    // opened the chapter on its end-of-chapter card over an unloaded page.
+    testWidgets('vertical: opening a chapter does not jump to its last page', (
+      tester,
+    ) async {
+      await tester.runAsync(() => sl<ReaderPrefs>().setDirection('vertical'));
+      ani.register(_FakeReadingProvider('ani:m', {'u1': pages(20)}));
+
+      await tester.pumpWidget(harness());
+      await settle(tester);
+
+      // Page 1, at the top — not page 20 with the end card.
+      expect(find.textContaining('1/20'), findsOneWidget);
+      expect(find.textContaining('End of'), findsNothing);
+      expect(
+        tester.getTopLeft(find.byKey(const ValueKey('manga-page-0'))).dy,
+        0,
+      );
+
+      await disposeHarness(tester);
+    });
+
+    // A source that rewrites its image bytes (scrambled pages) serves every
+    // page through the native provider, and THAT path had no placeholder at
+    // all — it faded in from opacity 0, so a page that had not decoded yet was
+    // simply invisible. Every loading indicator built for this reader lived on
+    // the CachedNetworkImage branch, which those pages never take, so they
+    // showed a black screen with nothing on it.
+    testWidgets(
+      'vertical: a native-provider page shows a loading placeholder',
+      (tester) async {
+        await tester.runAsync(() => sl<ReaderPrefs>().setDirection('vertical'));
+        // The marker header is what routes a page to the native provider.
+        ani.register(
+          _FakeReadingProvider('ani:m', {
+            'u1': [
+              for (var i = 0; i < 4; i++)
+                PageImage(
+                  url: 'https://img/scrambled/$i.jpg',
+                  headers: const {'x-mihon-src': '7'},
+                ),
+            ],
+          }),
+        );
+
+        await tester.pumpWidget(harness());
+        await settle(tester);
+
+        // Nothing can decode in a widget test, so every page is mid-load — and
+        // mid-load must not mean invisible. A progress ring is the whole
+        // placeholder now; there is deliberately no text with it.
+        expect(find.byType(CircularProgressIndicator), findsWidgets);
+
+        await disposeHarness(tester);
+      },
+    );
+
+    // Guardrail: a plain single tap still toggles chrome (AnimatedOpacity
+    // targets flip 0 -> 1).
+    testWidgets('vertical: a single tap still toggles chrome', (tester) async {
+      await tester.runAsync(() => sl<ReaderPrefs>().setDirection('vertical'));
+
+      await tester.pumpWidget(harness());
+      await settle(tester);
+
+      final before = tester
+          .widgetList<AnimatedOpacity>(find.byType(AnimatedOpacity))
+          .map((o) => o.opacity);
+      expect(before, everyElement(0.0), reason: 'chrome starts hidden');
+
+      await tester.tapAt(const Offset(400, 300));
+      await settle(tester);
+
+      final after = tester
+          .widgetList<AnimatedOpacity>(find.byType(AnimatedOpacity))
+          .map((o) => o.opacity);
+      expect(after, everyElement(1.0), reason: 'tap reveals chrome');
+
+      await disposeHarness(tester);
+    });
+
+    // Tiling needs THREE things before it may draw a page: the aspect, the
+    // page's true pixel size, and a resolved on-disk file. In this sandbox
+    // there is no real network and no real file, so none of them is ever
+    // recorded — and a page missing any of them must take the plain path,
+    // never a guessed one. A guessed size means a tile crop addressed in the
+    // wrong space, which is a visibly broken page rather than a slow one.
+    //
+    // The strip assertions matter as much as the absent widget: tiling is new
+    // code in the reader, and the ordinary vertical path has to behave exactly
+    // as it did before the feature existed.
+    testWidgets('vertical: a page with nothing recorded takes the plain path', (
+      tester,
+    ) async {
+      await tester.runAsync(() => sl<ReaderPrefs>().setDirection('vertical'));
+      ani.register(_FakeReadingProvider('ani:m', {'u1': pages(20)}));
+
+      await tester.pumpWidget(harness());
+      await settle(tester);
+
+      expect(find.byType(TiledPageImage), findsNothing);
+      // The strip itself is unaffected: still page 1 of 20, at the top.
+      expect(find.textContaining('1/20'), findsOneWidget);
+      expect(
+        tester.getTopLeft(find.byKey(const ValueKey('manga-page-0'))).dy,
+        0,
+      );
+
+      await disposeHarness(tester);
+    });
+  });
+}
