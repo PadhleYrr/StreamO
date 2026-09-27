@@ -1,0 +1,536 @@
+// Aniyomi sources — phone UI.
+part of 'aniyomi_sources_screen.dart';
+
+
+// ---------------------------------------------------------------------------
+// Phone view
+// ---------------------------------------------------------------------------
+
+class _AniScreenPhoneView extends StatefulWidget {
+  const _AniScreenPhoneView({
+    required this.repoUrls,
+    required this.onAddRepo,
+    required this.onRemoveRepo,
+  });
+
+  final List<String> repoUrls;
+  final VoidCallback onAddRepo;
+  final void Function(String url) onRemoveRepo;
+
+  @override
+  State<_AniScreenPhoneView> createState() => _AniScreenPhoneViewState();
+}
+
+class _AniScreenPhoneViewState extends State<_AniScreenPhoneView> {
+  final _searchCtrl = TextEditingController();
+  String _query = '';
+
+  @override
+  void dispose() {
+    _searchCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return DefaultTabController(
+      length: 2,
+      child: Scaffold(
+        backgroundColor: AppColors.bg,
+        appBar: AppBar(
+          title: Text(context.l10n.aniyomi, style: AppText.barTitle),
+          actions: [
+            IconButton(
+              tooltip: context.l10n.languages,
+              icon: const Icon(Icons.language_rounded),
+              onPressed: () =>
+                  showSourceLanguageSheet(
+                    context,
+                    sl<AnimeLangPrefs>(),
+                    present: presentLangCodes(
+                      sl<AniyomiManager>().all,
+                      (p) => p is AniyomiProvider ? p.info.lang : '',
+                    ),
+                  ),
+            ),
+          ],
+          bottom: TabBar(
+            indicatorColor: AppColors.accent,
+            indicatorSize: TabBarIndicatorSize.label,
+            labelColor: AppColors.textPrimary,
+            unselectedLabelColor: AppColors.textSecondary,
+            labelStyle: AppText.headline,
+            unselectedLabelStyle: AppText.headline,
+            dividerHeight: 0,
+            tabs: [
+              Tab(text: context.l10n.installed),
+              Tab(text: context.l10n.repositories),
+            ],
+          ),
+        ),
+        floatingActionButton: FloatingActionButton.extended(
+          backgroundColor: AppColors.accent,
+          foregroundColor: Colors.white,
+          onPressed: widget.onAddRepo,
+          icon: const Icon(Icons.add),
+          label: Text(
+            context.l10n.addAniyomiRepo,
+            style: AppText.button.copyWith(color: Colors.white),
+          ),
+        ),
+        body: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+              child: SourcesSearchField(
+                controller: _searchCtrl,
+                onChanged: (q) => setState(() => _query = q),
+              ),
+            ),
+            Expanded(
+              child: TabBarView(
+                children: [
+                  ListView(
+                    padding: const EdgeInsets.fromLTRB(16, 12, 16, 96),
+                    children: [_AniyomiInstalledGroup(query: _query)],
+                  ),
+                  // AniyomiRepoTab brings its own scrollable ListView.builder +
+                  // padding; wrapping it in another ListView gives the inner
+                  // list unbounded height and it renders blank, so mount it
+                  // directly.
+                  AniyomiRepoTab(
+                    repoUrls: widget.repoUrls,
+                    onRemoveRepo: widget.onRemoveRepo,
+                    query: _query,
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Lifted verbatim from sources_screen.dart:1127-1470 — Installed-tab Aniyomi
+// group + source row.
+// ---------------------------------------------------------------------------
+
+class _AniyomiInstalledGroup extends StatefulWidget {
+  const _AniyomiInstalledGroup({this.query = ''});
+
+  final String query;
+
+  @override
+  State<_AniyomiInstalledGroup> createState() => _AniyomiInstalledGroupState();
+}
+
+class _AniyomiInstalledGroupState extends State<_AniyomiInstalledGroup> {
+  bool _expanded = true;
+
+  @override
+  Widget build(BuildContext context) {
+    final langPrefs = sl.isRegistered<AnimeLangPrefs>()
+        ? sl<AnimeLangPrefs>()
+        : null;
+    return ListenableBuilder(
+      // The language prefs too: the globe in this screen's app bar edits them,
+      // and without listening the list it edits sat unchanged.
+      listenable: Listenable.merge([sl<AniyomiManager>(), langPrefs]),
+      builder: (context, _) {
+        final query = widget.query;
+        var sources = sl<AniyomiManager>()
+            .all
+            .where((p) => sourceSearchMatches(
+                query,
+                p.displayName,
+                p is AniyomiProvider ? p.info.lang : null))
+            .toList();
+        // Same filter the picker and the browse list use. Without it, picking
+        // English left this screen listing every language anyway.
+        sources = visibleInstalledSources(
+          sources,
+          langPrefs?.enabled ?? defaultSourceLangs(),
+          pkgOf: (p) => p is AniyomiProvider ? p.info.pkg : p.sourceId,
+          langOf: (p) => p is AniyomiProvider ? p.info.lang : '',
+        );
+        if (sources.isEmpty) {
+          return EmptyState(
+            icon: Icons.extension_outlined,
+            message: query.trim().isEmpty
+                ? context.l10n.noAniyomiSourcesInstalled
+                : 'No installed sources match "${query.trim()}".',
+          );
+        }
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: () => setState(() => _expanded = !_expanded),
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(4, 4, 8, 8),
+                child: Row(
+                  children: [
+                    AnimatedRotation(
+                      turns: _expanded ? 0 : -0.25,
+                      duration: const Duration(milliseconds: 200),
+                      child: const Icon(
+                        Icons.expand_more,
+                        color: AppColors.textTertiary,
+                        size: 20,
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    Expanded(
+                      child: Text(
+                        'ANIYOMI',
+                        style: AppText.overline.copyWith(
+                          color: AppColors.textTertiary,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    Text(
+                      '${sources.length}',
+                      style: AppText.overline.copyWith(
+                        color: AppColors.textTertiary,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            AnimatedSize(
+              duration: const Duration(milliseconds: 200),
+              curve: Curves.easeOut,
+              alignment: Alignment.topCenter,
+              // A live search forces the group open so matches are visible.
+              child: !(_expanded || query.trim().isNotEmpty)
+                  ? const SizedBox(width: double.infinity)
+                  : BlocBuilder<ActiveSourceCubit, String>(
+                      builder: (context, activeId) => Container(
+                        clipBehavior: Clip.antiAlias,
+                        decoration: BoxDecoration(
+                          color: AppColors.surface,
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                        child: Column(
+                          children: [
+                            for (var i = 0; i < sources.length; i++) ...[
+                              if (i > 0)
+                                const Divider(
+                                  height: 0.5,
+                                  thickness: 0.5,
+                                  color: AppColors.hairline,
+                                ),
+                              _AniSourceRow(
+                                source: sources[i],
+                                activeId: activeId,
+                              ),
+                            ],
+                          ],
+                        ),
+                      ),
+                    ),
+            ),
+            const SizedBox(height: 18),
+          ],
+        );
+      },
+    );
+  }
+}
+
+/// Single Aniyomi source row in the Installed tab. Tapping makes it the active
+/// source. No enable/disable switch — Aniyomi sources are always active.
+class _AniSourceRow extends StatefulWidget {
+  const _AniSourceRow({
+    required this.source,
+    required this.activeId,
+    this.updateLookupFn,
+    this.applyUpdateFn,
+  });
+
+  final BaseProvider source;
+  final String activeId;
+
+  /// Test seam: overrides the live `AniyomiManager.updateFor` lookup. When
+  /// non-null the button also skips the `AnimatedBuilder` so widget tests
+  /// stay deterministic.
+  final AniyomiUpdate? Function(String pkg)? updateLookupFn;
+
+  /// Test seam: overrides the real install-from-repo apply flow.
+  final Future<void> Function(AniyomiUpdate update)? applyUpdateFn;
+
+  @override
+  State<_AniSourceRow> createState() => _AniSourceRowState();
+}
+
+class _AniSourceRowState extends State<_AniSourceRow> {
+  bool _hasSettings = false;
+  bool _busy = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _checkSettings();
+  }
+
+  @override
+  void didUpdateWidget(_AniSourceRow oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // The element may be recycled for a different source when the list is
+    // filtered/reordered (e.g. the NSFW toggle) — re-query so the gear
+    // reflects the source now shown rather than a stale cached result.
+    if (oldWidget.source.sourceId != widget.source.sourceId) {
+      _hasSettings = false;
+      _checkSettings();
+    }
+  }
+
+  Future<void> _checkSettings() async {
+    final src = widget.source;
+    if (src is! AniyomiProvider) return;
+    final has = await AniyomiExtensionService().hasSourceSettings(src.info.id);
+    if (mounted) setState(() => _hasSettings = has);
+  }
+
+  Future<void> _openSettings() async {
+    final src = widget.source;
+    if (src is! AniyomiProvider) return;
+    await source_actions.openSourceSettings(
+      context,
+      'ani:${src.info.id}',
+      src.info.name,
+    );
+  }
+
+  /// Shows a confirm dialog then uninstalls the source.
+  Future<void> _confirmUninstall(BuildContext context) async {
+    final name = widget.source.displayName;
+    final ok = await AppDialog.confirm(
+      context,
+      title: context.l10n.uninstallNameQuestion(name),
+      message: context.l10n.thisRemovesTheSourceFromYourInstalledList,
+      confirmLabel: context.l10n.uninstall,
+      destructive: true,
+    );
+    if (ok != true) return;
+
+    final aniProvider =
+        widget.source is AniyomiProvider ? widget.source as AniyomiProvider : null;
+    final pkg = aniProvider?.info.pkg;
+
+    const boxName = 'aniyomi_installed';
+    if (pkg != null && Hive.isBoxOpen(boxName)) {
+      final box = Hive.box<dynamic>(boxName);
+      final apkPath = box.get(pkg) as String?;
+      if (apkPath != null) {
+        try {
+          final f = File(apkPath);
+          if (await f.exists()) await f.delete();
+        } catch (_) {}
+      }
+      await box.delete(pkg);
+    }
+
+    if (pkg != null) {
+      sl<AniyomiManager>().removeWhere(
+        (p) => p is AniyomiProvider && p.info.pkg == pkg,
+      );
+    } else {
+      sl<AniyomiManager>().removeWhere(
+        (p) => p.sourceId == widget.source.sourceId,
+      );
+    }
+
+    if (context.mounted) {
+      ScaffoldMessenger.of(context)
+        ..clearSnackBars()
+        ..showSnackBar(SnackBar(content: Text(context.l10n.uninstalledName(name))));
+    }
+  }
+
+  Future<void> _applyUpdate(AniyomiUpdate update) async {
+    final messenger = ScaffoldMessenger.of(context);
+    setState(() => _busy = true);
+    try {
+      final apply = widget.applyUpdateFn ?? _defaultApplyUpdate;
+      await apply(update);
+      messenger
+        ..clearSnackBars()
+        ..showSnackBar(SnackBar(content: Text(context.l10n.updatedName(update.name))));
+    } catch (e) {
+      messenger
+        ..clearSnackBars()
+        ..showSnackBar(SnackBar(content: Text(context.l10n.updateFailed('$e'))));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _defaultApplyUpdate(AniyomiUpdate update) async {
+    // installFromRepo never throws — it returns an empty list on failure —
+    // so a failed download must be surfaced here rather than silently
+    // reported as a success that clears the update badge.
+    final providers = await AniyomiExtensionService()
+        .installFromRepo(update.entry, manager: sl<AniyomiManager>());
+    if (providers.isEmpty) throw Exception('Update failed to install');
+    sl<AniyomiManager>().clearUpdatesForPkg(update.pkg);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final source = widget.source;
+    final active = source.sourceId == widget.activeId;
+    final lang = source is AniyomiProvider ? source.info.lang : '';
+    final nameColor = active ? AppColors.accent : AppColors.textPrimary;
+    final aniProvider = source is AniyomiProvider ? source : null;
+    final lookup = widget.updateLookupFn ??
+        (String pkg) => sl<AniyomiManager>().updateFor(pkg);
+
+    Widget updateButton() {
+      final pkg = aniProvider?.info.pkg;
+      final update = pkg == null ? null : lookup(pkg);
+      if (update == null) return const SizedBox.shrink();
+      return Padding(
+        padding: const EdgeInsets.only(right: 4),
+        // Capped width + an ellipsis, because this row also carries a
+        // settings, a sign-in and a delete button: the button's full label
+        // used to win the width fight outright and the source NAME was what
+        // got squeezed away. NOT a Flexible — that defaults to flex:1, so it
+        // claimed half the row's free space and, with no update to show, left
+        // it empty and dragged the trailing buttons into the middle.
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 148),
+          child: FilledButton(
+            onPressed: _busy ? null : () => _applyUpdate(update),
+            style: FilledButton.styleFrom(
+              backgroundColor: AppColors.accent,
+              foregroundColor: Colors.white,
+              elevation: 0,
+              visualDensity: VisualDensity.compact,
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(8),
+              ),
+            ),
+            child: Text(
+              context.l10n.updateArrowVersion('${update.availableVersion}'),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+        ),
+      );
+    }
+
+    return InkWell(
+      onTap: () {
+        context.read<ActiveSourceCubit>().setSource(source.sourceId);
+        ScaffoldMessenger.of(context)
+          ..clearSnackBars()
+          ..showSnackBar(
+            SnackBar(content: Text(context.l10n.activeSourceColon(source.displayName))),
+          );
+      },
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 8, 6, 8),
+        child: Row(
+          children: [
+            Padding(
+              padding: const EdgeInsets.only(right: 12),
+              child: SourceIconTile(
+                name: source.displayName,
+                icon: aniProvider == null
+                    ? null
+                    : SourceIconStore.urlFor(aniProvider.info.pkg),
+              ),
+            ),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    source.displayName,
+                    style: AppText.headline.copyWith(
+                      fontSize: 15,
+                      color: nameColor,
+                      fontWeight: active ? FontWeight.w600 : null,
+                    ),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    lang.isNotEmpty ? 'aniyomi • $lang' : 'aniyomi',
+                    style: AppText.caption,
+                  ),
+                ],
+              ),
+            ),
+            if (widget.updateLookupFn != null)
+              updateButton()
+            else
+              AnimatedBuilder(
+                animation: sl<AniyomiManager>(),
+                builder: (_, _) => updateButton(),
+              ),
+            if (_hasSettings)
+              IconButton(
+                tooltip: context.l10n.sourceSettings,
+                icon: const Icon(Icons.tune_rounded, size: 20),
+                color: AppColors.textSecondary,
+                onPressed: _openSettings,
+                // Default IconButtons are 48x48 for a 20px glyph. Three of
+                // them ate the width the source NAME needed once the row
+                // grew an icon tile; 36 still clears the 36dp touch floor.
+                visualDensity: VisualDensity.compact,
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints.tightFor(
+                  width: 36,
+                  height: 36,
+                ),
+              ),
+            if (source_actions.webViewUrlFor(source.sourceId) != null)
+              IconButton(
+                tooltip: context.l10n.signInToSource,
+                icon: const Icon(Icons.login_rounded, size: 20),
+                color: AppColors.textSecondary,
+                onPressed: () =>
+                    source_actions.openSourceWebView(source.sourceId),
+                // Default IconButtons are 48x48 for a 20px glyph. Three of
+                // them ate the width the source NAME needed once the row
+                // grew an icon tile; 36 still clears the 36dp touch floor.
+                visualDensity: VisualDensity.compact,
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints.tightFor(
+                  width: 36,
+                  height: 36,
+                ),
+              ),
+            IconButton(
+              tooltip: context.l10n.uninstall,
+              icon: const Icon(Icons.delete_outline_rounded, size: 20),
+              color: AppColors.textSecondary,
+              onPressed: () => _confirmUninstall(context),
+              // Default IconButtons are 48x48 for a 20px glyph. Three of
+              // them ate the width the source NAME needed once the row
+              // grew an icon tile; 36 still clears the 36dp touch floor.
+              visualDensity: VisualDensity.compact,
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints.tightFor(
+                width: 36,
+                height: 36,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
