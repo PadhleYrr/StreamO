@@ -1,0 +1,370 @@
+// Home's "provider returned no sections" branch (loadedEmpty in
+// home_screen.dart's build) renders _SourceUnavailable ("isn't answering, try
+// again") for anime, but for a reading mode with ZERO manga/novel sources
+// installed it shows an install guide ("No <mode> sources yet" → Open
+// Providers) — nothing's "unavailable", there's just nothing set up yet.
+//
+// HomeLoadedEmptyView is the decision extracted out of _HomeViewState.build
+// into its own widget so it's testable without pumping the real HomeScreen
+// (whose initState fires a real, un-DI'd network call).
+//
+// Anime mode never touches hasReadingSourcesFor's categorizedSources() call
+// (ContentMode.isReading is false, short-circuited) — the anime-mode test
+// below runs with ZERO source-related DI registered, which is itself part of
+// the regression proof: the anime path cannot depend on installed sources.
+
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:dio/dio.dart';
+import 'package:hive/hive.dart';
+import 'dart:io';
+import 'package:watch_app/core/app_mode.dart';
+import 'package:watch_app/core/di/injector.dart' show sl;
+import 'package:watch_app/core/mode/content_mode.dart';
+import 'package:watch_app/core/playback/playback_prefs.dart';
+import 'package:watch_app/core/provider/cloudstream_provider.dart';
+import 'package:watch_app/core/provider/provider_downloader.dart';
+import 'package:watch_app/core/provider/provider_manager.dart';
+import 'package:watch_app/core/provider/provider_registry.dart';
+import 'package:watch_app/core/provider/provider_repo_registry.dart';
+import 'package:watch_app/core/zmode/zmode_prefs.dart';
+import 'package:watch_app/features/home/home_screen.dart';
+
+class _FakeManager implements ProviderRuntimeLoader {
+  @override
+  JsProvider? get(String id) => null;
+  @override
+  Future<void> load({
+    required String sourceId,
+    required String jsSource,
+    String originRepoUrl = '',
+    String displayName = '',
+  }) async {}
+  @override
+  void setSettings(String sourceId, Map<String, dynamic> settings) {}
+  @override
+  void remove(String id) {}
+}
+
+class _FakeFetcher implements ProviderJsFetcher {
+  @override
+  Future<CachedProvider> fetch({
+    required String name,
+    required String url,
+    bool force = false,
+  }) async =>
+      CachedProvider(name: name, jsCode: '', url: url, fetchedAt: DateTime.now());
+  @override
+  Future<void> remove(String name) async {}
+}
+
+Future<void> _seedJsSource({
+  required String id,
+  required String type,
+  String repoUrl = 'https://example.com/repo/index.json',
+}) async {
+  final reposBox = Hive.box<Map>(ProviderReposRegistry.boxName);
+  final existingRaw = reposBox.get(repoUrl);
+  final existingSources = existingRaw == null
+      ? const <RepoSource>[]
+      : ProviderRepo.fromJson(Map<String, dynamic>.from(existingRaw)).sources;
+  final repo = ProviderRepo(
+    url: repoUrl,
+    name: 'Test Repo',
+    description: '',
+    lastSyncedAt: DateTime.now(),
+    sources: [
+      ...existingSources,
+      RepoSource(id: id, name: id, version: '1.0.0', type: type, lang: 'en', file: '$id.js'),
+    ],
+  );
+  await reposBox.put(repoUrl, repo.toJson());
+
+  final regBox = Hive.box<Map>(ProviderRegistry.boxName);
+  final entry = ProviderRegistryEntry(
+    name: id,
+    url: '$repoUrl/$id.js',
+    originRepoUrl: repoUrl,
+    displayName: id,
+  );
+  await regBox.put(ProviderRegistry.providerKey(repoUrl, id), entry.toJson());
+}
+
+Future<void> pumpEmptyView(
+  WidgetTester tester, {
+  required ContentMode mode,
+  VoidCallback? onInstall,
+  VoidCallback? onRetry,
+  String? cloudflareUrl,
+  Future<void> Function()? onSolveCloudflare,
+  bool offline = false,
+}) async {
+  await tester.pumpWidget(
+    MaterialApp(
+      home: Scaffold(
+        body: HomeLoadedEmptyView(
+          mode: mode,
+          sourceName: 'allanime',
+          onRetry: onRetry ?? () {},
+          onInstallSources: onInstall ?? () {},
+          cloudflareUrl: cloudflareUrl,
+          onSolveCloudflare: onSolveCloudflare,
+          offline: offline,
+        ),
+      ),
+    ),
+  );
+  await tester.pumpAndSettle();
+}
+
+void main() {
+  group('HomeLoadedEmptyView — anime mode regression (no source DI needed)', () {
+    testWidgets(
+      'anime mode renders the existing "Couldn\'t load" wording with Retry, '
+      'no install button',
+      (tester) async {
+        await pumpEmptyView(tester, mode: ContentMode.anime);
+
+        expect(find.text("allanime isn't answering"), findsOneWidget);
+        expect(find.text('Retry'), findsOneWidget);
+        expect(find.widgetWithText(FilledButton, 'Browse sources'), findsNothing);
+        expect(find.textContaining('sources yet'), findsNothing);
+      },
+    );
+  });
+
+  group('HomeLoadedEmptyView — with source DI up (all modes)', () {
+    late Directory tempDir;
+
+    setUp(() async {
+      tempDir = await Directory.systemTemp.createTemp('home_loaded_empty_test');
+      Hive.init(tempDir.path);
+      await ZModePrefs.init();
+      await ZModePrefs.setEnabled(false);
+      await ProviderRegistry.init();
+      await ProviderReposRegistry.init();
+      await PlaybackPrefs.init();
+      await CloudStreamManager.init();
+
+      sl.registerSingleton<ProviderRegistry>(
+        ProviderRegistry(
+          downloader: _FakeFetcher(),
+          manager: _FakeManager(),
+          repos: ProviderReposRegistry(dio: Dio()),
+        ),
+      );
+      sl.registerSingleton<ProviderReposRegistry>(ProviderReposRegistry(dio: Dio()));
+      sl.registerSingleton<PlaybackPrefs>(PlaybackPrefs());
+      sl.registerSingleton<CloudStreamManager>(CloudStreamManager());
+      sl.registerSingleton<AniyomiManager>(AniyomiManager());
+      sl.registerSingleton<AppMode>(const AppMode(isTv: false));
+    });
+
+    tearDown(() async {
+      await sl.reset();
+      await Hive.close();
+      try {
+        await tempDir.delete(recursive: true);
+      } catch (_) {}
+    });
+
+    testWidgets(
+      'anime mode, Z Mode on, no sources: catalogue miss shows retry, not install',
+      (tester) async {
+        // runAsync: setEnabled is a real Hive write, and under FakeAsync it
+        // dangles — tearDown's Hive.close() then waits on it forever. Same
+        // reason mode_switcher_test wraps setMode.
+        await tester.runAsync(() async {
+          await ZModePrefs.setEnabled(true);
+          await Future<void>.delayed(const Duration(milliseconds: 50));
+        });
+        await pumpEmptyView(tester, mode: ContentMode.anime);
+
+        // main's wording, which this branch keeps: it distinguishes a
+        // catalogue having a moment from a source that isn't answering, and
+        // it goes through l10n rather than a hardcoded English string.
+        expect(find.text("allanime isn't answering"), findsOneWidget);
+        expect(find.text('Retry'), findsOneWidget);
+        expect(find.text('No Streaming sources yet'), findsNothing);
+      },
+    );
+
+    testWidgets(
+      'anime mode, no anime source installed: shows the install guide, '
+      'not the "couldn\'t load" wording',
+      (tester) async {
+        var installTapped = false;
+        await pumpEmptyView(
+          tester,
+          mode: ContentMode.anime,
+          onInstall: () => installTapped = true,
+        );
+
+        // ContentMode.anime.label is "Streaming".
+        expect(find.text('No Streaming sources yet'), findsOneWidget);
+        final cta = find.widgetWithText(FilledButton, 'Browse sources');
+        expect(cta, findsOneWidget);
+        expect(find.text("allanime isn't answering"), findsNothing);
+
+        await tester.tap(cta);
+        expect(installTapped, isTrue);
+      },
+    );
+
+    testWidgets(
+      'anime mode, an anime source IS installed: keeps the "couldn\'t load" '
+      'retry wording, not the install guide',
+      (tester) async {
+        await tester.runAsync(() => _seedJsSource(id: 'js:a', type: 'anime'));
+
+        await pumpEmptyView(tester, mode: ContentMode.anime);
+
+        expect(find.text("allanime isn't answering"), findsOneWidget);
+        expect(find.text('Retry'), findsOneWidget);
+        expect(find.textContaining('sources yet'), findsNothing);
+      },
+    );
+
+    testWidgets(
+      'manga mode, nothing installed: shows the install-CTA empty state, '
+      'tapping the button fires onInstallSources',
+      (tester) async {
+        var installTapped = false;
+        await pumpEmptyView(
+          tester,
+          mode: ContentMode.manga,
+          onInstall: () => installTapped = true,
+        );
+
+        expect(find.text('No Manga sources yet'), findsOneWidget);
+        final cta = find.widgetWithText(FilledButton, 'Browse sources');
+        expect(cta, findsOneWidget);
+        expect(find.text("allanime isn't answering"), findsNothing);
+
+        await tester.tap(cta);
+        expect(installTapped, isTrue);
+      },
+    );
+
+    testWidgets(
+      'manga mode, a manga source IS installed: falls back to the existing '
+      '"source failed" wording, not the install CTA',
+      (tester) async {
+        await tester.runAsync(() => _seedJsSource(id: 'js:m', type: 'manga'));
+
+        await pumpEmptyView(tester, mode: ContentMode.manga);
+
+        expect(find.text("allanime isn't answering"), findsOneWidget);
+        expect(find.text('Retry'), findsOneWidget);
+        expect(find.text('No Manga sources yet'), findsNothing);
+        expect(find.widgetWithText(FilledButton, 'Browse sources'), findsNothing);
+      },
+    );
+
+    testWidgets(
+      'novel mode, nothing installed: shows the install-CTA empty state, '
+      'the button fires onInstallSources',
+      (tester) async {
+        var installTapped = false;
+        await pumpEmptyView(
+          tester,
+          mode: ContentMode.novel,
+          onInstall: () => installTapped = true,
+        );
+
+        expect(find.text('No Novel sources yet'), findsOneWidget);
+        await tester.tap(find.widgetWithText(FilledButton, 'Browse sources'));
+        expect(installTapped, isTrue);
+      },
+    );
+  });
+
+  // The hidden WebView solver clears Cloudflare's automatic challenges, but the
+  // interactive one (Turnstile, served to networks Cloudflare distrusts) needs a
+  // human. Anime and manga extensions share one HTTP stack, so both surface it —
+  // and both land here, which is the only screen that offers the visible solve.
+  group('HomeLoadedEmptyView — Cloudflare block', () {
+    testWidgets(
+      'a Cloudflare-blocked source offers Solve Cloudflare, not the generic '
+      "\"couldn't load\" outage wording",
+      (tester) async {
+        await pumpEmptyView(
+          tester,
+          mode: ContentMode.anime,
+          cloudflareUrl: 'https://animepahe.ru/',
+          onSolveCloudflare: () async {},
+        );
+
+        expect(find.text('allanime is protected by Cloudflare'), findsOneWidget);
+        expect(find.text("allanime isn't answering"), findsNothing);
+        expect(
+          find.widgetWithText(ElevatedButton, 'Solve Cloudflare'),
+          findsOneWidget,
+        );
+      },
+    );
+
+    testWidgets('tapping Solve Cloudflare fires onSolveCloudflare', (
+      tester,
+    ) async {
+      var solved = false;
+      await pumpEmptyView(
+        tester,
+        mode: ContentMode.anime,
+        cloudflareUrl: 'https://animepahe.ru/',
+        onSolveCloudflare: () async => solved = true,
+      );
+
+      await tester.tap(find.widgetWithText(ElevatedButton, 'Solve Cloudflare'));
+      await tester.pump();
+      expect(solved, isTrue);
+    });
+
+    testWidgets(
+      'with no solve callback it stays the plain outage state — a source that '
+      'is merely down must not claim to be Cloudflare-gated',
+      (tester) async {
+        await pumpEmptyView(tester, mode: ContentMode.anime);
+
+        expect(find.text("allanime isn't answering"), findsOneWidget);
+        expect(find.text('Solve Cloudflare'), findsNothing);
+      },
+    );
+  });
+
+  group('offline', () {
+    testWidgets('says the connection failed, and does not blame the source',
+        (tester) async {
+      await pumpEmptyView(tester, mode: ContentMode.anime, offline: true);
+
+      expect(find.text("You're offline"), findsOneWidget);
+      // The whole point: the outage wording sent people off
+      // reinstalling a source that was never the problem.
+      expect(find.text("allanime isn't answering"), findsNothing);
+      expect(find.textContaining('allanime is probably fine'), findsOneWidget);
+    });
+
+    testWidgets('outranks the install-sources guide', (tester) async {
+      // No sources installed AND offline: telling someone to go install an
+      // extension is useless advice when nothing can reach the network.
+      await pumpEmptyView(tester, mode: ContentMode.novel, offline: true);
+
+      expect(find.text("You're offline"), findsOneWidget);
+      expect(find.textContaining('Browse'), findsNothing);
+    });
+
+    testWidgets('a Cloudflare block still wins — that one IS actionable',
+        (tester) async {
+      await pumpEmptyView(
+        tester,
+        mode: ContentMode.anime,
+        offline: true,
+        cloudflareUrl: 'https://animepahe.ru/',
+        onSolveCloudflare: () async {},
+      );
+
+      expect(find.text('Solve Cloudflare'), findsOneWidget);
+      expect(find.text("You're offline"), findsNothing);
+    });
+  });
+}
