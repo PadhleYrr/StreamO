@@ -1,0 +1,230 @@
+package eu.kanade.tachiyomi.network.interceptor
+
+import android.annotation.SuppressLint
+import android.content.Context
+import android.webkit.WebView
+import android.widget.Toast
+import androidx.core.content.ContextCompat
+import eu.kanade.tachiyomi.network.AndroidCookieJar
+import eu.kanade.tachiyomi.util.system.WebViewClientCompat
+import eu.kanade.tachiyomi.util.system.isOutdated
+import eu.kanade.tachiyomi.util.system.toast
+import okhttp3.Cookie
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.Interceptor
+import okhttp3.Request
+import okhttp3.Response
+import java.io.IOException
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+
+class CloudflareInterceptor(
+    private val context: Context,
+    private val cookieManager: AndroidCookieJar,
+    defaultUserAgentProvider: () -> String,
+) : WebViewInterceptor(context, defaultUserAgentProvider) {
+
+    private val executor = ContextCompat.getMainExecutor(context)
+
+    override fun shouldIntercept(response: Response): Boolean {
+        if (response.request.url.host.contains("anilist.co")) return false
+        return response.code in ERROR_CODES && response.header("Server") in SERVER_CHECK
+    }
+
+    override fun intercept(
+        chain: Interceptor.Chain,
+        request: Request,
+        response: Response
+    ): Response {
+        // Remember the UA this source actually sends, so the visible solver
+        // (SourceWebViewActivity) solves under the SAME UA — a cf_clearance
+        // cookie is bound to its UA; solving under the app default when the
+        // source uses its own UA makes Cloudflare reject the cookie forever.
+        eu.kanade.tachiyomi.network.NetworkHelper.challengeUserAgent =
+            request.header("User-Agent")
+        // Per-host too: the global above is overwritten by whichever concurrent
+        // request is challenged last, which is how a solve ends up bound to a
+        // UA that a different request never sends.
+        eu.kanade.tachiyomi.network.NetworkHelper.rememberSolveUa(
+            request.url.host,
+            request.header("User-Agent"),
+        )
+        // A clearance the user JUST earned by hand is never thrown away. Without
+        // this the app loops forever: the reload after a visible solve gets
+        // challenged, the remove() below deletes the fresh cf_clearance, the
+        // headless retry can't pass an interactive challenge, so we prompt again
+        // — and every solve is wiped by the request that follows it.
+        //
+        // Inside the grace window we retry ONCE carrying the cookie. If
+        // Cloudflare still refuses, the clearance isn't being accepted for our
+        // requests at all and re-solving cannot help, so we return that response
+        // and let it surface as an ordinary failure rather than another prompt.
+        val solvedAt = eu.kanade.tachiyomi.network.NetworkHelper.lastSolveAtMs
+        val justSolved = solvedAt > 0 &&
+            System.currentTimeMillis() - solvedAt < SOLVE_GRACE_MS
+        if (justSolved &&
+            cookieManager.get(request.url).any { it.name == "cf_clearance" }
+        ) {
+            response.close()
+            val retried = chain.proceed(request)
+
+            // A clearance earned by hand seconds ago and still refused means the
+            // cookie isn't being accepted for our requests at all. Log what we
+            // actually sent — whether the cookie went out, and whether the UA
+            // the source sends matches the one the challenge was solved under
+            // (cf_clearance is bound to its UA, so a mismatch is refused every
+            // time). This is the only window where the answer is knowable, and
+            // it's cheap: it runs once per failed solve, never in the happy path.
+            if (retried.code in ERROR_CODES && retried.header("Server") in SERVER_CHECK) {
+                val cookieSent = cookieManager.get(request.url)
+                    .any { it.name == "cf_clearance" }
+                val reqUa = request.header("User-Agent")
+                val solveUa =
+                    eu.kanade.tachiyomi.network.NetworkHelper.challengeUserAgent
+                val uaState = when {
+                    reqUa == null -> "none"
+                    reqUa == solveUa -> "match"
+                    else -> "MISMATCH"
+                }
+                android.util.Log.w(
+                    "ZangetsuCF",
+                    "still challenged after a manual solve: ${retried.code} " +
+                        "${request.url.host} cookie=${if (cookieSent) "sent" else "MISSING"} " +
+                        "ua=$uaState mit=${retried.header("cf-mitigated") ?: "-"}\n" +
+                        "reqUA=$reqUa\nsolveUA=$solveUa",
+                )
+            }
+            return retried
+        }
+
+        try {
+            response.close()
+            cookieManager.remove(request.url, COOKIE_NAMES, 0)
+            val oldCookie = cookieManager.get(request.url)
+                .firstOrNull { it.name == "cf_clearance" }
+            resolveWithWebView(request, oldCookie)
+
+            return chain.proceed(request)
+        }
+        // Because OkHttp's enqueue only handles IOExceptions, wrap the exception so that
+        // we don't crash the entire app
+        catch (e: CloudflareBypassException) {
+            // The headless solve can't pass an interactive challenge (Turnstile).
+            // Surface it as a typed IOException carrying the URL so the bridge can
+            // offer the user a visible WebView solve (SourceWebViewActivity).
+            throw CloudflareRequiredException(request.url.toString())
+        } catch (e: Exception) {
+            throw IOException(e)
+        }
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun resolveWithWebView(originalRequest: Request, oldCookie: Cookie?) {
+        // We need to lock this thread until the WebView finds the challenge solution url, because
+        // OkHttp doesn't support asynchronous interceptors.
+        val latch = CountDownLatch(1)
+
+        var webview: WebView? = null
+
+        var challengeFound = false
+        var cloudflareBypassed = false
+        var isWebViewOutdated = false
+
+        val origRequestUrl = originalRequest.url.toString()
+        val headers = parseHeaders(originalRequest.headers)
+
+        executor.execute {
+            webview = createWebView(originalRequest)
+
+            webview?.webViewClient = object : WebViewClientCompat() {
+                override fun onPageFinished(view: WebView, url: String) {
+                    fun isCloudFlareBypassed(): Boolean {
+                        return cookieManager.get(origRequestUrl.toHttpUrl())
+                            .firstOrNull { it.name == "cf_clearance" }
+                            .let { it != null && it != oldCookie }
+                    }
+
+                    if (isCloudFlareBypassed()) {
+                        cloudflareBypassed = true
+                        latch.countDown()
+                    }
+
+                    if (url == origRequestUrl && !challengeFound) {
+                        // The first request didn't return the challenge, abort.
+                        latch.countDown()
+                    }
+                }
+
+                override fun onReceivedErrorCompat(
+                    view: WebView,
+                    errorCode: Int,
+                    description: String?,
+                    failingUrl: String,
+                    isMainFrame: Boolean,
+                ) {
+                    if (isMainFrame) {
+                        if (errorCode in ERROR_CODES) {
+                            // Found the Cloudflare challenge page.
+                            challengeFound = true
+                        } else {
+                            // Unlock thread, the challenge wasn't found.
+                            latch.countDown()
+                        }
+                    }
+                }
+            }
+
+            webview?.loadUrl(origRequestUrl, headers)
+        }
+
+        // A managed (auto) challenge clears in a few seconds; give it a short
+        // window and then fall back to the visible solve for interactive
+        // Turnstile, rather than blocking the browse for a full 30s.
+        latch.await(HEADLESS_SOLVE_SECONDS, TimeUnit.SECONDS)
+
+        executor.execute {
+            if (!cloudflareBypassed) {
+                isWebViewOutdated = webview?.isOutdated() == true
+            }
+
+            webview?.run {
+                stopLoading()
+                destroy()
+            }
+        }
+
+        // Throw exception if we failed to bypass Cloudflare
+        if (!cloudflareBypassed) {
+            // Prompt user to update WebView if it seems too outdated
+            if (isWebViewOutdated) {
+                context.toast(
+                    "Please update the webview app for better compatibility",
+                    Toast.LENGTH_LONG
+                )
+            }
+
+            throw CloudflareBypassException()
+        }
+    }
+}
+
+private val ERROR_CODES = listOf(403, 503)
+private val SERVER_CHECK = arrayOf("cloudflare-nginx", "cloudflare")
+private val COOKIE_NAMES = listOf("cf_clearance")
+private const val HEADLESS_SOLVE_SECONDS = 12L
+
+/** How long a hand-solved `cf_clearance` is treated as fresh (see [CloudflareInterceptor.intercept]).
+ *  Long enough to cover the reload right after a solve, short enough that a
+ *  genuinely stale cookie still gets cleared on the next browse. */
+private const val SOLVE_GRACE_MS = 90_000L
+
+class CloudflareBypassException : Exception()
+
+/**
+ * Thrown when the headless solver couldn't clear an interactive Cloudflare
+ * challenge. Carries the [url] to solve so the app can open a visible WebView
+ * ([com.spyou.watch_app.mihon.SourceWebViewActivity]). Extends [IOException]
+ * so it propagates cleanly through OkHttp and the source call.
+ */
+class CloudflareRequiredException(val url: String) :
+    IOException("Cloudflare challenge — solve at $url")
