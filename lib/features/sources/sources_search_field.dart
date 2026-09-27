@@ -1,0 +1,104 @@
+import 'package:flutter/material.dart';
+
+import '../../core/app_mode.dart';
+import '../../core/di/injector.dart';
+import '../../core/theme/app_colors.dart';
+import '../../core/theme/app_text.dart';
+import '../../core/tv/tv_text_field.dart';
+
+/// Whether an extension/plugin row matches a search [query].
+///
+/// Case-insensitive substring on [name]; a query that exactly equals the
+/// row's [lang] code (e.g. "en", "id") also matches. An empty/blank query
+/// matches everything.
+bool sourceSearchMatches(String query, String name, [String? lang]) {
+  final q = query.trim().toLowerCase();
+  if (q.isEmpty) return true;
+  if (name.toLowerCase().contains(q)) return true;
+  return lang != null && lang.trim().toLowerCase() == q;
+}
+
+/// The shared search box used by the provider screens (phone + TV).
+///
+/// Purely presentational: the owning screen holds the [controller] and
+/// rebuilds itself from [onChanged].
+///
+/// On TV this uses [TvTextField] so D-pad focus does **not** raise the
+/// leanback IME (a bare [TextField] would steal arrows and open the
+/// keyboard the moment focus lands from a source row below). OK/Select
+/// opens the keyboard when the user actually wants to type.
+class SourcesSearchField extends StatelessWidget {
+  const SourcesSearchField({
+    super.key,
+    required this.controller,
+    required this.onChanged,
+    this.hint = 'Search extensions',
+  });
+
+  final TextEditingController controller;
+  final ValueChanged<String> onChanged;
+  final String hint;
+
+  @override
+  Widget build(BuildContext context) {
+    final isTv = sl.isRegistered<AppMode>() && sl<AppMode>().isTv;
+    final decoration = InputDecoration(
+      hintText: hint,
+      hintStyle: AppText.body.copyWith(color: AppColors.textSecondary),
+      prefixIcon:
+          const Icon(Icons.search, color: AppColors.textSecondary, size: 20),
+      suffixIcon: controller.text.isEmpty
+          ? null
+          : Focus(
+              // Clear is tap/OK-reachable via the field itself on phone;
+              // on TV keep it out of D-pad traversal so arrows stay on the
+              // search field ↔ tabs ↔ list path.
+              canRequestFocus: false,
+              skipTraversal: true,
+              descendantsAreFocusable: !isTv,
+              descendantsAreTraversable: !isTv,
+              child: IconButton(
+                icon: const Icon(
+                  Icons.close,
+                  color: AppColors.textSecondary,
+                  size: 18,
+                ),
+                onPressed: () {
+                  controller.clear();
+                  onChanged('');
+                },
+              ),
+            ),
+      isDense: true,
+      filled: true,
+      fillColor: AppColors.surface,
+      contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      border: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(12),
+        borderSide: BorderSide.none,
+      ),
+      focusedBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(12),
+        borderSide: BorderSide(color: AppColors.accent, width: 1.5),
+      ),
+    );
+
+    if (isTv) {
+      return TvTextField(
+        controller: controller,
+        onChanged: onChanged,
+        style: AppText.body,
+        cursorColor: AppColors.accent,
+        decoration: decoration,
+      );
+    }
+
+    return TextField(
+      controller: controller,
+      onChanged: onChanged,
+      style: AppText.body,
+      cursorColor: AppColors.accent,
+      decoration: decoration,
+    );
+  }
+}
