@@ -1036,6 +1036,9 @@ class _ZTvAddRepoDialog extends StatefulWidget {
 }
 
 class _ZTvAddRepoDialogState extends State<_ZTvAddRepoDialog> {
+  static const _kStreamOProvidersUrl =
+      'https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/index.json';
+
   final _urlCtrl = TextEditingController();
   final _nameCtrl = TextEditingController();
   bool _loading = false;
@@ -1074,6 +1077,26 @@ class _ZTvAddRepoDialogState extends State<_ZTvAddRepoDialog> {
     });
   }
 
+  Future<void> _addStreamOProviders() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    final error = await widget.bloc.addRepo(
+      _kStreamOProvidersUrl,
+      customName: 'StreamO Providers',
+    );
+    if (!mounted) return;
+    if (error == null) {
+      Navigator.of(context).pop();
+      return;
+    }
+    setState(() {
+      _loading = false;
+      _error = error;
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
@@ -1083,6 +1106,68 @@ class _ZTvAddRepoDialogState extends State<_ZTvAddRepoDialog> {
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
+          // StreamO Providers quick-add — one remote press, no typing.
+          TvListFocusable(
+            onTap: _loading ? () {} : _addStreamOProviders,
+            semanticLabel: 'Add StreamO Providers',
+            child: Material(
+              color: AppColors.surface2,
+              borderRadius: BorderRadius.circular(12),
+              clipBehavior: Clip.antiAlias,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                child: Row(
+                  children: [
+                    Container(
+                      width: 36,
+                      height: 36,
+                      alignment: Alignment.center,
+                      decoration: BoxDecoration(
+                        color: AppColors.accent.withValues(alpha: 0.15),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Icon(Icons.bolt_rounded,
+                          color: AppColors.accent, size: 20),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text('StreamO Providers',
+                              style: AppText.headline.copyWith(fontSize: 14)),
+                          const SizedBox(height: 2),
+                          Text('65 sources — movies, TV, anime',
+                              style: AppText.caption),
+                        ],
+                      ),
+                    ),
+                    _loading
+                        ? const SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(strokeWidth: 2))
+                        : Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 10, vertical: 5),
+                            decoration: BoxDecoration(
+                              color: AppColors.accent,
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            child: Text('Add',
+                                style: AppText.caption.copyWith(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.w700)),
+                          ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 16),
+          Divider(color: AppColors.surface2, height: 1),
+          const SizedBox(height: 14),
           // TvTextField: focus without opening IME; OK/Select shows the keyboard
           // (bare TextField autofocus eats the remote and often never shows IME on TV).
           TvTextField(
