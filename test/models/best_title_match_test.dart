@@ -1,0 +1,161 @@
+import 'package:flutter_test/flutter_test.dart';
+import 'package:watch_app/core/models/media_item.dart';
+import 'package:watch_app/core/models/provider_info.dart';
+
+MediaItem _item(String title, {String? english, int? malId}) => MediaItem(
+      id: title,
+      title: title,
+      englishTitle: english,
+      url: title,
+      type: ProviderType.anime,
+      sourceId: 'src',
+      malId: malId,
+    );
+
+void main() {
+  group('bestTitleMatch', () {
+    test('returns null for empty results', () {
+      expect(bestTitleMatch([], 'anything'), isNull);
+    });
+
+    test('prefers an exact (normalized) title match over the first result', () {
+      // The reported bug: source ranked "III" first; tapping season 1 must open
+      // season 1, not results.first.
+      final results = [
+        _item('Mushoku Tensei III: Isekai Ittara Honki Dasu'),
+        _item('Mushoku Tensei: Jobless Reincarnation'),
+      ];
+      final match = bestTitleMatch(results, 'Mushoku Tensei: Jobless Reincarnation');
+      expect(match!.title, 'Mushoku Tensei: Jobless Reincarnation');
+    });
+
+    test('matches ignoring punctuation/case', () {
+      final results = [_item('Attack on Titan Final'), _item('ATTACK ON TITAN!')];
+      expect(bestTitleMatch(results, 'attack on titan')!.title, 'ATTACK ON TITAN!');
+    });
+
+    test('matches on englishTitle too', () {
+      final results = [
+        _item('Shingeki no Kyojin', english: 'Attack on Titan'),
+        _item('Other'),
+      ];
+      expect(bestTitleMatch(results, 'Attack on Titan')!.title, 'Shingeki no Kyojin');
+    });
+
+    test('falls back to the first result when nothing matches', () {
+      final results = [_item('First'), _item('Second')];
+      expect(bestTitleMatch(results, 'Unrelated')!.title, 'First');
+    });
+
+    test('prefers a MAL id match over title, even when titles differ', () {
+      // Source names season 1 differently than AniList, so title won't match —
+      // but the MAL id does, so it must still open season 1.
+      final results = [
+        _item('Mushoku Tensei III', malId: 111),
+        _item('Mushoku Tensei', malId: 222),
+      ];
+      final match = bestTitleMatch(
+        results,
+        'Mushoku Tensei: Jobless Reincarnation',
+        wantedMalId: 222,
+      );
+      expect(match!.malId, 222);
+    });
+
+    test('ignores a null MAL id and falls through to title match', () {
+      final results = [_item('First', malId: 1), _item('Target', malId: 2)];
+      final match =
+          bestTitleMatch(results, 'Target', wantedMalId: null);
+      expect(match!.title, 'Target');
+    });
+
+    test('matches a source title decorated with a year', () {
+      final results = [_item('Reacher (2022)')];
+      expect(bestTitleMatch(results, 'Reacher')!.title, 'Reacher (2022)');
+    });
+
+    test('matches a source title decorated with a season suffix', () {
+      final results = [_item('Reacher Season 1')];
+      expect(bestTitleMatch(results, 'Reacher')!.title, 'Reacher Season 1');
+    });
+
+    test('matches a source title wrapped in "Watch ... Online"', () {
+      final results = [_item('Watch Reacher Online')];
+      expect(bestTitleMatch(results, 'Reacher')!.title, 'Watch Reacher Online');
+    });
+
+    test('does not match an unrelated title that merely contains the substring', () {
+      // The reported bug: "Reacher" must not fall through to a result whose
+      // title happens to contain it as a substring.
+      final results = [_item('The Reluctant Preacher')];
+      final match = bestTitleMatch(results, 'Reacher');
+      expect(match, isNotNull); // falls back to first result (only one here)
+      expect(titleMatches(match!, 'Reacher'), isFalse);
+    });
+
+    test('matches a decorated title but not the bare franchise name', () {
+      final decorated = _item('Spider-Man: Brand New Day (2026)');
+      final bare = _item('Spider-Man');
+      expect(
+        titleMatches(decorated, 'Spider-Man: Brand New Day'),
+        isTrue,
+      );
+      expect(
+        titleMatches(bare, 'Spider-Man: Brand New Day'),
+        isFalse,
+      );
+    });
+
+    test('matches the Romaji alt title when the source indexes by Romaji', () {
+      // The real bug: metadata gives English, source lists Romaji, no malId.
+      final results = [
+        _item('Mushoku Tensei III: Isekai Ittara Honki Dasu'),
+        _item('Mushoku Tensei II: Isekai Ittara Honki Dasu Part 2'),
+        _item('Mushoku Tensei: Isekai Ittara Honki Dasu'),
+      ];
+      final match = bestTitleMatch(
+        results,
+        'Mushoku Tensei: Jobless Reincarnation Season 2 Part 2',
+        altTitle: 'Mushoku Tensei II: Isekai Ittara Honki Dasu Part 2',
+      );
+      expect(match!.title, 'Mushoku Tensei II: Isekai Ittara Honki Dasu Part 2');
+    });
+
+    test('an ampersand matches the same title spelled with "and"', () {
+      // Sources write it either way. Dropping the symbol made these normalise
+      // to `abovebelow` vs `aboveandbelow` — never equal, on the same film.
+      expect(
+        titleMatches(_item('Above and Below'), 'Above & Below'),
+        isTrue,
+      );
+      expect(
+        titleMatches(_item('Above & Below'), 'Above and Below'),
+        isTrue,
+      );
+    });
+
+    test('spelling out & does not make unrelated titles collide', () {
+      expect(titleMatches(_item('Above & Beyond'), 'Above & Below'), isFalse);
+      expect(titleMatches(_item('Below'), 'Above & Below'), isFalse);
+    });
+
+    test('normalizeTitle agrees on both spellings', () {
+      expect(normalizeTitle('Above & Below'), normalizeTitle('Above and Below'));
+      expect(normalizeTitle('Tom & Jerry'), 'tomandjerry');
+    });
+
+    test('an accented title matches the plain spelling a source uses', () {
+      // The strip used to DELETE the accent: pokémon -> pokmon, which cannot
+      // equal pokemon. Folding makes both sides land on the same letters.
+      expect(normalizeTitle('Pokémon'), 'pokemon');
+      expect(normalizeTitle('Amélie'), 'amelie');
+      expect(normalizeTitle('Café Society'), normalizeTitle('Cafe Society'));
+      expect(titleMatches(_item('Pokemon'), 'Pokémon'), isTrue);
+      expect(titleMatches(_item('Pokémon'), 'Pokemon'), isTrue);
+    });
+
+    test('folding does not merge titles that are genuinely different', () {
+      expect(titleMatches(_item('Pokemon Journeys'), 'Pokémon'), isFalse);
+    });
+  });
+}
