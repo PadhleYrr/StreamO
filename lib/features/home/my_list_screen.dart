@@ -1,0 +1,1253 @@
+import 'dart:async';
+import 'dart:ui' show ImageFilter;
+
+import 'package:cached_network_image/cached_network_image.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
+
+import '../../core/tracker/tracker_item_url.dart';
+import '../../core/zmode/metadata_provider_prefs.dart';
+import '../../core/app_mode.dart';
+import '../../core/di/injector.dart';
+import '../../core/mode/content_mode.dart';
+import '../../core/mode/content_mode_cubit.dart';
+import '../../core/models/media_item.dart';
+import '../../core/anilist/anilist_service.dart';
+import '../../core/playback/category_store.dart';
+import '../../l10n/ui_strings.dart';
+import '../../core/ui/reveal_item.dart';
+import '../../core/ui/global_messenger.dart';
+import '../../core/ui/anilist_custom_lists_sheet.dart';
+import '../../core/prefs/list_sort.dart';
+import '../../core/models/watch_status.dart';
+import '../../core/playback/my_list.dart';
+import '../../core/playback/list_status_store.dart';
+import '../../core/theme/app_colors.dart';
+import '../../core/theme/app_text.dart';
+import '../../l10n/l10n.dart';
+import '../../core/tracker/tracker.dart';
+import '../../core/tracker/tracker_hub.dart';
+import '../../core/ui/buttons.dart';
+import '../../core/ui/list_status_sheet.dart';
+import '../../core/ui/poster_card.dart';
+import '../../core/ui/states.dart';
+import '../../core/ui/tracker_entry_sheet.dart';
+import '../auth/auth_cubit.dart';
+import '../auth/auth_screens.dart';
+import '../detail/detail_screen.dart';
+import 'cubit/my_list_cubit.dart';
+import 'library_tabs.dart';
+import 'cubit/tracker_list_cubit.dart';
+import 'my_list_screen_tv.dart';
+import 'search_screen.dart';
+
+/// My List — one library the user browses by source (their own saved list plus
+/// each connected tracker) via a segmented control, and by status via tabs.
+/// Trackers are connected/managed from the header's accounts button.
+class MyListScreen extends StatelessWidget {
+  const MyListScreen({
+    super.key,
+    this.initialTracker,
+    this.initialKind,
+    this.initialStatus,
+  });
+
+  /// Open straight onto one tracker's library instead of your own list, with
+  /// the account switcher hidden.
+  ///
+  /// This is how the Home cards reach a tracker: reusing this screen rather
+  /// than writing a thinner one keeps statuses, custom lists, sort and filter
+  /// working, which a purpose-built list screen would have quietly lost.
+  final Tracker? initialTracker;
+
+  /// Which kind of list to open for [initialTracker]. The hub names the kind
+  /// on the row itself ("AniList → Manga"), so the screen must honour that
+  /// rather than following whatever mode the app happens to be in — otherwise
+  /// tapping Manga while in anime mode would land on the anime list.
+  final ContentMode? initialKind;
+
+  /// Land on one status tab instead of All. A home row IS a status bucket, so
+  /// its See All has to arrive on the tab it came from — landing on All would
+  /// show a different list than the row the user tapped.
+  final WatchStatus? initialStatus;
+
+  @override
+  Widget build(BuildContext context) {
+    final pinned = initialTracker;
+    return MultiBlocProvider(
+      providers: [
+        BlocProvider(
+          create: (_) => MyListCubit(sl<MyListStore>(), sl<ListStatusStore>()),
+        ),
+        BlocProvider(
+          create: (_) {
+            // Pinned screens name their own kind: the hub opens a tracker
+            // FOR a kind, which is not necessarily the app's current mode.
+            final c = TrackerListCubit(pinnedKind: initialKind);
+            if (pinned != null) c.selectTracker(pinned);
+            return c;
+          },
+        ),
+      ],
+      child: _MyListView(
+        pinnedTracker: pinned,
+        pinnedKind: initialKind,
+        initialStatus: initialStatus,
+      ),
+    );
+  }
+}
+
+class _MyListView extends StatefulWidget {
+  const _MyListView({this.pinnedTracker, this.pinnedKind, this.initialStatus});
+
+  /// Non-null when this screen was opened FOR one tracker — the switcher is
+  /// hidden and there is nothing to switch to.
+  final Tracker? pinnedTracker;
+
+  /// The kind a pinned tracker screen was opened for. Null falls back to the
+  /// app's current mode, which is what the old Home cards relied on.
+  final ContentMode? pinnedKind;
+
+  /// Status tab to open on, or null for All.
+  final WatchStatus? initialStatus;
+
+  @override
+  State<_MyListView> createState() => _MyListViewState();
+}
+
+class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
+  late WatchStatus? _statusFilter = widget.initialStatus; // null = All
+
+  /// Selected AniList custom list, or null. Separate from [_categoryFilter]:
+  /// that one is ours and local, this one is AniList's own and lives on their
+  /// servers. They can never both be active — categories only exist on My
+  /// List, custom lists only on the AniList tab.
+  String? _customListFilter;
+
+  /// Selected user category, or null when a status tab is picked. The two are
+  /// mutually exclusive: the tab row holds both, and only one tab is active.
+  String? _categoryFilter;
+
+  /// Null when the store isn't registered. Widget tests build this screen with
+  /// a minimal DI set, and a library view is not worth an exception over an
+  /// optional feature — no store simply means no categories.
+  CategoryStore? get _cats =>
+      sl.isRegistered<CategoryStore>() ? sl<CategoryStore>() : null;
+
+  /// Null until the user picks one — the default then depends on which list is
+  /// showing (your own keeps insertion order, a tracker leads with score), and
+  /// that can change under us when the source switcher moves.
+  ListSort? _sort = ListSortPrefs.sortBy;
+
+  /// Which kind the local list is showing. Replaces the old implicit filter on
+  /// the app's ContentMode, so you can see your manga list without switching
+  /// the whole app into manga mode. Tracker screens ignore it — a tracker
+  /// answers for one kind already.
+  ContentMode _kind = sl<ContentModeCubit>().state;
+  bool _sortDesc = ListSortPrefs.descending;
+
+  ListSort _sortFor({required bool isMyList}) {
+    final chosen = _sort;
+    // A saved sort that this list can't do (score on your own list, which has
+    // none) falls back rather than showing an empty-looking order.
+    if (chosen != null && optionsFor(isMyList: isMyList).contains(chosen)) {
+      return chosen;
+    }
+    return defaultSortFor(isMyList: isMyList);
+  }
+
+  Future<void> _openItem(
+    BuildContext context,
+    MediaItem item, {
+    PreferredProvider? prefer,
+  }) async {
+    final cubit = context.read<MyListCubit>();
+    await Navigator.push(context, DetailScreen.route(item, prefer: prefer));
+    cubit.reload();
+  }
+
+  /// The catalogue behind a tracker, when it has one. A tracker that is only a
+  /// tracker — no catalogue of its own — returns null and the app-wide choice
+  /// stands.
+  PreferredProvider? _providerOf(Tracker? t) => switch (t?.displayName) {
+    'AniList' => PreferredProvider.anilist,
+    'MyAnimeList' => PreferredProvider.mal,
+    'Simkl' => PreferredProvider.simkl,
+    _ => null,
+  };
+
+  Timer? _liveSync;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    // Own My List is Hive; tracker chips cache a fetch. While this screen is
+    // mounted, keep both aligned with other devices — TV never backgrounds.
+    _liveSync = Timer.periodic(const Duration(seconds: 15), (_) {
+      _refreshLibrary();
+    });
+  }
+
+  @override
+  void dispose() {
+    _liveSync?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) _refreshLibrary();
+  }
+
+  void _refreshLibrary() {
+    if (!mounted) return;
+    if (sl.isRegistered<MyListStore>()) {
+      unawaited(sl<MyListStore>().pullFromCloud());
+    }
+    unawaited(context.read<TrackerListCubit>().refresh());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (sl<AppMode>().isTv) {
+      return MyListScreenTv(initialStatus: widget.initialStatus);
+    }
+    return Scaffold(
+      backgroundColor: AppColors.bg,
+      // bottom: false — the shell's floating dock overlays the content
+      // (extendBody); a full SafeArea would clip the grid at the dock's top
+      // edge, leaving a dead band on both sides of the capsule.
+      body: SafeArea(
+        bottom: false,
+        child: BlocBuilder<TrackerListCubit, TrackerListState>(
+          builder: (context, tlState) {
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _header(context),
+                if (_searching) _searchField(context),
+                if (widget.pinnedTracker == null) _kindTabs(context),
+                Expanded(
+                  child: tlState.isMyList
+                      ? _myListBody(context)
+                      : _trackerBody(context, tlState),
+                ),
+              ],
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  double _cellW(BuildContext context) =>
+      (MediaQuery.of(context).size.width - 32 - 24) / 3;
+
+  /// Filters the list you are looking at by title — My List and every tracker
+  /// list, in every kind. View state: it belongs to the screen, and a query
+  /// should not survive leaving it.
+  bool _searching = false;
+  String _query = '';
+  final _searchController = TextEditingController();
+
+  void _toggleSearch() {
+    setState(() {
+      _searching = !_searching;
+      if (!_searching) {
+        _query = '';
+        _searchController.clear();
+      }
+    });
+  }
+
+  /// The search field, shown under the header while searching.
+  Widget _searchField(BuildContext context) => Padding(
+    padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
+    child: Container(
+      height: 42,
+      padding: const EdgeInsets.symmetric(horizontal: 14),
+      decoration: BoxDecoration(
+        color: AppColors.surface,
+        borderRadius: BorderRadius.circular(21),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.search_rounded, size: 18, color: AppColors.textSecondary),
+          const SizedBox(width: 10),
+          Expanded(
+            child: TextField(
+              controller: _searchController,
+              autofocus: true,
+              style: AppText.body.copyWith(color: AppColors.textPrimary),
+              cursorColor: AppColors.accent,
+              decoration: InputDecoration(
+                isDense: true,
+                border: InputBorder.none,
+                hintText: context.l10n.search2,
+                hintStyle: AppText.body,
+              ),
+              onChanged: (v) => setState(() => _query = v),
+            ),
+          ),
+          if (_query.isNotEmpty)
+            GestureDetector(
+              onTap: () => setState(() {
+                _query = '';
+                _searchController.clear();
+              }),
+              child: Icon(
+                Icons.clear_rounded,
+                size: 18,
+                color: AppColors.textSecondary,
+              ),
+            ),
+        ],
+      ),
+    ),
+  );
+
+  // ── Header: frosted capsule (no avatar) + search/filter + accounts ─────────
+
+  Widget _header(BuildContext context) {
+    final hub = sl<TrackerHub>();
+    return AnimatedBuilder(
+      // Rebuild when a tracker connects/disconnects.
+      animation: Listenable.merge(hub.trackers),
+      builder: (context, _) {
+        final l10n = context.l10n;
+        final pinned = widget.pinnedTracker;
+        // Opened for one tracker: name it. Saying "Library / My List + 3
+        // trackers" on a screen showing only AniList was just wrong.
+        // Whose list this is: the account name earns its place here, where the
+        // avatar did not — it says the same thing in less space and reads.
+        final who = pinned?.viewerName;
+        final title = pinned == null
+            ? l10n.libraryLabel
+            : (who == null || who.isEmpty
+                  ? pinned.displayName
+                  : '${pinned.displayName} · $who');
+        // Names the kind on screen rather than "titles": a tracker screen is
+        // opened FOR one, so being vague about it helps nobody.
+        final subtitle = pinned == null
+            ? l10n.yourSavedTitles
+            : switch (widget.pinnedKind ?? sl<ContentModeCubit>().state) {
+                ContentMode.manga => l10n.yourSavedMangaList,
+                ContentMode.novel => l10n.yourSavedNovelList,
+                ContentMode.anime => l10n.yourSavedAnimeList,
+              };
+        return Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(26),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: 0.28),
+                  blurRadius: 24,
+                  offset: const Offset(0, 4),
+                ),
+                BoxShadow(
+                  color: AppColors.accent.withValues(alpha: 0.10),
+                  blurRadius: 40,
+                  spreadRadius: -8,
+                  offset: const Offset(0, 8),
+                ),
+              ],
+            ),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(26),
+              child: BackdropFilter(
+                filter: ImageFilter.blur(sigmaX: 14, sigmaY: 14),
+                child: Container(
+                  decoration: BoxDecoration(
+                    color: AppColors.surface.withValues(alpha: 0.72),
+                    borderRadius: BorderRadius.circular(26),
+                    border: Border.all(
+                      color: Colors.white.withValues(alpha: 0.09),
+                      width: 0.5,
+                    ),
+                  ),
+                  padding: const EdgeInsets.fromLTRB(10, 6, 8, 6),
+                  child: Row(
+                    children: [
+                      // The account this list belongs to, round and leading —
+                      // a tracker's own avatar, or yours on My List.
+                      _headerAvatar(context, pinned),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              title,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              // 19 overflowed the moment a handle was added
+                              // next to the tracker's name.
+                              style: AppText.title.copyWith(fontSize: 15.5),
+                            ),
+                            const SizedBox(height: 1),
+                            Text(
+                              subtitle,
+                              style: AppText.caption.copyWith(
+                                color: AppColors.textTertiary,
+                                fontSize: 11,
+                              ),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      _pillIcon(
+                        _searching ? Icons.close_rounded : Icons.search_rounded,
+                        l10n.search2,
+                        _toggleSearch,
+                        active: _query.isNotEmpty,
+                      ),
+
+                      const SizedBox(width: 8),
+                      _pillIcon(
+                        Icons.sort_rounded,
+                        context.l10n.sort,
+                        () => _openSortSheet(context),
+                        active: _sort != null,
+                      ),
+                      const SizedBox(width: 8),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  /// Sort options for whichever list is showing. Tapping the active one flips
+  /// its direction, which is how the reference apps do it and saves a second
+  /// control.
+  void _openSortSheet(BuildContext context) {
+    final isMyList = context.read<TrackerListCubit>().state.isMyList;
+    final options = optionsFor(isMyList: isMyList);
+    final active = _sortFor(isMyList: isMyList);
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: AppColors.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 18, 20, 8),
+              child: Text(context.l10n.sortBy, style: AppText.title),
+            ),
+            for (final o in options)
+              ListTile(
+                title: Text(
+                  listSortLabel(o),
+                  style: AppText.body.copyWith(
+                    color: o == active
+                        ? AppColors.accent
+                        : AppColors.textPrimary,
+                    fontWeight: o == active ? FontWeight.w700 : null,
+                  ),
+                ),
+                subtitle: o == active
+                    ? Text(
+                        listSortDirectionLabel(o, _sortDesc),
+                        style: AppText.caption,
+                      )
+                    : null,
+                trailing: o == active
+                    ? Icon(
+                        _sortDesc
+                            ? Icons.arrow_downward_rounded
+                            : Icons.arrow_upward_rounded,
+                        color: AppColors.accent,
+                        size: 18,
+                      )
+                    : null,
+                onTap: () {
+                  Navigator.pop(sheetContext);
+                  setState(() {
+                    // Same option again → flip direction; a new one starts in
+                    // the direction people expect (best/newest/A-Z first).
+                    if (o == active) {
+                      _sortDesc = !_sortDesc;
+                    } else {
+                      _sort = o;
+                      _sortDesc = o != ListSort.title;
+                    }
+                  });
+                  ListSortPrefs.save(_sortFor(isMyList: isMyList), _sortDesc);
+                },
+              ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Create a list on the user's AniList account from the tab row, then
+  /// refresh so the new tab appears.
+  Future<void> _createAniListList(
+    BuildContext context,
+    AniListService service,
+  ) async {
+    final mode = sl<ContentModeCubit>().state;
+    final made = await promptCreateAniListList(
+      context,
+      service,
+      mode.isReading ? MediaKind.manga : MediaKind.anime,
+    );
+    if (made == null || !mounted) return;
+    // The names are cached per tracker; creating one is the only thing that
+    // changes them, so drop it before re-reading.
+    final cubit = this.context.read<TrackerListCubit>();
+    cubit.invalidateCustomListNames();
+    await cubit.refresh();
+  }
+
+  /// Name a new category. Duplicate names are refused by the store (two tabs
+  /// reading the same would be indistinguishable), so say so rather than
+  /// failing silently.
+  Future<void> _createCategory(BuildContext context) async {
+    final controller = TextEditingController();
+    final name = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        title: Text(context.l10n.newCategory, style: AppText.title),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          style: AppText.body.copyWith(color: AppColors.textPrimary),
+          decoration: InputDecoration(hintText: context.l10n.personaGym),
+          onSubmitted: (v) => Navigator.pop(ctx, v),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: Text(context.l10n.cancel),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, controller.text),
+            style: FilledButton.styleFrom(backgroundColor: AppColors.accent),
+            child: Text(context.l10n.create),
+          ),
+        ],
+      ),
+    );
+    if (name == null || !mounted) return;
+    // Stamped with the mode it was made in, so it stops appearing as an empty
+    // tab under the other two.
+    final made = await sl<CategoryStore>().create(name, kind: _kind.name);
+    if (!mounted) return;
+    if (made == null) {
+      showGlobalSnack(
+        name.trim().isEmpty
+            ? context.l10n.giveItAName
+            : context.l10n.youAlreadyHaveThatOne,
+      );
+      return;
+    }
+    setState(() => _categoryFilter = made.id); // land on the new tab
+  }
+
+  /// Rename or delete a category (long-press its tab). Deleting keeps every
+  /// title — it only drops the label.
+  Future<void> _manageCategory(BuildContext context, ListCategory c) async {
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: AppColors.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 18, 20, 6),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Text(c.name, style: AppText.title),
+              ),
+            ),
+            ListTile(
+              leading: const Icon(
+                Icons.edit_outlined,
+                color: AppColors.textSecondary,
+              ),
+              title: Text(context.l10n.rename),
+              onTap: () => Navigator.pop(ctx, 'rename'),
+            ),
+            ListTile(
+              leading: Icon(
+                Icons.delete_outline_rounded,
+                color: AppColors.accent,
+              ),
+              title: Text(
+                context.l10n.deleteCategory,
+                style: TextStyle(color: AppColors.accent),
+              ),
+              subtitle: Text(context.l10n.yourTitlesStayOnlyTheLabelGoes),
+              onTap: () => Navigator.pop(ctx, 'delete'),
+            ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+    if (action == null || !mounted) return;
+
+    if (action == 'delete') {
+      await sl<CategoryStore>().delete(c.id);
+      if (!mounted) return;
+      setState(() {
+        // Don't leave the tab row pointing at a category that's gone.
+        if (_categoryFilter == c.id) _categoryFilter = null;
+      });
+      return;
+    }
+
+    final controller = TextEditingController(text: c.name);
+    final name = await showDialog<String>(
+      context: this.context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        title: Text(context.l10n.renameCategory, style: AppText.title),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          style: AppText.body.copyWith(color: AppColors.textPrimary),
+          onSubmitted: (v) => Navigator.pop(ctx, v),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: Text(context.l10n.cancel),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, controller.text),
+            style: FilledButton.styleFrom(backgroundColor: AppColors.accent),
+            child: Text(context.l10n.rename),
+          ),
+        ],
+      ),
+    );
+    if (name == null || !mounted) return;
+    final ok = await sl<CategoryStore>().rename(c.id, name);
+    if (!mounted) return;
+    if (!ok) {
+      showGlobalSnack(context.l10n.thatNameIsTaken);
+      return;
+    }
+    setState(() {});
+  }
+
+  Widget _pillIcon(
+    IconData icon,
+    String tooltip,
+    VoidCallback onTap, {
+    bool active = false,
+  }) {
+    return Tooltip(
+      message: tooltip,
+      child: GestureDetector(
+        onTap: onTap,
+        child: Container(
+          width: 36,
+          height: 36,
+          decoration: BoxDecoration(
+            color: active ? AppColors.accentSoft : AppColors.surface2,
+            shape: BoxShape.circle,
+          ),
+          child: Icon(icon, size: 18, color: AppColors.accent),
+        ),
+      ),
+    );
+  }
+
+  // ── Accounts button (connected avatars + ＋, else "Connect") ───────────────
+
+  /// The header's round avatar: the tracker's own picture on a pinned screen,
+  /// and yours on My List. 30px — big enough to read as a face, small enough
+  /// that the capsule stays one line.
+  Widget _headerAvatar(BuildContext context, Tracker? pinned) {
+    final url = pinned != null
+        ? pinned.viewerAvatar
+        : (sl.isRegistered<AuthCubit>()
+              ? sl<AuthCubit>().state.avatarUrl
+              : null);
+    final letter = pinned?.displayName.isNotEmpty == true
+        ? pinned!.displayName[0]
+        : 'Z';
+    return Container(
+      width: 30,
+      height: 30,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        color: AppColors.surface2,
+        border: Border.all(
+          color: AppColors.accent.withValues(alpha: 0.35),
+          width: 1.5,
+        ),
+      ),
+      child: ClipOval(
+        child: (url != null && url.isNotEmpty)
+            ? CachedNetworkImage(
+                imageUrl: url,
+                width: 30,
+                height: 30,
+                fit: BoxFit.cover,
+                errorWidget: (_, _, _) => _miniLetter(letter),
+              )
+            : _miniLetter(letter),
+      ),
+    );
+  }
+
+  Widget _miniLetter(String letter) => Container(
+    width: 20,
+    height: 20,
+    color: AppColors.accent,
+    alignment: Alignment.center,
+    child: Text(
+      letter,
+      style: const TextStyle(
+        color: Colors.white,
+        fontWeight: FontWeight.w800,
+        fontSize: 10,
+      ),
+    ),
+  );
+
+  Widget _kindTabs(BuildContext context) {
+    const kinds = ContentMode.values;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 2, 16, 10),
+      child: LayoutBuilder(
+        builder: (context, c) {
+          final segW = (c.maxWidth - 8) / kinds.length;
+          return Container(
+            height: 46,
+            padding: const EdgeInsets.all(4),
+            clipBehavior: Clip.antiAlias,
+            decoration: BoxDecoration(
+              color: AppColors.surface2,
+              borderRadius: BorderRadius.circular(23),
+            ),
+            child: Stack(
+              children: [
+                AnimatedAlign(
+                  duration: const Duration(milliseconds: 220),
+                  curve: Curves.easeOutCubic,
+                  alignment: Alignment(
+                    kinds.length == 1
+                        ? 0
+                        : -1 + 2 * (kinds.indexOf(_kind) / (kinds.length - 1)),
+                    0,
+                  ),
+                  child: Container(
+                    width: segW,
+                    decoration: BoxDecoration(
+                      color: AppColors.accent,
+                      borderRadius: BorderRadius.circular(19),
+                    ),
+                  ),
+                ),
+                Row(
+                  children: [
+                    for (final k in kinds)
+                      Expanded(
+                        child: GestureDetector(
+                          behavior: HitTestBehavior.opaque,
+                          onTap: () => setState(() {
+                            _kind = k;
+                            _dropCategoryForeignTo(k);
+                          }),
+                          child: Center(
+                            child: Text(
+                              contentModeLabel(context.l10n, k),
+                              style: AppText.body.copyWith(
+                                fontSize: 13.5,
+                                fontWeight: FontWeight.w700,
+                                color: _kind == k
+                                    ? Colors.white
+                                    : AppColors.textSecondary,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  // ── Filter sheet (type) ────────────────────────────────────────────────────
+
+  // ── My List body ───────────────────────────────────────────────────────────
+
+  Widget _myListBody(BuildContext context) {
+    return BlocBuilder<MyListCubit, List<MyListEntry>>(
+      builder: (context, entries) {
+        final child = entries.isEmpty
+            ? _empty(context)
+            : _grid(
+                context,
+                entries,
+                onTap: (item) => _openItem(context, item),
+                onMore: (entry) =>
+                    showListStatusSheet(context, item: entry.item),
+              );
+        return RefreshIndicator(
+          color: AppColors.accent,
+          backgroundColor: AppColors.surface,
+          onRefresh: () => sl<MyListStore>().pullFromCloud(),
+          child: entries.isEmpty
+              ? ListView(
+                  physics: const AlwaysScrollableScrollPhysics(),
+                  children: [
+                    SizedBox(
+                      height: MediaQuery.of(context).size.height * 0.6,
+                      child: child,
+                    ),
+                  ],
+                )
+              : child,
+        );
+      },
+    );
+  }
+
+  // ── Tracker body (refresh + load/empty/error) ─────────────────────────────
+
+  Widget _trackerBody(BuildContext context, TrackerListState tlState) {
+    final Widget content;
+    switch (tlState.status) {
+      case TrackerListStatus.loading:
+        content = Center(
+          child: CircularProgressIndicator(color: AppColors.accent),
+        );
+      case TrackerListStatus.error:
+        content = EmptyState(
+          icon: Icons.cloud_off_rounded,
+          message: context.l10n.couldnTLoadPullToRefresh,
+        );
+      case TrackerListStatus.idle:
+      case TrackerListStatus.ready:
+        content = tlState.entries.isEmpty
+            ? EmptyState(
+                icon: Icons.bookmark_outline,
+                message: context.l10n.noTitlesInThisList,
+              )
+            : _grid(
+                context,
+                tlState.entries,
+                onTap: (item) => _openTrackerItem(context, item),
+                onMore: (entry) => showTrackerEntrySheet(
+                  context,
+                  tracker: tlState.tracker!,
+                  item: entry.item,
+                  status: entry.status,
+                  progress: entry.progress,
+                  score: entry.score,
+                  tmdbIsTv: entry.tmdbIsTv,
+                  customLists: entry.customLists,
+                  onFind: () => _openTrackerItem(context, entry.item),
+                  onChanged: () => context.read<TrackerListCubit>().refresh(),
+                ),
+              );
+    }
+
+    return RefreshIndicator(
+      color: AppColors.accent,
+      backgroundColor: AppColors.surface,
+      onRefresh: () => context.read<TrackerListCubit>().refresh(),
+      child:
+          tlState.status == TrackerListStatus.ready &&
+              tlState.entries.isNotEmpty
+          ? content
+          : ListView(
+              physics: const AlwaysScrollableScrollPhysics(),
+              children: [
+                SizedBox(
+                  height: MediaQuery.of(context).size.height * 0.6,
+                  child: content,
+                ),
+              ],
+            ),
+    );
+  }
+
+  // ── Shared grid: status tabs (with counts) + poster grid ──────────────────
+
+  Widget _grid(
+    BuildContext context,
+    List<MyListEntry> entries, {
+    required void Function(MediaItem) onTap,
+    void Function(MyListEntry)? onMore,
+  }) {
+    final cellW = _cellW(context);
+    // Fixed tab order (All is prepended in _statusTabs): Watching first, then
+    // Plan to Watch, Completed, Paused, Dropped — regardless of enum order.
+    const tabOrder = [
+      WatchStatus.watching,
+      WatchStatus.planning,
+      WatchStatus.completed,
+      WatchStatus.paused,
+      WatchStatus.dropped,
+    ];
+    // Reading modes (manga/novel) see only their own items; anime mode's
+    // matchesProvider covers BOTH anime + movie types, so this is a no-op
+    // there — today's anime My List is unaffected.
+    //
+    // Narrow by mode FIRST: the status tabs' counts and which tabs even appear
+    // are both derived from this, so counting raw `entries` showed anime totals
+    // (and anime-only status tabs) while in manga/novel mode.
+    // The kind tab decides, not the app's current mode — the point of the
+    // tabs is seeing all three without leaving the mode you're browsing in.
+    // A tracker screen has no tabs and keeps following the app mode.
+    final mode = widget.pinnedTracker == null
+        ? _kind
+        : (widget.pinnedKind ?? sl<ContentModeCubit>().state);
+    final modeEntries = entries
+        .where((e) => mode.matchesProvider(e.item.type))
+        .toList();
+
+    final presentStatuses = tabOrder
+        .where((s) => modeEntries.any((e) => e.status == s))
+        .toList();
+
+    // Which list is on screen. Gates the category tabs and their filter, and
+    // picks the sort defaults below — the tracker lists share this widget.
+    final trackerState = context.read<TrackerListCubit>().state;
+    final isMyList = trackerState.isMyList;
+
+    // The account's own list names first — a list created but not yet filled
+    // still deserves a tab. Anything an entry claims to be in is unioned on
+    // top, so a stale name-fetch can't hide a tab that clearly has titles.
+    final customLists = <String>[...trackerState.customListNames];
+    for (final e in modeEntries) {
+      for (final name in e.customLists) {
+        if (!customLists.contains(name)) customLists.add(name);
+      }
+    }
+    customLists.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+
+    // One entry per tab, in the order the row draws them. Each carries its own
+    // test rather than a shared filter field, so the pages can live side by
+    // side in a TabBarView and be swiped between.
+    final views = <LibraryTab>[
+      LibraryTab(
+        id: 'all',
+        label: context.l10n.all,
+        count: modeEntries.length,
+        test: (_) => true,
+      ),
+      for (final st in presentStatuses)
+        LibraryTab(
+          id: 'status:${st.name}',
+          label: shortLabelFor(
+            st,
+            reading: sl<ContentModeCubit>().state.isReading,
+          ),
+          count: modeEntries.where((e) => e.status == st).length,
+          test: (e) => e.status == st,
+        ),
+      // User-made categories come after the statuses, in their own order.
+      // Long-press one to rename, delete or reorder it.
+      //
+      // Only the ones that mean something for the kind on screen: a category
+      // is not tied to a kind, so one made under Streaming used to appear
+      // under Manga and Novel as an empty tab.
+      if (isMyList)
+        for (final c in (_cats?.all() ?? const <ListCategory>[]).where(
+          _categoryFitsKind(modeEntries),
+        ))
+          LibraryTab(
+            id: 'cat:${c.id}',
+            label: c.name,
+            count: _categoryCount(modeEntries, c),
+            test: (e) => _cats?.isIn(e.item, c.id) ?? false,
+            onLongPress: () => _manageCategory(context, c),
+          ),
+      // AniList's own custom lists. Only ever non-empty on that tab — MAL and
+      // Simkl have no such concept, and My List uses categories instead.
+      if (!isMyList)
+        for (final name in customLists)
+          LibraryTab(
+            id: 'list:$name',
+            label: name,
+            count: modeEntries
+                .where((e) => e.customLists.contains(name))
+                .length,
+            test: (e) => e.customLists.contains(name),
+          ),
+    ];
+
+    // The + creates a list on the AniList account; on My List it makes a local
+    // category. Same gesture, different home. Parked beside the row rather
+    // than inside it so it can't be swiped to.
+    final tracker = trackerState.tracker;
+    final onAdd = isMyList
+        ? (_cats != null ? () => _createCategory(context) : null)
+        : (tracker is AniListService
+              ? () => _createAniListList(context, tracker)
+              : null);
+
+    return LibraryTabs(
+      tabs: views,
+      selectedId: _selectedTabId,
+      onSelected: _selectTab,
+      onAdd: onAdd,
+      bodyFor: (view) {
+        final shown = sortLibrary(
+          modeEntries.where((e) => view.test(e) && _matchesQuery(e)).toList(),
+          _sortFor(isMyList: isMyList),
+          _sortDesc,
+        );
+        if (shown.isEmpty) {
+          return EmptyState(
+            icon: Icons.filter_list_off_rounded,
+            message: myListFilteredEmptyMessage(context.l10n, mode),
+          );
+        }
+        return GridView.builder(
+          key: ValueKey('${view.id}|${_sort?.name}|$_sortDesc'),
+          // Bottom: clear the floating dock, which overlays content
+          // (extendBody reserves it no space of its own).
+          padding: EdgeInsets.fromLTRB(
+            16,
+            4,
+            16,
+            MediaQuery.paddingOf(context).bottom,
+          ),
+          physics: const AlwaysScrollableScrollPhysics(),
+          cacheExtent: 800,
+          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: 3,
+            childAspectRatio: posterGridAspect(context),
+            crossAxisSpacing: 12,
+            mainAxisSpacing: 16,
+          ),
+          itemCount: shown.length,
+          itemBuilder: (context, i) {
+            final entry = shown[i];
+            return RevealItem(
+              index: i,
+              child: PosterCard(
+                title: entry.item.title,
+                imageUrl: entry.item.cover,
+                headers: entry.item.coverHeaders,
+                cellWidth: cellW,
+                onTap: () => onTap(entry.item),
+                // Long-press opens the per-card edit sheet (own list →
+                // status/remove; tracker → the tracker editor).
+                onLongPress: onMore == null ? null : () => onMore(entry),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  /// Search narrows every tab, not just the one on screen — the counts in the
+  /// row stay whole so you can still see where the rest of your list is.
+  bool _matchesQuery(MyListEntry e) {
+    if (_query.isEmpty) return true;
+    // English titles count too: plenty of entries are filed under a romaji
+    // name nobody would think to type.
+    final q = _query.toLowerCase();
+    return e.item.title.toLowerCase().contains(q) ||
+        (e.item.englishTitle?.toLowerCase() ?? '').contains(q);
+  }
+
+  /// The selection, in the same id space the tabs use.
+  String get _selectedTabId {
+    if (_categoryFilter != null) return 'cat:$_categoryFilter';
+    if (_customListFilter != null) return 'list:$_customListFilter';
+    if (_statusFilter != null) return 'status:${_statusFilter!.name}';
+    return 'all';
+  }
+
+  void _selectTab(String id) {
+    setState(() {
+      _statusFilter = null;
+      _categoryFilter = null;
+      _customListFilter = null;
+      if (id.startsWith('status:')) {
+        final name = id.substring(7);
+        _statusFilter = WatchStatus.values.firstWhere((s) => s.name == name);
+      } else if (id.startsWith('cat:')) {
+        _categoryFilter = id.substring(4);
+      } else if (id.startsWith('list:')) {
+        _customListFilter = id.substring(5);
+      }
+    });
+  }
+
+  /// Open a tracker entry.
+  ///
+  /// The stub carries no provider, but it does carry the id the metadata
+  /// catalogue is keyed by, which is the same identity a `zm://` title uses.
+  /// So the title opens directly instead of dumping you into a search for its
+  /// own name. Search stays the fallback for an entry with no id to go on.
+  ///
+  /// This goes through the shared [playableTrackerItem] on purpose. A local
+  /// copy of that logic used to live here and fell behind it: the copy knew
+  /// only MAL and TMDB ids, so every AniList manga without a MAL id — which is
+  /// a lot of them — took the search fallback despite having an `al:` id the
+  /// catalogue resolves perfectly well.
+  void _openTrackerItem(BuildContext context, MediaItem stub) {
+    final item = playableTrackerItem(
+      stub,
+      // Saved from here, it stays this tracker's title.
+      savedFrom: widget.pinnedTracker?.displayName,
+    );
+    if (item != null) {
+      _openItem(context, prefer: _providerOf(widget.pinnedTracker), item);
+      return;
+    }
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => SearchScreen(initialQuery: stub.title),
+      ),
+    );
+  }
+
+  /// How many of [entries] — already narrowed to the kind on screen — are in
+  /// [c].
+  int _categoryCount(List<MyListEntry> entries, ListCategory c) {
+    final cats = _cats;
+    if (cats == null) return 0;
+    return entries.where((e) => cats.isIn(e.item, c.id)).length;
+  }
+
+  /// Drop the selected category when it does not belong to [k].
+  ///
+  /// The mode row only ever changed the kind, and [_categoryFitsKind] keeps
+  /// the SELECTED category visible whatever the mode — so a category picked
+  /// under Streaming followed you into Manga as a selected, empty tab, and
+  /// defeated the mode a category is stamped with.
+  ///
+  /// Categories from before the stamp carry no mode and are genuinely shared,
+  /// so those keep their selection.
+  void _dropCategoryForeignTo(ContentMode k) {
+    final id = _categoryFilter;
+    if (id == null) return;
+    final made = _cats
+        ?.all()
+        .where((c) => c.id == id)
+        .map((c) => c.kind)
+        .firstOrNull;
+    if (made != null && made != k.name) _categoryFilter = null;
+  }
+
+  /// Whether [c] earns a tab for the kind currently on screen.
+  ///
+  /// A category made since categories started remembering belongs to the mode
+  /// it was made in, full stop — that is what stops a new Streaming list from
+  /// showing up as an empty tab under Manga and Novel.
+  ///
+  /// Older ones carry no mode and keep the rules they always had: kept if they
+  /// hold something of this kind, if you are looking at one right now, or if
+  /// they are empty everywhere. That last rule is why a new category used to
+  /// appear in all three modes, and it is left alone here so the categories
+  /// already on people's devices do not look deleted from two of them.
+  bool Function(ListCategory) _categoryFitsKind(List<MyListEntry> entries) {
+    final cats = _cats;
+    return (c) {
+      if (cats == null) return false;
+      if (_categoryFilter == c.id) return true;
+      final madeIn = c.kind;
+      if (madeIn != null) return madeIn == _kind.name;
+      if (_categoryCount(entries, c) > 0) return true;
+      return cats.countIn(c.id) == 0;
+    };
+  }
+
+  // ── Empty / sign-in ────────────────────────────────────────────────────────
+
+  Widget _empty(BuildContext context) {
+    final auth = context.watch<AuthCubit>().state;
+    if (!auth.isLoggedIn) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(
+                Icons.bookmark_outline,
+                size: 56,
+                color: AppColors.textTertiary,
+              ),
+              const SizedBox(height: 16),
+              Text(
+                context.l10n.signInToBuildYourList,
+                style: AppText.body,
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 20),
+              SizedBox(
+                width: 180,
+                child: PrimaryButton(
+                  label: context.l10n.signIn,
+                  onPressed: () => Navigator.of(context).push(
+                    MaterialPageRoute(builder: (_) => const LoginScreen()),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+    return EmptyState(
+      icon: Icons.bookmark_outline,
+      message: myListEmptyMessage(context.l10n, sl<ContentModeCubit>().state),
+    );
+  }
+}
+
+/// EmptyState message for My List's per-status/type filter turning up
+/// nothing (the mode filter itself is applied before this — see [_grid]).
+/// Anime mode's wording is unchanged; a reading mode names its own content
+/// type instead of the generic "Nothing".
+String myListFilteredEmptyMessage(AppLocalizations l10n, ContentMode mode) =>
+    switch (mode) {
+      ContentMode.anime => l10n.nothingHereInThisFilter,
+      ContentMode.manga => l10n.noMangaHereInThisFilter,
+      ContentMode.novel => l10n.noNovelsHereInThisFilter,
+    };
+
+/// EmptyState message for a genuinely empty My List (nothing saved yet, of
+/// ANY type). Anime mode's wording is unchanged.
+String myListEmptyMessage(AppLocalizations l10n, ContentMode mode) =>
+    switch (mode) {
+      ContentMode.anime => l10n.titlesYouAddAppearHere,
+      ContentMode.manga => l10n.mangaYouAddAppearHere,
+      ContentMode.novel => l10n.novelsYouAddAppearHere,
+    };
