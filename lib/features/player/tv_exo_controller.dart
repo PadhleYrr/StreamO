@@ -1,0 +1,180 @@
+import 'dart:async';
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+
+import '../../core/playback/tv_track_helpers.dart';
+
+/// Dart-side controller for the native ExoPlayer PlatformView (see
+/// ExoPlayerView.kt). Wraps the per-view method channel + event stream and
+/// exposes playback state as [ValueListenable]s. Engine-only — no source
+/// resolution / resume logic (that lives in TvExoPlayerScreen).
+class TvExoController {
+  TvExoController(int viewId)
+      : _method = MethodChannel('zangetsu/exoplayer_$viewId'),
+        _events = EventChannel('zangetsu/exoplayer_events_$viewId') {
+    _sub = _events.receiveBroadcastStream().listen((e) {
+      if (e is Map) applyEvent(Map<String, dynamic>.from(e));
+    });
+  }
+
+  final MethodChannel _method;
+  final EventChannel _events;
+  StreamSubscription<dynamic>? _sub;
+
+  final position = ValueNotifier<int>(0); // ms
+  final duration = ValueNotifier<int>(0); // ms
+  final playing = ValueNotifier<bool>(false);
+  final buffering = ValueNotifier<bool>(false);
+  final ended = ValueNotifier<bool>(false);
+  final audioTracks = ValueNotifier<List<TvTrack>>(const []);
+  final textTracks = ValueNotifier<List<TvTrack>>(const []);
+
+  /// Video renditions inside the open stream, tallest first. More than one means
+  /// there is a real quality choice; anything less and there is nothing to
+  /// switch, whatever other sources might offer.
+  final videoTracks = ValueNotifier<List<TvTrack>>(const []);
+
+  /// Height of the frame actually on screen, 0 until the first one decodes.
+  final videoHeight = ValueNotifier<int>(0);
+
+  /// Pure event→state mapping (unit-tested). Tolerates missing/garbage fields.
+  void applyEvent(Map<String, dynamic> e) {
+    final rawPosition = e['positionMs'];
+    final rawDuration = e['durationMs'];
+    position.value = rawPosition is num ? rawPosition.toInt() : 0;
+    // HLS/DASH often emit 0 until the window is known. Don't clobber a real
+    // duration — that would drop Discord's progress bar and resume seeks.
+    final nextDur = rawDuration is num ? rawDuration.toInt() : 0;
+    if (nextDur > 0) duration.value = nextDur;
+    playing.value = e['playing'] == true;
+    buffering.value = e['buffering'] == true;
+    ended.value = e['ended'] == true;
+    if (e.containsKey('audioTracks')) {
+      final a = _parseTracks(e['audioTracks']);
+      if (!_tracksEqual(audioTracks.value, a)) audioTracks.value = a;
+    }
+    if (e.containsKey('textTracks')) {
+      final t = _parseTracks(e['textTracks']);
+      if (!_tracksEqual(textTracks.value, t)) textTracks.value = t;
+    }
+    if (e.containsKey('videoTracks')) {
+      // Copy before sorting: _parseTracks hands back a const [] for a
+      // malformed payload, and sorting that throws.
+      final v = [..._parseTracks(e['videoTracks'])]
+        ..sort((a, b) => (b.height ?? 0).compareTo(a.height ?? 0));
+      if (!_tracksEqual(videoTracks.value, v)) videoTracks.value = v;
+    }
+    final rawHeight = e['videoHeight'];
+    if (rawHeight is num && rawHeight.toInt() != videoHeight.value) {
+      videoHeight.value = rawHeight.toInt();
+    }
+  }
+
+  static List<TvTrack> _parseTracks(dynamic raw) {
+    if (raw is! List) return const [];
+    final out = <TvTrack>[];
+    for (final item in raw) {
+      if (item is Map) {
+        final label = '${item['label'] ?? ''}';
+        final h = item['height'];
+        out.add(TvTrack(
+          id: '${item['id'] ?? ''}',
+          language: '${item['language'] ?? ''}',
+          label: label.isEmpty ? null : label,
+          selected: item['selected'] == true,
+          height: h is num && h > 0 ? h.toInt() : null,
+        ));
+      }
+    }
+    return out;
+  }
+
+  static bool _tracksEqual(List<TvTrack> a, List<TvTrack> b) {
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i].id != b[i].id || a[i].selected != b[i].selected) return false;
+    }
+    return true;
+  }
+
+  /// Whether to fire the one-time resume seek: a real resume point, a known
+  /// duration, before the end, and not already done.
+  static bool shouldResumeSeek({
+    required int resumeMs,
+    required int durationMs,
+    required bool alreadySeeked,
+  }) =>
+      !alreadySeeked &&
+      resumeMs > 0 &&
+      durationMs > 0 &&
+      resumeMs < durationMs;
+
+  Future<void> setSource(
+    String url,
+    Map<String, String> headers, {
+    List<TvSubtitleConfig> subtitles = const [],
+    String? mimeType,
+    String? drmKid,
+    String? drmKey,
+  }) =>
+      _method.invokeMethod('setSource', {
+        'url': url,
+        'headers': headers,
+        'subtitles': subtitles.map((s) => s.toMap()).toList(),
+        'mimeType': mimeType, // null → native infers the container from the URL
+        // ClearKey DRM (base64url kid/key) for encrypted CENC/DASH channels.
+        'drmKid': drmKid,
+        'drmKey': drmKey,
+      });
+  Future<void> play() => _method.invokeMethod('play');
+  Future<void> pause() => _method.invokeMethod('pause');
+  Future<void> seek(int ms) => _method.invokeMethod('seekTo', {'positionMs': ms});
+
+  Future<void> selectAudioTrack(String id) =>
+      _method.invokeMethod('selectAudioTrack', {'id': id});
+  Future<void> selectTextTrack(String? id) =>
+      _method.invokeMethod('selectTextTrack', {'id': id});
+  Future<void> setMaxVideoBitrate(int bandwidth) =>
+      _method.invokeMethod('setMaxVideoBitrate', {'bandwidth': bandwidth});
+
+  /// Pick a rendition inside the current stream; null hands the ladder back to
+  /// ExoPlayer. Never reopens anything, so position and server are untouched.
+  Future<void> selectVideoTrack(String? id) =>
+      _method.invokeMethod('selectVideoTrack', {'id': id});
+  Future<void> applyCaptionStyle(
+    TvCaptionStyle s, {
+    String? fontPath,
+    required int positionPref,
+  }) =>
+      _method.invokeMethod('setCaptionStyle', {
+        'scale': s.scale,
+        'fontPath': fontPath,
+        'fgColor': s.fgColor,
+        'bgColor': s.bgColor,
+        'edge': s.edge,
+        'edgeType': s.edgeType,
+        'positionPref': positionPref,
+      });
+  Future<void> setPlaybackSpeed(double speed) =>
+      _method.invokeMethod('setPlaybackSpeed', {'speed': speed});
+  Future<void> setVolumeBoost(int percent) =>
+      _method.invokeMethod('setVolumeBoost', {'percent': percent});
+
+  void dispose() {
+    _sub?.cancel();
+    position.dispose();
+    duration.dispose();
+    playing.dispose();
+    buffering.dispose();
+    ended.dispose();
+    audioTracks.dispose();
+    textTracks.dispose();
+  }
+
+  /// New source / episode — duration is unknown until the next ready event.
+  void resetTimeline() {
+    position.value = 0;
+    duration.value = 0;
+  }
+}
