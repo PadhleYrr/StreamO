@@ -1,0 +1,4 @@
+{
+  "_comment": "Developer announcements shown in the app. Add an object to the list to broadcast a message. Rules: give every entry a NEW unique id (reusing an id won't re-show); title is required; body/action/date optional; use \\n for line breaks in body; action.url must be http/https; type is info | warning | update; minVersion/maxVersion (optional) target app versions, e.g. \"maxVersion\":\"1.5.9\" to nudge only older builds to update. The app only READS this file.",
+  "announcements": []
+}
