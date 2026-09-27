@@ -145,13 +145,22 @@ jobs:
             echo "  $f  [$(du -sh "$f" | cut -f1)]"
           done
 
-      # ── 11. Upload artifact ──────────────────────────────────────────────────
-      - name: Upload debug APKs
+      # ── 11. Upload artifacts (one per ABI so you can download only what you need) ──
+      - name: Upload arm64-v8a APK
         if: ${{ github.event_name != 'pull_request' || inputs.upload_artifact == 'true' }}
         uses: actions/upload-artifact@v4
         with:
-          name: zangetsu-debug-${{ github.sha }}
-          path: ${{ env.PROJECT_DIR }}/build/app/outputs/apk/debug/*.apk
+          name: zangetsu-debug-arm64-${{ github.sha }}
+          path: ${{ env.PROJECT_DIR }}/build/app/outputs/apk/debug/*arm64-v8a*.apk
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Upload armeabi-v7a APK
+        if: ${{ github.event_name != 'pull_request' || inputs.upload_artifact == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: zangetsu-debug-arm32-${{ github.sha }}
+          path: ${{ env.PROJECT_DIR }}/build/app/outputs/apk/debug/*armeabi-v7a*.apk
           retention-days: 14
           if-no-files-found: error
 
