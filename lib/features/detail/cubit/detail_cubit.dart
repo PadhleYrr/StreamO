@@ -1,0 +1,800 @@
+import 'dart:async';
+import 'package:equatable/equatable.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
+
+import '../../../core/di/injector.dart';
+import '../../../core/provider/provider_manager.dart';
+import '../../../core/error/exceptions.dart';
+import '../../../core/anilist/anilist_network_policy.dart';
+import '../../../core/error/network_failure.dart';
+import '../../../core/logging/app_logger.dart';
+import '../../../core/lnreader/novel_cloudflare.dart';
+import '../../../core/metadata/episode_metadata_service.dart';
+import '../../../core/metadata/metadata_enrichment.dart';
+import '../../../core/models/episode.dart';
+import '../../../core/models/episode_title.dart';
+import '../../../core/models/media_detail.dart';
+import '../../../core/models/media_extras.dart';
+import '../../../core/models/provider_info.dart';
+import '../../../core/playback/playback_prefs.dart';
+import '../../../core/playback/title_prefs.dart';
+import '../../../core/repository/catalogue_repository.dart';
+import '../../../core/zmode/metadata_repository.dart';
+import '../../../core/zmode/season_chain.dart';
+import '../../../core/zmode/zmode_ids.dart';
+import '../../../core/zmode/metadata_provider_prefs.dart';
+
+export '../../../core/models/episode_title.dart'
+    show cleanTitle, carryEpisodeDisplayMeta;
+
+/// Lifecycle of the detail load. Mirrors Sozo Read's `DetailStatus`
+/// (we drop `initial` — the cubit starts in `loading` since `load()`
+/// fires immediately on construction).
+enum DetailStatus { loading, success, error }
+
+/// Immutable view-state for the Detail screen. Owns everything that used
+/// to live in `_DetailScreenState`'s setState fields: the fetched
+/// [MediaDetail], the sub/dub [category], the selected season, and the
+/// description-expanded flag. The scroll-driven app-bar title fade is
+/// pure UI state and intentionally stays widget-level.
+class DetailState extends Equatable {
+  const DetailState({
+    this.status = DetailStatus.loading,
+    this.detail,
+    this.category = 'sub',
+    this.selectedSeason = 1,
+    this.descExpanded = false,
+    this.error,
+    this.cast = const [],
+    this.relations = const [],
+    this.seasons = const [],
+    this.cloudflareUrl,
+    this.episodesLoading = false,
+    this.extrasLoading = false,
+  });
+
+  final DetailStatus status;
+  final MediaDetail? detail;
+
+  /// Cast + related titles, fetched async from a metadata API after the detail
+  /// loads (AniList for anime, TMDB for movie/TV). Empty until resolved.
+  final List<CastMember> cast;
+  final List<MediaRelation> relations;
+
+  /// The franchise's seasons in order, when it has more than one. Empty for
+  /// the great majority of titles, which is what tells the Relations tab to
+  /// draw no Seasons section at all. See [SeasonChain].
+  final List<SeasonEntry> seasons;
+  final bool extrasLoading;
+
+  /// 'sub' | 'dub'. Drives the Sub/Dub toggle and the player `category`.
+  final String category;
+  final int selectedSeason;
+  final bool descExpanded;
+  final String? error;
+
+  /// Set when the source (Mihon/Aniyomi) throws [CloudflareRequiredException],
+  /// or a novel plugin's swallowed fetch failure is picked up from
+  /// [NovelCloudflare]'s latch — the URL to open in the visible WebView
+  /// solve. Null in every other state. Mirrors `HomeState.cloudflareUrl`.
+  final String? cloudflareUrl;
+
+  /// True between the metadata landing and the episode list arriving. The
+  /// screen is fully usable in that window — only the episode list is still
+  /// coming — so Play/Download keep their normal look and the Episodes tab
+  /// shows a skeleton instead of "no episodes".
+  final bool episodesLoading;
+
+  DetailState copyWith({
+    DetailStatus? status,
+    MediaDetail? detail,
+    String? category,
+    int? selectedSeason,
+    bool? descExpanded,
+    String? error,
+    List<CastMember>? cast,
+    List<MediaRelation>? relations,
+    List<SeasonEntry>? seasons,
+    String? cloudflareUrl,
+    bool clearCloudflareUrl = false,
+    bool? episodesLoading,
+    bool? extrasLoading,
+  }) => DetailState(
+    status: status ?? this.status,
+    detail: detail ?? this.detail,
+    category: category ?? this.category,
+    selectedSeason: selectedSeason ?? this.selectedSeason,
+    descExpanded: descExpanded ?? this.descExpanded,
+    error: error ?? this.error,
+    cast: cast ?? this.cast,
+    relations: relations ?? this.relations,
+    seasons: seasons ?? this.seasons,
+    cloudflareUrl: clearCloudflareUrl
+        ? null
+        : (cloudflareUrl ?? this.cloudflareUrl),
+    episodesLoading: episodesLoading ?? this.episodesLoading,
+    extrasLoading: extrasLoading ?? this.extrasLoading,
+  );
+
+  @override
+  List<Object?> get props => [
+    status,
+    detail,
+    episodesLoading,
+    category,
+    selectedSeason,
+    descExpanded,
+    error,
+    cast,
+    relations,
+    seasons,
+    cloudflareUrl,
+  ];
+}
+
+class DetailCubit extends Cubit<DetailState> {
+  DetailCubit({
+    required CatalogueRepository repo,
+    required String url,
+    String? sourceId,
+    TitlePrefsStore? prefs,
+    int? seedMalId,
+    ProviderType? seedType,
+    this.prefer,
+  }) : _repo = repo,
+       _url = url,
+       _sourceId = sourceId,
+       _prefs = prefs ?? sl<TitlePrefsStore>(),
+       // Seed the INITIAL category from the per-title remembered choice so the
+       // Sub/Dub toggle reflects the saved value on the very first render (no
+       // flash from 'sub' → remembered). Else Settings › Default audio, else
+       // 'sub'. Must match openPlayer's launchCategory so Z Mode's remembered
+       // cut (set on detail fetch) agrees with the player category — otherwise
+       // Default audio = Dub still resolved the sub list.
+       super(
+         DetailState(
+           category:
+               (prefs ?? sl<TitlePrefsStore>()).category(sourceId ?? '', url) ??
+               (sl.isRegistered<PlaybackPrefs>()
+                   ? sl<PlaybackPrefs>().defaultCategory
+                   : 'sub'),
+         ),
+       ) {
+    // Prefetch episode metadata using the MAL id we already know from the
+    // tapped item, so the AniZip call overlaps the detail fetch and episodes
+    // render already-enriched instead of popping in ~0.3s later. Fire-and-
+    // forget; the service dedupes this against the enrichment call and never
+    // throws. Id-less titles (no seed id) just enrich after load, as before.
+    if (seedType == ProviderType.anime && seedMalId != null) {
+      sl<EpisodeMetadataService>().animeEpisodeMeta(seedMalId);
+    }
+  }
+
+  final CatalogueRepository _repo;
+
+  /// Read this title from a specific metadata catalogue — set when it was
+  /// opened from a tracker that has one, so an AniList library entry opens
+  /// AniList's page even if MyAnimeList is the app-wide pick.
+  final PreferredProvider? prefer;
+
+  /// The metadata fetch, honouring [prefer] when there is one. The router has
+  /// no opinion about providers, so a preference goes straight to the
+  /// repository that does.
+  Future<MediaDetail> _fetchDetail({
+    required String category,
+    void Function(MediaDetail partial)? onPartial,
+  }) {
+    // Backing out before this lands means the answer is no longer wanted.
+    // Provider calls run one at a time, so a fetch left running holds up the
+    // NEXT title you open — which is how three titles opened five seconds
+    // apart took 12s, 24s and 27s in a shared report. Closed is the whole
+    // test: this cubit is created per detail screen and closed with it.
+    bool gone() => isClosed;
+    final p = prefer;
+    if (p != null && sl.isRegistered<MetadataRepository>()) {
+      return sl<MetadataRepository>().detail(
+        _url,
+        category: category,
+        sourceId: _sourceId,
+        onPartial: onPartial,
+        prefer: p,
+        abandoned: gone,
+      );
+    }
+    return _repo.detail(
+      _url,
+      category: category,
+      sourceId: _sourceId,
+      onPartial: onPartial,
+      abandoned: gone,
+    );
+  }
+  final String _url;
+  final TitlePrefsStore _prefs;
+
+  /// The in-flight (or completed) movie→anime MAL-id resolution for this title,
+  /// if it's a movie-typed candidate. The player launch awaits this so a fast
+  /// Play still scrobbles to AniList/MAL instead of losing the race. Null when
+  /// the title isn't a movie-typed promotion candidate.
+  Future<int?>? _animePromotion;
+  Future<int?>? get animePromotion => _animePromotion;
+
+  /// The owning item's source. When null, repo calls fall back to the
+  /// active source. Set from `DetailScreen(item:).sourceId` so a title
+  /// opened from My List / cross-source rows queries its OWN provider.
+  final String? _sourceId;
+
+  /// Stable key component for per-title prefs. Falls back to '' when the
+  /// owning source is unknown (active-source title) — robust, never throws.
+  String get _prefsSourceId => _sourceId ?? '';
+
+  /// True for zm:// anime/movie/tv — catalogue episodes land in one shot.
+  bool get _zmVideoDetail {
+    final c = ZmodeIds.parseShow(_url);
+    if (c == null) return false;
+    return c.kind != ZKind.manga && c.kind != ZKind.novel;
+  }
+
+  void _log(String msg, {String level = 'I'}) =>
+      AppLogger.instance.log('[detail] $msg', level: level);
+
+  /// Initial fetch. Emits loading then success/error for the current
+  /// [DetailState.category] (the per-title remembered choice, else 'sub').
+  Future<void> load() async {
+    final sw = Stopwatch()..start();
+    _log(
+      'load start url=$_url sourceId=${_sourceId ?? "active"} '
+      'cat=${state.category} zmVideo=$_zmVideoDetail',
+    );
+    emit(
+      state.copyWith(status: DetailStatus.loading, clearCloudflareUrl: true),
+    );
+    try {
+      final detail = await _fetchDetail(
+        category: state.category,
+        // Metadata titles paint catalogue episodes immediately; source matching
+        // is deferred to Play / download / the source row on the Detail screen.
+        onPartial: (partial) {
+          if (isClosed || state.status != DetailStatus.loading) return;
+          _log(
+            'load partial title="${partial.title}" eps=${partial.episodes.length} '
+            '${sw.elapsedMilliseconds}ms',
+          );
+          emit(state.copyWith(
+            status: DetailStatus.success,
+            detail: partial,
+            episodesLoading: !_zmVideoDetail,
+          ));
+          // Cast and Relations run off malId/tmdbId/title, all of which are
+          // here already — they were waiting on the source match and episode
+          // fetch below, which they never use, so they landed a beat after the
+          // episodes. Started here they resolve alongside it instead.
+          //
+          // The call after the await stays: it joins this one when it is still
+          // running, and covers the paths that never emit a partial at all.
+          _enrich(partial);
+        },
+      );
+      // Backing out while this was in flight closes the cubit, and every emit
+      // below then throws "Cannot emit new states after calling close" — 41 of
+      // them across the shared reports. The work is finished either way; there
+      // is just no longer a screen to tell.
+      if (isClosed) return;
+      // A novel (LNReader) plugin swallows its own fetch failure and returns
+      // an empty detail rather than throwing (LnReaderProvider.getDetail's
+      // fallback), so a Cloudflare challenge never reaches the catch below.
+      // Pick the URL up from the same latch Home reads — only when nothing
+      // useful actually came back, so a genuinely empty (if odd) title never
+      // gets mistaken for a block.
+      final latched = detail.title.isEmpty ? NovelCloudflare.pendingUrl : null;
+      if (latched != null) {
+        _log('load cloudflare latched ${sw.elapsedMilliseconds}ms', level: 'W');
+        emit(state.copyWith(
+          status: DetailStatus.error,
+          cloudflareUrl: latched,
+          episodesLoading: false,
+        ));
+        return;
+      }
+      NovelCloudflare.clear();
+      _log(
+        'load success title="${detail.title}" eps=${detail.episodes.length} '
+        '${sw.elapsedMilliseconds}ms',
+      );
+      // Keep AniZip/TMDB episode names that already painted on the catalogue
+      // partial — the matched source's "Episode N" list must not wipe them.
+      final carried = detail.copyWith(
+        episodes: carryEpisodeDisplayMeta(
+          state.detail?.episodes,
+          detail.episodes,
+        ),
+      );
+      emit(state.copyWith(
+        status: DetailStatus.success,
+        detail: carried,
+        episodesLoading: false,
+      ));
+      _enrich(carried);
+    } on CloudflareRequiredException catch (e) {
+      // The last emit in here without one: a catch is not covered by the
+      // isClosed check in the try body, and the fetch that threw is exactly
+      // the slow kind somebody backs out of.
+      if (isClosed) return;
+      _log('load cloudflare required ${e.url} ${sw.elapsedMilliseconds}ms', level: 'W');
+      emit(state.copyWith(
+        status: DetailStatus.error,
+        cloudflareUrl: e.url,
+        episodesLoading: false,
+      ));
+    } on ProviderCallAbandoned {
+      // We asked for this: the screen closed while the call sat in the queue.
+      // Returning here keeps it out of the log and skips the offline probe
+      // below, which would be a network round trip for an answer nobody wants.
+      return;
+    } catch (e, st) {
+      // Same distinction Home makes: a request that never left the device is
+      // not the title failing to load. A rate limit is a third thing again —
+      // it passes on its own, and saying how long is the whole difference
+      // between waiting and hunting a fault.
+      final limited = aniListRateLimitOf(e);
+      final offline = limited == null && await isOfflineErrorConfirmed(e);
+      if (isClosed) return; // that await can outlive the screen too
+      _log(
+        'load failed offline=$offline limited=${limited?.seconds} '
+        '${sw.elapsedMilliseconds}ms: $e',
+        level: 'E',
+      );
+      AppLogger.instance.logError(e, st);
+      emit(state.copyWith(
+        status: DetailStatus.error,
+        error: limited != null
+            ? 'rate_limited:${limited.seconds}'
+            : (offline ? 'offline' : 'load_failed'),
+        episodesLoading: false,
+      ));
+    }
+  }
+
+  /// Re-fetch. Drops the source's HTTP cache first so the re-fetch is genuinely
+  /// fresh (new chapters show now instead of after the 10-min cache expires),
+  /// then reloads detail+chapters for the current category. Keeps the current
+  /// content on screen while refreshing — no skeleton flash — and a failed
+  /// refresh leaves the page as-is rather than wiping it.
+  ///
+  /// Everything [_enrich] produced lives only on the in-memory detail, so a
+  /// bare re-emit throws it away: the ids it resolved and the per-episode
+  /// metadata. Ids are carried across; enrichment is re-run with `force`
+  /// because its usual guard (Cast/Relations already present) would otherwise
+  /// skip it. A match change makes that mandatory — the episode list is new,
+  /// so its per-episode metadata has to be fetched again.
+  Future<void> refresh({bool dropCache = true}) async {
+    final sw = Stopwatch()..start();
+    _log('refresh start dropCache=$dropCache url=$_url');
+    // Pull-to-refresh wants genuinely fresh data, so it drops the cache. A
+    // SOURCE CHANGE does not: the source being switched to was never in that
+    // cache, and clearing it throws away every other source's responses too,
+    // making the switch (and everything after it) slower for no gain.
+    if (dropCache) await _repo.clearHttpCache();
+    final previous = state.detail;
+    try {
+      final fresh = await _fetchDetail(
+        category: state.category,
+        // Same early paint load() gets. It matters more here: without it the
+        // PREVIOUS source's episodes sit on screen, looking like this
+        // source's, until the new list lands.
+        onPartial: (partial) {
+          if (isClosed || state.status != DetailStatus.success) return;
+          _log(
+            'refresh partial title="${partial.title}" eps=${partial.episodes.length} '
+            '${sw.elapsedMilliseconds}ms',
+          );
+          emit(state.copyWith(
+            detail: partial.copyWith(
+              malId: partial.malId ?? previous?.malId,
+              tmdbId: partial.tmdbId ?? previous?.tmdbId,
+            ),
+            episodesLoading: !_zmVideoDetail,
+          ));
+        },
+      );
+      if (isClosed) return;
+      // Same novel-latch fallback as load() — a swallowed fetch failure
+      // surfaces as an empty detail, not an exception.
+      final latched = fresh.title.isEmpty ? NovelCloudflare.pendingUrl : null;
+      if (latched != null) {
+        _log('refresh cloudflare latched ${sw.elapsedMilliseconds}ms', level: 'W');
+        emit(state.copyWith(cloudflareUrl: latched, episodesLoading: false));
+        return;
+      }
+      NovelCloudflare.clear();
+      final merged = fresh.copyWith(
+        malId: fresh.malId ?? previous?.malId,
+        tmdbId: fresh.tmdbId ?? previous?.tmdbId,
+        episodes: carryEpisodeDisplayMeta(
+          previous?.episodes,
+          fresh.episodes,
+        ),
+      );
+      _log(
+        'refresh success title="${merged.title}" eps=${merged.episodes.length} '
+        '${sw.elapsedMilliseconds}ms',
+      );
+      emit(
+        state.copyWith(
+          status: DetailStatus.success,
+          detail: merged,
+          clearCloudflareUrl: true,
+          episodesLoading: false,
+        ),
+      );
+      _enrich(merged, force: true);
+    } on CloudflareRequiredException catch (e) {
+      if (isClosed) return;
+      _log('refresh cloudflare required ${e.url} ${sw.elapsedMilliseconds}ms', level: 'W');
+      emit(state.copyWith(cloudflareUrl: e.url, episodesLoading: false));
+    } catch (e, st) {
+      _log('refresh failed ${sw.elapsedMilliseconds}ms: $e', level: 'E');
+      AppLogger.instance.logError(e, st);
+      // Keep what's on screen — a failed pull shouldn't blank the page. The
+      // skeleton must still come down though: onPartial may have armed it,
+      // and nothing else would ever turn it off.
+      if (isClosed) return;
+      if (state.status != DetailStatus.error) {
+        emit(state.copyWith(episodesLoading: false));
+        return;
+      }
+      // Retrying from the failure banner: re-derive why it failed, or the
+      // banner keeps a countdown that expired minutes ago and a reason that
+      // may no longer be the reason.
+      final limited = aniListRateLimitOf(e);
+      final offline = limited == null && await isOfflineErrorConfirmed(e);
+      if (isClosed) return;
+      emit(state.copyWith(
+        error: limited != null
+            ? 'rate_limited:${limited.seconds}'
+            : (offline ? 'offline' : 'load_failed'),
+        episodesLoading: false,
+      ));
+    }
+  }
+
+  /// Fetch Cast + Relations in the background (AniList for anime, TMDB for
+  /// movie/TV) and merge into state. Best-effort — failures leave the tabs in
+  /// their empty state. Runs once per title; Sub/Dub switches keep the result.
+  /// [force] re-runs enrichment for a detail that has already been enriched
+  /// once. Only [refresh] sets it, after a match change swaps the episode list
+  /// out from under the metadata fetched for the previous one.
+  /// In flight, so the post-fetch call joins the early one instead of starting
+  /// a second. Without it both would run: the guard below only sees a FINISHED
+  /// enrichment, and the early one is usually still going when the source
+  /// match lands.
+  Future<void>? _enriching;
+
+  /// Episode list identity the in-flight [_enriching] started against. When
+  /// the source list replaces the catalogue partial under that run, joining
+  /// alone would drop AniZip titles (apply checks list identity). After the
+  /// join we re-enrich whatever is on screen if it is a different list.
+  List<Episode>? _enrichingForEpisodes;
+
+  Future<void> _enrich(MediaDetail detail, {bool force = false}) async {
+    if (!force && (state.cast.isNotEmpty || state.relations.isNotEmpty)) {
+      await _enrichEpisodesOnly(detail);
+      return;
+    }
+    if (!force && _enriching != null) {
+      await _enriching;
+      final current = state.detail;
+      if (current != null &&
+          !identical(current.episodes, _enrichingForEpisodes)) {
+        await _enrichEpisodesOnly(current);
+      }
+      return;
+    }
+    _enrichingForEpisodes = detail.episodes;
+    final run = _enrichOnce(detail, force: force);
+    _enriching = run;
+    try {
+      await run;
+    } finally {
+      if (identical(_enriching, run)) _enriching = null;
+    }
+  }
+
+  /// AniZip / TMDB season names for the episode list currently on screen.
+  Future<void> _enrichEpisodesOnly(MediaDetail detail) async {
+    if (detail.episodes.isEmpty) return;
+    try {
+      final enriched = await sl<EpisodeMetadataService>().enrich(
+        episodes: detail.episodes,
+        type: detail.type,
+        malId: detail.malId,
+        tmdbId: detail.tmdbId,
+        tmdbIsTv: detail.tmdbIsTv,
+      );
+      if (isClosed) return;
+      final onScreen = state.detail?.episodes;
+      if (!identical(enriched, detail.episodes) &&
+          onScreen != null &&
+          identical(onScreen, detail.episodes)) {
+        _patchDetail((cur) => cur.copyWith(episodes: enriched));
+      }
+    } catch (_) {/* keep episodes as-is */}
+  }
+
+  Future<void> _enrichOnce(MediaDetail detail, {required bool force}) async {
+    emit(state.copyWith(extrasLoading: true));
+    try {
+      await _enrichInner(detail, force: force);
+    } finally {
+      if (!isClosed) emit(state.copyWith(extrasLoading: false));
+    }
+  }
+
+  /// Applies one enrichment result to whatever detail is on screen RIGHT NOW.
+  ///
+  /// Enrichment holds its own copy of the detail it started from, and that
+  /// copy goes stale: it runs alongside the source match, which replaces the
+  /// catalogue's episode list with the source's. Emitting the captured copy
+  /// would put the catalogue's episodes back — the list would fill in and then
+  /// visibly revert. So each result is applied to `state.detail` instead.
+  void _patchDetail(MediaDetail Function(MediaDetail) apply) {
+    final current = state.detail;
+    if (current == null) return;
+    emit(state.copyWith(detail: apply(current)));
+  }
+
+  Future<void> _enrichInner(MediaDetail detail, {bool force = false}) async {
+    final sw = Stopwatch()..start();
+    _log(
+      'enrich start title="${detail.title}" type=${detail.type} '
+      'malId=${detail.malId} tmdbId=${detail.tmdbId} eps=${detail.episodes.length}',
+    );
+    var d = detail;
+
+    // TMDB fallback: an id-less movie/series (e.g. some CloudStream sources)
+    // can't track on Simkl and can't be id-enriched. Resolve a TMDB id from
+    // title (+ year) so it gains BOTH — then re-emit the detail so the player
+    // scrobbles by the resolved id.
+    //
+    // Gated to `== movie` explicitly, NOT `!= anime` — this is a TMDB (video
+    // metadata) lookup, and `!= anime` silently let manga/novel through once
+    // Task 1 added those to ProviderType. Manga often shares its anime
+    // adaptation's title, so that resolved a real TMDB id and displayed the
+    // ANIME's Cast/Relations on the manga's own detail page.
+    if (d.malId == null &&
+        d.tmdbId == null &&
+        (d.imdbId == null || d.imdbId!.isEmpty) &&
+        d.type == ProviderType.movie) {
+      try {
+        final id = await sl<MetadataEnrichment>().resolveTmdbId(
+          d.title,
+          d.year,
+          d.tmdbIsTv,
+        );
+        if (isClosed) return;
+        if (id != null) {
+          d = d.copyWith(tmdbId: id);
+          _patchDetail((cur) => cur.copyWith(tmdbId: id));
+        }
+      } catch (_) {/* keep going with what we have */}
+    }
+
+    // Id-less anime (Aniyomi, most CloudStream): resolve the MAL id from title
+    // via AniList and store it, so the player, scrobbler AND the filler-episode
+    // lookup all key off a real id instead of nothing.
+    if (d.malId == null && d.type == ProviderType.anime) {
+      try {
+        final resolved = await sl<MetadataEnrichment>().resolveMalId(d);
+        if (isClosed) return;
+        if (resolved != null) {
+          d = d.copyWith(malId: resolved);
+          _patchDetail((cur) => cur.copyWith(malId: resolved));
+        }
+      } catch (_) {/* keep going without it */}
+    }
+
+    // A movie-typed title from an anime-capable (mixed) source might actually be
+    // anime the plugin tagged as TvSeries/Movie. Promote it — and route it to
+    // the anime trackers — ONLY on a strict AniList match (exact title + year).
+    // Gated to anime-capable sources so real movie catalogs never hit AniList.
+    if (d.malId == null && d.type == ProviderType.movie) {
+      final promotion = sl<MetadataEnrichment>().promoteMovieToAnimeMalId(d);
+      _animePromotion = promotion; // Play awaits this same future
+      try {
+        final mal = await promotion;
+        if (isClosed) return;
+        if (mal != null) {
+          d = d.copyWith(malId: mal, type: ProviderType.anime);
+          _patchDetail(
+            (cur) => cur.copyWith(malId: mal, type: ProviderType.anime),
+          );
+        }
+      } catch (_) {/* stays a movie */}
+    }
+
+    // Fill in per-episode descriptions (AniZip for anime, TMDB season for a
+    // movie-source TV series). Best-effort — a miss leaves the row on its date.
+    if (d.episodes.isNotEmpty) {
+      try {
+        final enriched = await sl<EpisodeMetadataService>().enrich(
+          episodes: d.episodes,
+          type: d.type,
+          malId: d.malId,
+          tmdbId: d.tmdbId,
+          tmdbIsTv: d.tmdbIsTv,
+        );
+        if (isClosed) return;
+        // Episode descriptions are the one result tied to a SPECIFIC list.
+        // If the source has since replaced it, these belong to the old one —
+        // drop them rather than reinstating the list they came from.
+        final onScreen = state.detail?.episodes;
+        if (!identical(enriched, d.episodes) &&
+            onScreen != null &&
+            identical(onScreen, d.episodes)) {
+          d = d.copyWith(episodes: enriched);
+          _patchDetail((cur) => cur.copyWith(episodes: enriched));
+        }
+      } catch (_) {/* keep episodes as-is */}
+    }
+
+    // Prefer id-based enrichment (AniList/TMDB) — it's richer: actor photos,
+    // more entries, properly-linked relations. Id-less anime (Aniyomi, most
+    // CloudStream) also go through fetch(), which resolves extras by title.
+    // Manga/novel join the id-less title-search path. They resolve no id at
+    // all above (the TMDB step is movie-only, the MAL step anime-only), so
+    // without them named here the gate was false three ways and Cast/Relations
+    // never loaded for a reading title.
+    if (d.malId != null ||
+        d.tmdbId != null ||
+        d.type == ProviderType.anime ||
+        d.type == ProviderType.manga ||
+        d.type == ProviderType.novel) {
+      try {
+        final extras = await sl<MetadataEnrichment>().fetch(d);
+        if (isClosed) return;
+        if (extras.cast.isNotEmpty || extras.relations.isNotEmpty) {
+          emit(state.copyWith(cast: extras.cast, relations: extras.relations));
+          // After the tab has something to show, not before: the walk costs a
+          // request per hop and nobody is waiting on it.
+          unawaited(_loadSeasons(d));
+          return;
+        }
+      } catch (_) {/* fall through to source-supplied extras */}
+    }
+    // Fall back to Cast/Relations the source supplied directly (e.g.
+    // CloudStream's actors/recommendations) — so the tabs fill even without ids.
+    if (isClosed) return;
+    if (detail.castMembers.isNotEmpty || detail.relations.isNotEmpty) {
+      emit(
+        state.copyWith(cast: detail.castMembers, relations: detail.relations),
+      );
+    }
+    _log('enrich done ${sw.elapsedMilliseconds}ms');
+  }
+
+  /// Walks the franchise so the Relations tab can show its seasons in order.
+  ///
+  /// Deliberately after Cast/Relations have already painted: each hop is a
+  /// request, and nothing on screen is waiting for the answer. A miss is an
+  /// empty list, which simply means no Seasons section.
+  Future<void> _loadSeasons(MediaDetail d) async {
+    try {
+      final seasons = await sl<MetadataEnrichment>().seasons(d);
+      if (isClosed || seasons.isEmpty) return;
+      // The detail may have moved on while the walk was in flight.
+      if (state.detail?.url != d.url) return;
+      emit(state.copyWith(seasons: seasons));
+    } catch (e) {
+      _log('seasons failed: $e', level: 'W');
+    }
+  }
+
+  /// Sub/Dub re-fetch. No-op when the category is unchanged. Otherwise
+  /// flips to loading for the new category and re-fetches, resetting the
+  /// selected season to 1 (the new audio track may have a different set
+  /// of seasons). Matches the original `onAudioChanged` behavior.
+  Future<void> setCategory(String cat) async {
+    if (cat == state.category) return;
+    emit(state.copyWith(category: cat, status: DetailStatus.loading));
+    try {
+      final detail = await _fetchDetail(category: cat);
+      emit(
+        state.copyWith(
+          status: DetailStatus.success,
+          detail: detail,
+          selectedSeason: 1,
+        ),
+      );
+      // Netflix-style: remember THIS title's Sub/Dub choice so reopening it
+      // restores the last-picked category. Only after a successful switch.
+      await _prefs.setCategory(_prefsSourceId, _url, cat);
+    } catch (e) {
+      final offline = await isOfflineErrorConfirmed(e);
+      emit(state.copyWith(
+        status: DetailStatus.error,
+        error: offline ? 'offline' : 'load_failed',
+      ));
+    }
+  }
+
+  void selectSeason(int s) {
+    if (s == state.selectedSeason) return;
+    emit(state.copyWith(selectedSeason: s));
+  }
+
+  void toggleDesc() => emit(state.copyWith(descExpanded: !state.descExpanded));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pure helpers — moved off the screen state. Stateless, so they live as
+// top-level functions for both the cubit and the view to share.
+// ─────────────────────────────────────────────────────────────────────────────
+
+String statusLabel(MediaStatus status) {
+  switch (status) {
+    case MediaStatus.ongoing:
+      return 'Ongoing';
+    case MediaStatus.completed:
+      return 'Completed';
+    case MediaStatus.hiatus:
+      return 'Hiatus';
+    case MediaStatus.cancelled:
+      return 'Cancelled';
+    case MediaStatus.unknown:
+      return '';
+  }
+}
+
+/// Parse the season number from the start of an episode title.
+/// Returns null if no such prefix exists.
+/// E.g. "S1 E3 - Attack" gives 1; "Episode 5" gives null.
+int? parseSeason(String title) {
+  final m = RegExp(r'^S(\d+)').firstMatch(title.trim());
+  if (m == null) return null;
+  return int.tryParse(m.group(1)!);
+}
+
+/// The season an episode belongs to: the source-reported field when present
+/// (CloudStream sets it per episode), else parsed from the title's `S<n>`
+/// prefix. Sources that report neither are treated as single-season.
+int? seasonOf(Episode ep) => ep.season ?? parseSeason(ep.title);
+
+/// Derive the set of seasons present in the episode list.
+///
+/// An episode that reports no season counts as season 1 — the same `?? 1` the
+/// download sheet and the player's episode panel already apply. Skipping it
+/// was fine while a list was all-or-nothing, and wrong once the two got mixed:
+/// a TMDB series merges the source's rows (only CloudStream reports a season)
+/// with the catalogue's tail rows (always seasoned), so the set came back
+/// {2, 3} and season 1 — every episode that could actually be played — wasn't
+/// in the picker at all.
+///
+/// A list where nothing reports a season now gives {1} rather than {}. Every
+/// caller reads it the same way: they all ask whether there is MORE than one.
+Set<int> seasonsOf(List<Episode> eps) {
+  final result = <int>{};
+  for (final ep in eps) {
+    result.add(seasonOf(ep) ?? 1);
+  }
+  return result;
+}
+
+/// The episodes in [season], counting a missing season as 1 — see [seasonsOf].
+///
+/// Shared by the phone and TV episode lists. They each had their own copy of
+/// this line and both were missing the `?? 1`, which is how a season-less
+/// episode ended up in no season at all instead of the first one.
+List<Episode> episodesInSeason(List<Episode> eps, int season) => [
+  for (final e in eps)
+    if ((seasonOf(e) ?? 1) == season) e,
+];
+
+/// Whether to show the Sub/Dub toggle:
+/// - Only for anime (ProviderType.anime)
+/// - And at least one of subCount / dubCount is non-zero / non-null
+bool showSubDubFor(MediaDetail detail) {
+  if (detail.type != ProviderType.anime) return false;
+  final hasSub = (detail.subCount ?? 0) > 0;
+  final hasDub = (detail.dubCount ?? 0) > 0;
+  return hasSub || hasDub;
+}
