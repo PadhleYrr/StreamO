@@ -1,6 +1,6 @@
 {
-  "name": "All-in-One Nuvio (StreamO)",
-  "description": "65 streaming providers ported from the Nuvio plugin collection — movies, TV, anime in 10+ languages.",
+  "name": "StreamO Providers",
+  "description": "65 streaming providers — movies, TV, anime in 10+ languages.",
   "sources": [
     {
       "id": "allanime",
@@ -8,7 +8,7 @@
       "version": "1.0.0",
       "type": "anime",
       "lang": "en,ja",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/allanime.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/allanime.js",
       "logo": "https://i.postimg.cc/DwpqLJWV/allanime.png",
       "nsfw": false
     },
@@ -18,7 +18,7 @@
       "version": "1.0.1",
       "type": "movie",
       "lang": "en",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/4khdhub.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/4khdhub.js",
       "logo": "https://i.postimg.cc/DZpW6Xfb/4khdhub.png",
       "nsfw": false
     },
@@ -28,7 +28,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "en,hi",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/1shows.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/1shows.js",
       "logo": "https://i.postimg.cc/9fDVBvn5/1shows.png",
       "nsfw": false
     },
@@ -38,7 +38,7 @@
       "version": "1.0.1",
       "type": "movie",
       "lang": "en,ja",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/allwish.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/allwish.js",
       "logo": "https://i.postimg.cc/WpFW45WQ/allwish.png",
       "nsfw": false
     },
@@ -48,7 +48,7 @@
       "version": "1.0.0",
       "type": "anime",
       "lang": "en",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/animekai.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/animekai.js",
       "logo": "https://i.postimg.cc/MKJd7fy7/animekai.png",
       "nsfw": false
     },
@@ -58,7 +58,7 @@
       "version": "1.0.5",
       "type": "anime",
       "lang": "en,ja",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/anikototv.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/anikototv.js",
       "logo": "https://i.postimg.cc/JhL3HBR4/anikototv.png",
       "nsfw": false
     },
@@ -68,7 +68,7 @@
       "version": "1.0.0",
       "type": "anime",
       "lang": "en,ja,ko",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/anidb.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/anidb.js",
       "logo": "https://i.postimg.cc/rmMzZ45K/anidb.png",
       "nsfw": false
     },
@@ -78,7 +78,7 @@
       "version": "1.0.1",
       "type": "anime",
       "lang": "en,ja",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/animepahe.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/animepahe.js",
       "logo": "https://i.postimg.cc/c4ZBGNNs/animepahe.png",
       "nsfw": false
     },
@@ -88,7 +88,7 @@
       "version": "1.0.0",
       "type": "anime",
       "lang": "hi,ta,te,en,ja",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/animesalt.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/animesalt.js",
       "logo": "https://www.google.com/s2/favicons?domain=animesalt.cx&sz=128",
       "nsfw": false
     },
@@ -98,7 +98,7 @@
       "version": "1.0.0",
       "type": "anime",
       "lang": "hi,en,ja",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/animedekho.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/animedekho.js",
       "logo": "https://www.google.com/s2/favicons?domain=animedekho.app&sz=128",
       "nsfw": false
     },
@@ -108,7 +108,7 @@
       "version": "1.0.0",
       "type": "anime",
       "lang": "en,ja",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/animetsu.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/animetsu.js",
       "logo": "https://i.postimg.cc/0Q3DvLx7/animetsu.png",
       "nsfw": false
     },
@@ -118,7 +118,7 @@
       "version": "1.0.0",
       "type": "anime",
       "lang": "hi,en,ja",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/animeworld.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/animeworld.js",
       "logo": "https://i.postimg.cc/wxD6rVKX/animeworld.png",
       "nsfw": false
     },
@@ -128,7 +128,7 @@
       "version": "1.1.27",
       "type": "anime",
       "lang": "fr",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/anime-sama.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/anime-sama.js",
       "logo": "https://i.postimg.cc/tgYt2pYG/animesama.png",
       "nsfw": false
     },
@@ -138,7 +138,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "en,hi,ta,te",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/allmovieland.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/allmovieland.js",
       "logo": "https://i.postimg.cc/hhWqkVQs/allmovieland.png",
       "nsfw": false
     },
@@ -148,7 +148,7 @@
       "version": "1.0.0",
       "type": "anime",
       "lang": "en,pt",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/animezey.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/animezey.js",
       "logo": "https://i.postimg.cc/RVTy2djk/ainimezey.png",
       "nsfw": false
     },
@@ -158,7 +158,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "en,hi",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/desiflix.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/desiflix.js",
       "logo": "https://i.postimg.cc/Vvs4fmwM/desiflix.png",
       "nsfw": false
     },
@@ -168,7 +168,7 @@
       "version": "2.0.0",
       "type": "movie",
       "lang": "en",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/castle.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/castle.js",
       "logo": "https://i.postimg.cc/0NvGzFyK/castle.png",
       "nsfw": false
     },
@@ -178,7 +178,7 @@
       "version": "1.9.2",
       "type": "movie",
       "lang": "ar,en",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/cineby.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/cineby.js",
       "logo": "https://i.postimg.cc/dV1HWbqX/cineby.png",
       "nsfw": false
     },
@@ -188,7 +188,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "en,hi",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/cinefreak.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/cinefreak.js",
       "logo": "https://i.postimg.cc/rpDB2284/cinefreak.png",
       "nsfw": false
     },
@@ -198,7 +198,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "en,hi",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/moonflix.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/moonflix.js",
       "logo": "https://i.postimg.cc/90dVRJJq/moonflix.png",
       "nsfw": false
     },
@@ -208,7 +208,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "en,hi,ar",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/cinemacity.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/cinemacity.js",
       "logo": "https://i.postimg.cc/XYjKhS3b/cinemacity.png",
       "nsfw": false
     },
@@ -218,7 +218,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "en,hi",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/ctgmovies.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/ctgmovies.js",
       "logo": "https://i.postimg.cc/jSQmk9B3/ctgmovies.png",
       "nsfw": false
     },
@@ -228,7 +228,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "en",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/dahmermovies.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/dahmermovies.js",
       "logo": "https://i.postimg.cc/hGt3dV6Z/dhamermovies.png",
       "nsfw": false
     },
@@ -238,7 +238,7 @@
       "version": "1.0.1",
       "type": "movie",
       "lang": "en",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/dahmermovies-4k.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/dahmermovies-4k.js",
       "logo": "https://i.postimg.cc/hGt3dV6Z/dhamermovies.png",
       "nsfw": false
     },
@@ -248,7 +248,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "en,es",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/dooflix.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/dooflix.js",
       "logo": "https://i.postimg.cc/59H1DmRk/dooflix.png",
       "nsfw": false
     },
@@ -258,7 +258,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "hi,ta,te,ba",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/einthusan.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/einthusan.js",
       "logo": "https://i.postimg.cc/QCFYLyRR/einthusan.png",
       "nsfw": false
     },
@@ -268,7 +268,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "en,hi",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/fibwatch.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/fibwatch.js",
       "logo": "https://i.postimg.cc/sfLR6dMm/fibwatch.png",
       "nsfw": false
     },
@@ -278,7 +278,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "en,hi,ru,es",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/goated.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/goated.js",
       "logo": "https://i.postimg.cc/qqsfgS0F/goated.png",
       "nsfw": false
     },
@@ -288,7 +288,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "en,hi,ta,ru",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/gramcinema.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/gramcinema.js",
       "logo": "https://i.postimg.cc/WbNPW7Jv/gramcinema.png",
       "nsfw": false
     },
@@ -298,7 +298,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "en,hi",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/hdghartv.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/hdghartv.js",
       "logo": "https://i.postimg.cc/761WVpJS/hdghartv.png",
       "nsfw": false
     },
@@ -308,7 +308,7 @@
       "version": "1.0.1",
       "type": "movie",
       "lang": "en",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/hdhub4u.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/hdhub4u.js",
       "logo": "https://i.postimg.cc/mryRTf0R/hdhub4u.png",
       "nsfw": false
     },
@@ -318,7 +318,7 @@
       "version": "1.0.0",
       "type": "anime",
       "lang": "ja,en",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/hianime.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/hianime.js",
       "logo": "https://i.postimg.cc/13SYJPTx/hianime.png",
       "nsfw": false
     },
@@ -328,7 +328,7 @@
       "version": "1.0.1",
       "type": "movie",
       "lang": "en,hi",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/hindmoviez.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/hindmoviez.js",
       "logo": "https://i.postimg.cc/5t55Csm4/hindmoviez.png",
       "nsfw": false
     },
@@ -338,7 +338,7 @@
       "version": "1.0.0",
       "type": "anime",
       "lang": "en,ja",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/kurage.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/kurage.js",
       "logo": "https://i.postimg.cc/3N2V7pHc/kurage.png",
       "nsfw": false
     },
@@ -348,7 +348,7 @@
       "version": "1.2.0",
       "type": "movie",
       "lang": "en,hi,ta,te",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/moviebox.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/moviebox.js",
       "logo": "https://i.postimg.cc/TPwkfqHh/moviebox.png",
       "nsfw": false
     },
@@ -358,7 +358,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "en,hi,ta,te",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/movieblast.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/movieblast.js",
       "logo": "https://i.postimg.cc/qqkLSyhN/movieblast.png",
       "nsfw": false
     },
@@ -368,7 +368,7 @@
       "version": "3.0.0",
       "type": "movie",
       "lang": "en,hi",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/moviesdrive.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/moviesdrive.js",
       "logo": "https://i.postimg.cc/bwDbhq9q/moviesdrive.png",
       "nsfw": false
     },
@@ -378,7 +378,7 @@
       "version": "1.0.1",
       "type": "movie",
       "lang": "en",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/moviesmod.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/moviesmod.js",
       "logo": "https://www.google.com/s2/favicons?domain=moviesmod.farm&sz=128",
       "nsfw": false
     },
@@ -388,7 +388,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "hi,en",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/movieshunt.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/movieshunt.js",
       "logo": "https://i.postimg.cc/3Rc34LJj/movieshunt.png",
       "nsfw": false
     },
@@ -398,7 +398,7 @@
       "version": "1.0.2",
       "type": "movie",
       "lang": "en,hi,ta",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/movies4u.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/movies4u.js",
       "logo": "https://i.postimg.cc/J0QG1QhQ/movies4u.jpg",
       "nsfw": false
     },
@@ -408,7 +408,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "en,fr",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/movix.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/movix.js",
       "logo": "https://i.postimg.cc/XYrPQm87/movix.png",
       "nsfw": false
     },
@@ -418,7 +418,7 @@
       "version": "3.8.2",
       "type": "movie",
       "lang": "fr,en",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/nakios.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/nakios.js",
       "logo": "https://i.postimg.cc/nLwY1pJB/nakios.png",
       "nsfw": false
     },
@@ -428,7 +428,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "en,hi,ta,te",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/netmirror.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/netmirror.js",
       "logo": "https://i.postimg.cc/L64M3bYV/netmirror.png",
       "nsfw": false
     },
@@ -438,7 +438,7 @@
       "version": "1.4.0",
       "type": "movie",
       "lang": "en,pe",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/persianstremio.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/persianstremio.js",
       "logo": "https://i.postimg.cc/qq6V2fTL/persian.png",
       "nsfw": false
     },
@@ -448,7 +448,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "en,hi,te,ta,pt",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/peachify.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/peachify.js",
       "logo": "https://i.postimg.cc/tCz8CDH3/peachify.png",
       "nsfw": false
     },
@@ -458,7 +458,7 @@
       "version": "2.0.0",
       "type": "movie",
       "lang": "en,hi",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/playimdb.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/playimdb.js",
       "logo": "https://i.postimg.cc/KzjPtYWY/imdb.png",
       "nsfw": false
     },
@@ -468,7 +468,7 @@
       "version": "3.0.0",
       "type": "movie",
       "lang": "en,fr",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/purstream.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/purstream.js",
       "logo": "https://i.postimg.cc/7L5shxmC/purstream.png",
       "nsfw": false
     },
@@ -478,7 +478,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "en",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/showbox.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/showbox.js",
       "logo": "https://i.postimg.cc/8c5XGzsx/showbox.png",
       "nsfw": false
     },
@@ -488,7 +488,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "en",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/topcartoons.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/topcartoons.js",
       "logo": "https://i.postimg.cc/3xVsbwp8/topcartoons.png",
       "nsfw": false
     },
@@ -498,7 +498,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "en,hi",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/torrentio.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/torrentio.js",
       "logo": "https://i.postimg.cc/ZRYTCy0T/torrentio.png",
       "nsfw": false
     },
@@ -508,7 +508,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "en",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/vidrock.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/vidrock.js",
       "logo": "https://i.postimg.cc/brxL7qg3/multivid.png",
       "nsfw": false
     },
@@ -518,7 +518,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "en",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/uhdmovies.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/uhdmovies.js",
       "logo": "https://i.postimg.cc/KzDBBdbK/uhdmovies.png",
       "nsfw": false
     },
@@ -528,7 +528,7 @@
       "version": "2.0",
       "type": "movie",
       "lang": "en,hi",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/vegamovies.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/vegamovies.js",
       "logo": "https://i.postimg.cc/TwYK26jn/vegamovies.png",
       "nsfw": false
     },
@@ -538,7 +538,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "en",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/vidlink.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/vidlink.js",
       "logo": "https://i.postimg.cc/RZRHQd75/vidlink.png",
       "nsfw": false
     },
@@ -548,7 +548,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "en",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/videasy.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/videasy.js",
       "logo": "https://i.postimg.cc/7LHYMtVV/videasy.png",
       "nsfw": false
     },
@@ -558,7 +558,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "en",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/vidsrc.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/vidsrc.js",
       "logo": "https://i.postimg.cc/ncMLBsLJ/vidsrc.png",
       "nsfw": false
     },
@@ -568,7 +568,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "en,Ita",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/vixsrc.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/vixsrc.js",
       "logo": "https://i.postimg.cc/1tHrBvzs/vixsrc.png",
       "nsfw": false
     },
@@ -578,7 +578,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "en",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/vidfast.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/vidfast.js",
       "logo": "https://i.postimg.cc/0Qp8PSx5/vidfast.png",
       "nsfw": false
     },
@@ -588,7 +588,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "en",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/vidlove.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/vidlove.js",
       "logo": "https://i.postimg.cc/ZRjQytBY/vidlove.png",
       "nsfw": false
     },
@@ -598,7 +598,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "en,hi",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/xpass.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/xpass.js",
       "logo": "https://i.postimg.cc/tgqNQxdy/xpass.png",
       "nsfw": false
     },
@@ -608,7 +608,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "en,hi,ta,te",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/zinkmovies.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/zinkmovies.js",
       "logo": "https://i.postimg.cc/XqCZyCgp/zinkmovies.png",
       "nsfw": false
     },
@@ -618,7 +618,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "ko",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/onlykdrama.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/onlykdrama.js",
       "logo": "https://i.postimg.cc/dtX84Gqc/onlykdrama.jpg",
       "nsfw": false
     },
@@ -628,7 +628,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "ko,ch,ja,th",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/kisskh.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/kisskh.js",
       "logo": "https://i.postimg.cc/2yLnTzPP/kisskh.jpg",
       "nsfw": false
     },
@@ -638,7 +638,7 @@
       "version": "1.0.0",
       "type": "anime",
       "lang": "en",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/reanime.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/reanime.js",
       "logo": "https://www.google.com/s2/favicons?domain=reanime.to&sz=128",
       "nsfw": false
     },
@@ -648,7 +648,7 @@
       "version": "1.0.0",
       "type": "movie",
       "lang": "en",
-      "file": "https://raw.githubusercontent.com/NuvioPlugin/All-in-One-Nuvio/refs/heads/main/providers/mapple.js",
+      "file": "https://raw.githubusercontent.com/PadhleYrr/StreamO/main/providers/mapple.js",
       "logo": "https://www.google.com/s2/favicons?domain=mapple.fun&sz=128",
       "nsfw": false
     }
